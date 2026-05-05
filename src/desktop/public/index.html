@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Fabric Console</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div>
+          <div class="app-title">Agent Fabric Console</div>
+          <div id="daemon-line" class="muted">Connecting</div>
+        </div>
+        <div class="top-actions">
+          <input id="project-filter" type="text" placeholder="Project path" />
+          <label class="checkline"><input id="include-closed" type="checkbox" /> Closed</label>
+          <button id="refresh-all" type="button">Refresh</button>
+        </div>
+      </header>
+
+      <div id="notice-stack" class="notice-stack hidden" aria-live="polite"></div>
+
+      <main class="layout">
+        <aside class="sidebar">
+          <div class="section-head">
+            <h2>Queues</h2>
+            <div class="section-actions">
+              <span id="queue-count" class="pill">0</span>
+              <button id="seed-demo-queue" type="button">Demo</button>
+              <button id="new-queue-toggle" type="button">New</button>
+            </div>
+          </div>
+          <form id="new-queue-form" class="panel form-panel hidden">
+            <label>
+              <span>Project Folder</span>
+              <input id="new-project-path" type="text" placeholder="/path/to/project" required />
+            </label>
+            <label>
+              <span>Queue Title</span>
+              <input id="new-queue-title" type="text" placeholder="Optional" />
+            </label>
+            <div class="form-grid">
+              <label>
+                <span>Profile</span>
+                <select id="new-pipeline-profile">
+                  <option value="balanced">Balanced</option>
+                  <option value="careful">Careful</option>
+                  <option value="fast">Fast</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </label>
+              <label>
+                <span>Agents</span>
+                <input id="new-max-agents" type="number" min="1" max="16" value="4" />
+              </label>
+            </div>
+            <label>
+              <span>Prompt</span>
+              <textarea id="new-prompt" rows="7" placeholder="Describe the project goal. Raw prompt text is not stored in agent-fabric." required></textarea>
+            </label>
+            <div class="row-actions">
+              <button class="primary" type="submit">Create Queue</button>
+              <button id="new-queue-cancel" type="button">Cancel</button>
+            </div>
+          </form>
+          <div id="queue-list" class="queue-list"></div>
+        </aside>
+
+        <section class="workspace">
+          <div id="empty-state" class="empty">Select a queue.</div>
+          <div id="queue-view" class="hidden">
+            <div class="queue-header">
+              <div>
+                <h1 id="queue-title"></h1>
+                <div id="queue-meta" class="muted"></div>
+              </div>
+              <div class="queue-actions">
+                <button id="copy-current-link" type="button">Copy Link</button>
+                <button id="edit-settings-toggle" type="button">Settings</button>
+                <button id="prepare-ready" type="button">Prepare</button>
+                <button id="launch-plan" type="button">Plan Launch</button>
+                <button id="start-execution" type="button">Start</button>
+              </div>
+            </div>
+            <div id="queue-health-strip" class="queue-health-strip" aria-live="polite"></div>
+            <form id="queue-settings-form" class="panel form-panel hidden">
+              <div class="form-grid three">
+                <label>
+                  <span>Title</span>
+                  <input id="settings-title" type="text" />
+                </label>
+                <label>
+                  <span>Profile</span>
+                  <select id="settings-profile">
+                    <option value="balanced">Balanced</option>
+                    <option value="careful">Careful</option>
+                    <option value="fast">Fast</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Max Agents</span>
+                  <input id="settings-max-agents" type="number" min="1" max="16" />
+                </label>
+              </div>
+              <div class="row-actions">
+                <button class="primary" type="submit">Save Settings</button>
+                <button id="settings-cancel" type="button">Cancel</button>
+              </div>
+            </form>
+
+            <nav class="tabs" aria-label="Queue views">
+              <button class="tab active" data-tab="dashboard" type="button">Dashboard</button>
+              <button class="tab" data-tab="pipeline" type="button">Pipeline</button>
+              <button class="tab" data-tab="tasks" type="button">Tasks</button>
+              <button class="tab" data-tab="matrix" type="button">Matrix</button>
+              <button class="tab" data-tab="approvals" type="button">Approvals</button>
+              <button class="tab" data-tab="memory" type="button">Memory</button>
+              <button class="tab" data-tab="context" type="button">Context</button>
+              <button class="tab" data-tab="model-brain" type="button">Model Brain</button>
+              <button class="tab" data-tab="theater" type="button">Theater</button>
+              <button class="tab" data-tab="activity" type="button">Activity</button>
+            </nav>
+
+            <section id="tab-dashboard" class="tab-panel"></section>
+            <section id="tab-pipeline" class="tab-panel hidden">
+              <div class="panel">
+                <div class="section-head">
+                  <h2>Improve Prompt</h2>
+                  <span class="pill">model-backed first gate</span>
+                </div>
+                <form id="prompt-improve-form" class="form-panel no-margin">
+                  <div class="form-grid decision-grid">
+                    <label>
+                      <span>Model Alias</span>
+                      <input id="prompt-improve-model" type="text" value="prompt.improve.strong" />
+                    </label>
+                    <label class="form-check">
+                      <input id="prompt-improve-accept" type="checkbox" />
+                      <span>Accept improved prompt after generation</span>
+                    </label>
+                  </div>
+                  <label>
+                    <span>Prompt</span>
+                    <textarea id="prompt-improve-text" rows="7" placeholder="Paste the current project prompt. Raw prompt text is sent to the configured model runner but is not stored in agent-fabric."></textarea>
+                  </label>
+                  <div class="row-actions">
+                    <button class="primary" type="submit">Improve Prompt</button>
+                  </div>
+                </form>
+                <div id="prompt-improve-result"></div>
+              </div>
+              <div class="panel">
+                <div class="section-head">
+                  <h2>Start Planning</h2>
+                  <span class="pill">plan-chain gate</span>
+                </div>
+                <form id="start-plan-form" class="form-panel no-margin">
+                  <div class="form-grid pipeline-grid">
+                    <label>
+                      <span>Output</span>
+                      <select id="start-plan-output-format">
+                        <option value="markdown">Markdown</option>
+                        <option value="adr">ADR</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Max Rounds</span>
+                      <input id="start-plan-max-rounds" type="number" min="1" max="12" value="3" />
+                    </label>
+                    <label>
+                      <span>Budget USD</span>
+                      <input id="start-plan-budget" type="number" min="0" step="0.01" placeholder="Optional" />
+                    </label>
+                    <label class="form-check">
+                      <input id="start-plan-use-prompt-result" type="checkbox" checked />
+                      <span>Use latest improved prompt if shown</span>
+                    </label>
+                  </div>
+                  <label>
+                    <span>Planning Task</span>
+                    <textarea id="start-plan-task" rows="7" placeholder="Paste the accepted prompt or implementation goal to plan."></textarea>
+                  </label>
+                  <div class="row-actions">
+                    <button class="primary" type="submit">Start Plan Chain</button>
+                  </div>
+                </form>
+                <div id="start-plan-result"></div>
+              </div>
+              <div class="panel">
+                <div class="section-head">
+                  <h2>Record Pipeline Stage</h2>
+                  <span class="pill">durable stage event</span>
+                </div>
+                <form id="pipeline-stage-form" class="form-panel no-margin">
+                  <div class="form-grid pipeline-grid">
+                    <label>
+                      <span>Stage</span>
+                      <select id="pipeline-stage">
+                        <option value="prompt_improvement">Prompt improvement</option>
+                        <option value="planning">Planning</option>
+                        <option value="phasing">Phasing</option>
+                        <option value="task_writing">Task writing</option>
+                        <option value="queue_shaping">Queue shaping</option>
+                        <option value="tool_context">Tool/context</option>
+                        <option value="execution">Execution</option>
+                        <option value="review">Review</option>
+                        <option value="decision">Decision</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Status</span>
+                      <select id="pipeline-status">
+                        <option value="pending">Pending</option>
+                        <option value="running">Running</option>
+                        <option value="completed">Completed</option>
+                        <option value="needs_review" selected>Needs review</option>
+                        <option value="accepted">Accepted</option>
+                        <option value="rejected">Rejected</option>
+                        <option value="failed">Failed</option>
+                        <option value="skipped">Skipped</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Model Alias</span>
+                      <input id="pipeline-model-alias" type="text" placeholder="prompt.improve.strong" />
+                    </label>
+                    <label>
+                      <span>Plan Chain ID</span>
+                      <input id="pipeline-plan-chain" type="text" placeholder="Optional" />
+                    </label>
+                  </div>
+                  <div class="form-grid two">
+                    <label>
+                      <span>Input Summary</span>
+                      <textarea id="pipeline-input-summary" rows="5" placeholder="What entered this stage."></textarea>
+                    </label>
+                    <label>
+                      <span>Output Summary</span>
+                      <textarea id="pipeline-output-summary" rows="5" placeholder="What this stage produced or needs next."></textarea>
+                    </label>
+                  </div>
+                  <div class="form-grid two">
+                    <label>
+                      <span>Artifact refs</span>
+                      <textarea id="pipeline-artifacts" rows="4" placeholder="One artifact, path, or ref per line."></textarea>
+                    </label>
+                    <label>
+                      <span>Warnings</span>
+                      <textarea id="pipeline-warnings" rows="4" placeholder="One warning per line."></textarea>
+                    </label>
+                  </div>
+                  <div class="row-actions">
+                    <button class="primary" type="submit">Record Stage</button>
+                  </div>
+                </form>
+              <div id="pipeline-stage-result"></div>
+              </div>
+              <div class="panel">
+                <div class="section-head">
+                  <h2>Record Human Decision</h2>
+                  <span class="pill">queue gate</span>
+                </div>
+                <form id="pipeline-decision-form" class="form-panel no-margin">
+                  <div class="form-grid decision-grid">
+                    <label>
+                      <span>Decision</span>
+                      <select id="pipeline-decision">
+                        <option value="accept_improved_prompt">Accept improved prompt</option>
+                        <option value="request_prompt_revision">Request prompt revision</option>
+                        <option value="accept_plan">Accept plan</option>
+                        <option value="request_plan_revision">Request plan revision</option>
+                        <option value="approve_queue">Approve queue</option>
+                        <option value="start_execution">Start execution</option>
+                        <option value="pause">Pause</option>
+                        <option value="resume">Resume</option>
+                        <option value="cancel">Cancel</option>
+                        <option value="complete">Complete</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Note</span>
+                      <input id="pipeline-decision-note" type="text" placeholder="Why this gate changed" />
+                    </label>
+                  </div>
+                  <label>
+                    <span>Metadata JSON</span>
+                    <textarea id="pipeline-decision-metadata" rows="4" placeholder='{"source":"desktop-pipeline"}'></textarea>
+                  </label>
+                  <div class="row-actions">
+                    <button class="primary" type="submit">Record Decision</button>
+                  </div>
+                </form>
+                <div id="pipeline-decision-result"></div>
+              </div>
+              <div id="pipeline-view"></div>
+            </section>
+            <section id="tab-tasks" class="tab-panel hidden">
+              <div class="panel">
+                <div class="section-head">
+                  <h2>Add Coding Task</h2>
+                  <span class="pill">structured</span>
+                </div>
+                <form id="add-task-form" class="form-panel no-margin">
+                  <div class="form-grid task-main-grid">
+                    <label>
+                      <span>Title</span>
+                      <input id="add-task-title" type="text" placeholder="Implement queue schema" required />
+                    </label>
+                    <label>
+                      <span>Client Key</span>
+                      <input id="add-task-client-key" type="text" placeholder="Optional" />
+                    </label>
+                  </div>
+                  <label>
+                    <span>Goal</span>
+                    <textarea id="add-task-goal" rows="5" placeholder="Describe the concrete coding outcome." required></textarea>
+                  </label>
+                  <div class="form-grid task-options-grid">
+                    <label>
+                      <span>Phase</span>
+                      <input id="add-task-phase" type="text" placeholder="desktop" />
+                    </label>
+                    <label>
+                      <span>Category</span>
+                      <input id="add-task-category" type="text" value="implementation" />
+                    </label>
+                    <label>
+                      <span>Priority</span>
+                      <select id="add-task-priority">
+                        <option value="low">Low</option>
+                        <option value="normal" selected>Normal</option>
+                        <option value="high">High</option>
+                        <option value="urgent">Urgent</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Risk</span>
+                      <select id="add-task-risk">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                        <option value="breakglass">Breakglass</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div class="form-grid two">
+                    <label>
+                      <span>Acceptance Criteria</span>
+                      <textarea id="add-task-acceptance" rows="5" placeholder="One criterion per line."></textarea>
+                    </label>
+                    <label>
+                      <span>Expected Files</span>
+                      <textarea id="add-task-files" rows="5" placeholder="One file path per line."></textarea>
+                    </label>
+                  </div>
+                  <div class="form-grid two">
+                    <label>
+                      <span>Required Tools</span>
+                      <textarea id="add-task-tools" rows="4" placeholder="One tool per line."></textarea>
+                    </label>
+                    <label>
+                      <span>Required MCP Servers</span>
+                      <textarea id="add-task-mcp" rows="4" placeholder="One MCP server per line."></textarea>
+                    </label>
+                  </div>
+                  <div class="form-grid two">
+                    <label>
+                      <span>Required Memories</span>
+                      <textarea id="add-task-memories" rows="4" placeholder="One memory ref per line."></textarea>
+                    </label>
+                    <label>
+                      <span>Required Context Refs</span>
+                      <textarea id="add-task-context" rows="4" placeholder="One context ref per line."></textarea>
+                    </label>
+                  </div>
+                  <div class="form-grid two">
+                    <label>
+                      <span>Depends On</span>
+                      <textarea id="add-task-depends" rows="4" placeholder="One queue task id or same-batch client key per line."></textarea>
+                    </label>
+                    <label>
+                      <span>Parallel Group</span>
+                      <input id="add-task-parallel-group" type="text" placeholder="Optional conflict group" />
+                    </label>
+                  </div>
+                  <div class="row-actions">
+                    <label class="checkline form-check">
+                      <input id="add-task-parallel-safe" type="checkbox" checked />
+                      <span>Parallel safe</span>
+                    </label>
+                    <label class="checkline form-check">
+                      <input id="add-task-approve-queue" type="checkbox" />
+                      <span>Record queue approval after add</span>
+                    </label>
+                    <button class="primary" type="submit">Add Task</button>
+                  </div>
+                </form>
+                <div id="add-task-result"></div>
+              </div>
+              <div class="panel">
+                <div class="section-head">
+                  <h2>Import Coding Tasks</h2>
+                  <span class="pill">JSON</span>
+                </div>
+                <form id="import-tasks-form" class="form-panel no-margin">
+                  <label>
+                    <span>Tasks JSON</span>
+                    <textarea id="import-tasks-json" rows="14" placeholder='{"tasks":[{"clientKey":"schema","title":"Create schema","goal":"Add queue tables.","acceptanceCriteria":["Migration applies."],"risk":"medium","priority":"high","dependsOn":[]}]}'></textarea>
+                  </label>
+                  <label class="checkline form-check">
+                    <input id="import-approve-queue" type="checkbox" />
+                    <span>Record queue approval after import</span>
+                  </label>
+                  <div class="row-actions">
+                    <button class="primary" type="submit">Import Tasks</button>
+                    <button id="import-sample" type="button">Sample</button>
+                  </div>
+                </form>
+                <div id="import-tasks-result"></div>
+              </div>
+              <div id="task-list-view"></div>
+            </section>
+            <section id="tab-matrix" class="tab-panel hidden"></section>
+            <section id="tab-approvals" class="tab-panel hidden"></section>
+            <section id="tab-memory" class="tab-panel hidden"></section>
+            <section id="tab-context" class="tab-panel hidden">
+              <div class="panel">
+                <div class="section-head">
+                  <h2>Context Inspector</h2>
+                </div>
+                <div class="inline-form">
+                  <input id="context-request-id" type="text" placeholder="Preflight request id" />
+                  <button id="inspect-context" type="button">Inspect</button>
+                </div>
+                <div id="context-result"></div>
+              </div>
+            </section>
+            <section id="tab-model-brain" class="tab-panel hidden">
+              <div class="panel">
+                <div class="section-head">
+                  <h2>Model Brain</h2>
+                  <span class="pill">route + gate</span>
+                </div>
+                <form id="model-brain-form" class="form-panel no-margin">
+                  <div class="form-grid model-grid">
+                    <label>
+                      <span>Role Alias</span>
+                      <select id="brain-role-alias">
+                        <option value="execute.cheap">execute.cheap</option>
+                        <option value="prompt.improve.strong">prompt.improve.strong</option>
+                        <option value="plan.strong">plan.strong</option>
+                        <option value="phase.splitter">phase.splitter</option>
+                        <option value="task.writer">task.writer</option>
+                        <option value="tool.context.manager">tool.context.manager</option>
+                        <option value="review.strong">review.strong</option>
+                        <option value="">Custom model</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Candidate Model</span>
+                      <input id="brain-candidate-model" type="text" placeholder="Optional when alias is set" />
+                    </label>
+                    <label>
+                      <span>Risk</span>
+                      <select id="brain-risk">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                        <option value="breakglass">Breakglass</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Input Tokens</span>
+                      <input id="brain-input-tokens" type="number" min="1" value="8000" />
+                    </label>
+                  </div>
+                  <div class="form-grid two">
+                    <label>
+                      <span>Task Type</span>
+                      <input id="brain-task-type" type="text" value="code_edit" />
+                    </label>
+                    <label class="checkline form-check">
+                      <input id="brain-enforce" type="checkbox" checked />
+                      <span>Fail closed for participating clients</span>
+                    </label>
+                  </div>
+                  <label>
+                    <span>Goal</span>
+                    <textarea id="brain-goal" rows="5" placeholder="Describe what the model would do."></textarea>
+                  </label>
+                  <div class="row-actions">
+                    <button class="primary" type="submit">Route Request</button>
+                  </div>
+                </form>
+                <div id="model-brain-result"></div>
+              </div>
+            </section>
+            <section id="tab-theater" class="tab-panel hidden"></section>
+            <section id="tab-activity" class="tab-panel hidden"></section>
+          </div>
+        </section>
+      </main>
+
+      <div id="toast" class="toast hidden"></div>
+    </div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

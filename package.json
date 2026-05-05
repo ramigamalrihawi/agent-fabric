@@ -1,0 +1,57 @@
+{
+  "name": "agent-fabric",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local-first coordination substrate for multi-agent software work",
+  "bin": {
+    "agent-fabric-daemon": "dist/bin/daemon.js",
+    "agent-fabric-bridge": "dist/bin/bridge.js",
+    "agent-fabric-approve": "dist/bin/approve.js",
+    "agent-fabric-deepseek-worker": "dist/bin/deepseek-worker.js",
+    "agent-fabric-project": "dist/bin/project.js",
+    "agent-fabric-desktop": "dist/bin/desktop.js",
+    "agent-fabric-cost-poll": "dist/bin/cost-poll.js",
+    "agent-fabric-sim": "dist/bin/sim.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node -e \"const fs=require('node:fs');fs.rmSync('dist/migrations',{recursive:true,force:true});fs.cpSync('src/migrations','dist/migrations',{recursive:true});fs.rmSync('dist/desktop',{recursive:true,force:true});fs.cpSync('src/desktop','dist/desktop',{recursive:true})\"",
+    "test": "vitest run",
+    "cost:poll": "tsx src/bin/cost-poll.ts",
+    "dev:approve": "tsx src/bin/approve.ts",
+    "dev:daemon": "tsx src/bin/daemon.ts",
+    "dev:bridge": "tsx src/bin/bridge.ts",
+    "dev:desktop": "tsx src/bin/desktop.ts",
+    "dev:project": "tsx src/bin/project.ts",
+    "dev:sim": "tsx src/bin/sim.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "keywords": [
+    "agents",
+    "mcp",
+    "multi-agent",
+    "sqlite",
+    "coding-agents",
+    "automation",
+    "agent-orchestration"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ramigamalrihawi/agent-fabric.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ramigamalrihawi/agent-fabric/issues"
+  },
+  "homepage": "https://github.com/ramigamalrihawi/agent-fabric#readme"
+}

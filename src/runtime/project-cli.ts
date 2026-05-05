@@ -1,0 +1,4773 @@
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { tmpdir } from "node:os";
+import { FabricError } from "./errors.js";
+import { applyPatchWithSystemPatch, validateGitStylePatch } from "./patches.js";
+
+type WorkerKind = "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "manual";
+type CwdPrepMode = "auto" | "none" | "mkdir";
+type DeepSeekRole = "auto" | "implementer" | "reviewer" | "risk-reviewer" | "adjudicator" | "planner";
+type SensitiveContextMode = "basic" | "strict" | "off";
+
+export type ProjectCliCommand =
+  | {
+      command: "create";
+      json: boolean;
+      projectPath: string;
+      prompt?: string;
+      promptFile?: string;
+      promptSummary?: string;
+      title?: string;
+      pipelineProfile: "fast" | "balanced" | "careful" | "custom";
+      maxParallelAgents: number;
+    }
+  | {
+      command: "demo-seed";
+      json: boolean;
+      projectPath: string;
+      title?: string;
+      maxParallelAgents: number;
+    }
+  | {
+      command: "start-plan";
+      json: boolean;
+      queueId: string;
+      task?: string;
+      taskFile?: string;
+      maxRounds?: number;
+      budgetUsd?: number;
+      outputFormat?: "markdown" | "adr";
+    }
+  | {
+      command: "configure";
+      json: boolean;
+      queueId: string;
+      title?: string;
+      pipelineProfile?: "fast" | "balanced" | "careful" | "custom";
+      maxParallelAgents?: number;
+      note?: string;
+    }
+  | {
+      command: "improve-prompt";
+      json: boolean;
+      queueId: string;
+      prompt?: string;
+      promptFile?: string;
+      factorsFile?: string;
+      modelAlias: string;
+      approvalToken?: string;
+      accept: boolean;
+      outputFile?: string;
+    }
+  | {
+      command: "generate-tasks";
+      json: boolean;
+      queueId: string;
+      planFile: string;
+      modelAlias: string;
+      approvalToken?: string;
+      tasksFile?: string;
+      approveQueue: boolean;
+    }
+  | {
+      command: "review-queue";
+      json: boolean;
+      queueId: string;
+      approveQueue: boolean;
+    }
+  | {
+      command: "decide-queue";
+      json: boolean;
+      queueId: string;
+      decision: string;
+      note?: string;
+    }
+  | {
+      command: "claim-next";
+      json: boolean;
+      queueId: string;
+      workerRunId?: string;
+      worker?: WorkerKind;
+      workspaceMode?: "in_place" | "git_worktree" | "clone" | "sandbox";
+      workspacePath?: string;
+      modelProfile?: string;
+      contextPolicy?: string;
+      maxRuntimeMinutes?: number;
+      commandLine?: string;
+    }
+  | {
+      command: "prepare-ready";
+      json: boolean;
+      queueId: string;
+      limit?: number;
+    }
+  | {
+      command: "launch-plan";
+      json: boolean;
+      queueId: string;
+      limit?: number;
+    }
+  | {
+      command: "recover-stale";
+      json: boolean;
+      queueId: string;
+      staleAfterMinutes?: number;
+      action: "requeue" | "fail";
+      dryRun: boolean;
+    }
+  | {
+      command: "retry-task";
+      json: boolean;
+      queueId: string;
+      queueTaskId: string;
+      reason?: string;
+      clearOutputs: boolean;
+    }
+  | {
+      command: "edit-task";
+      json: boolean;
+      queueId: string;
+      queueTaskId: string;
+      metadataFile: string;
+      note?: string;
+    }
+  | {
+      command: "review-patches";
+      json: boolean;
+      queueId: string;
+      acceptTaskId?: string;
+      applyPatch: boolean;
+      applyCwd?: string;
+    }
+  | {
+      command: "write-task-packets";
+      json: boolean;
+      queueId: string;
+      outDir: string;
+      format: "json" | "markdown";
+      readyOnly: boolean;
+    }
+  | {
+      command: "resume-task";
+      json: boolean;
+      queueId: string;
+      queueTaskId: string;
+      preferredWorker?: WorkerKind;
+      outputFile?: string;
+      format: "json" | "markdown";
+    }
+  | {
+      command: "run-task";
+      json: boolean;
+      queueId: string;
+      queueTaskId: string;
+      commandLine: string;
+      cwd?: string;
+      cwdPrep?: CwdPrepMode;
+      taskPacketPath?: string;
+      taskPacketFormat?: "json" | "markdown";
+      worker: WorkerKind;
+      workspaceMode: "in_place" | "git_worktree" | "clone" | "sandbox";
+      modelProfile: string;
+      maxRuntimeMinutes?: number;
+      approvalToken?: string;
+      successStatus: "patch_ready" | "completed";
+      maxOutputChars: number;
+      approveToolContext: boolean;
+      rememberToolContext: boolean;
+    }
+  | {
+      command: "run-ready";
+      json: boolean;
+      queueId: string;
+      commandTemplate?: string;
+      cwd?: string;
+      cwdTemplate?: string;
+      cwdPrep?: CwdPrepMode;
+      taskPacketDir?: string;
+      taskPacketFormat: "json" | "markdown";
+      limit?: number;
+      parallel: number;
+      allowSharedCwd: boolean;
+      worker: WorkerKind;
+      workspaceMode: "in_place" | "git_worktree" | "clone" | "sandbox";
+      modelProfile: string;
+      maxRuntimeMinutes?: number;
+      approvalToken?: string;
+      successStatus: "patch_ready" | "completed";
+      maxOutputChars: number;
+      approveToolContext: boolean;
+      rememberToolContext: boolean;
+      continueOnFailure: boolean;
+      adaptiveRateLimit?: boolean;
+      minParallel?: number;
+      allowConcurrentRunner?: boolean;
+    }
+  | {
+      command: "factory-run";
+      json: boolean;
+      queueId: string;
+      limit?: number;
+      parallel: number;
+      minParallel: number;
+      adaptiveRateLimit: boolean;
+      taskPacketDir?: string;
+      cwdTemplate?: string;
+      deepSeekWorkerCommand: string;
+      deepSeekRole: DeepSeekRole;
+      sensitiveContextMode: SensitiveContextMode;
+      patchMode: "report" | "write";
+      approvalToken?: string;
+      maxRuntimeMinutes?: number;
+      maxOutputChars: number;
+      approveToolContext: boolean;
+      rememberToolContext: boolean;
+      continueOnFailure: boolean;
+      startExecution: boolean;
+      dryRun: boolean;
+      allowSensitiveContext: boolean;
+      allowConcurrentRunner?: boolean;
+    }
+  | {
+      command: "import-tasks";
+      json: boolean;
+      queueId: string;
+      tasksFile: string;
+      approveQueue: boolean;
+    }
+  | {
+      command: "list";
+      json: boolean;
+      projectPath?: string;
+      statuses: string[];
+      includeClosed: boolean;
+      limit?: number;
+    }
+  | {
+      command: "approval-inbox";
+      json: boolean;
+      projectPath?: string;
+      queueId?: string;
+      limit?: number;
+    }
+  | {
+      command: "memory-inbox";
+      json: boolean;
+      status?: string;
+      archived: boolean;
+      limit?: number;
+    }
+  | {
+      command: "review-memory";
+      json: boolean;
+      memoryId: string;
+      decision: "approve" | "reject" | "archive";
+      reason?: string;
+    }
+  | {
+      command: "queue-approvals";
+      json: boolean;
+      queueId: string;
+      includeExpired: boolean;
+      limit?: number;
+    }
+  | {
+      command: "lanes";
+      json: boolean;
+      queueId: string;
+      includeCompleted: boolean;
+      maxEventsPerLane?: number;
+    }
+  | {
+      command: "dashboard";
+      json: boolean;
+      queueId: string;
+      includeCompletedLanes: boolean;
+      maxEventsPerLane?: number;
+    }
+  | {
+      command: "review-matrix";
+      json: boolean;
+      queueId: string;
+      limit?: number;
+    }
+  | {
+      command: "task-detail";
+      json: boolean;
+      queueId: string;
+      queueTaskId: string;
+      includeResume: boolean;
+      preferredWorker?: WorkerKind;
+      maxEventsPerRun?: number;
+    }
+  | {
+      command: "timeline";
+      json: boolean;
+      queueId: string;
+      limit?: number;
+    }
+  | {
+      command: "status";
+      json: boolean;
+      queueId: string;
+    }
+  | {
+      command: "launch";
+      json: boolean;
+      queueId: string;
+      limit?: number;
+      worker: WorkerKind;
+      workspaceMode: "in_place" | "git_worktree" | "clone" | "sandbox";
+      modelProfile: string;
+      workspacePath?: string;
+      maxRuntimeMinutes?: number;
+    }
+  | {
+      command: "approve-tool";
+      json: boolean;
+      proposalId: string;
+      remember: boolean;
+      note?: string;
+    }
+  | {
+      command: "decide-tool";
+      json: boolean;
+      proposalId: string;
+      decision: "approve" | "reject" | "revise";
+      remember: boolean;
+      note?: string;
+    }
+  | {
+      command: "set-tool-policy";
+      json: boolean;
+      projectPath: string;
+      grantKind: string;
+      value: string;
+      status: "approved" | "rejected";
+    }
+  | { command: "help"; json: boolean };
+
+export type ProjectToolCaller = <T = Record<string, unknown>>(tool: string, input: Record<string, unknown>) => Promise<T>;
+
+export type ProjectModelRequest = {
+  kind: "prompt_improvement" | "task_generation";
+  modelAlias: string;
+  route: {
+    provider: string;
+    model: string;
+    reasoning: string;
+  };
+  queue: Record<string, unknown>;
+  input: Record<string, unknown>;
+};
+
+export type ProjectModelRunner = (request: ProjectModelRequest) => Promise<Record<string, unknown>>;
+
+export type ProjectRunResult = {
+  action: string;
+  message: string;
+  data: Record<string, unknown>;
+};
+
+const RUNNER_LOCK_STALE_MS = 6 * 60 * 60 * 1000;
+
+type QueueStatus = {
+  queue: {
+    queueId: string;
+    projectPath: string;
+    maxParallelAgents: number;
+    status: string;
+    promptSummary?: string;
+    planChainId?: string;
+  };
+  tasks: QueueTask[];
+  toolContextProposals?: Array<Record<string, unknown>>;
+  toolContextPolicies?: Array<{ status?: unknown } & Record<string, unknown>>;
+};
+
+type QueueListResult = {
+  count: number;
+  queues: Array<{
+    queueId: string;
+    projectPath: string;
+    title: string;
+    status: string;
+    activeWorkers?: number;
+    availableSlots?: number;
+    readyCount?: number;
+    blockedCount?: number;
+    pendingApprovals?: number;
+    counts?: Record<string, number>;
+  }>;
+};
+
+type PendingApprovalInbox = {
+  count: number;
+  pending: Array<{
+    proposalId: string;
+    queueId: string;
+    queueTitle?: string;
+    projectPath?: string;
+    queueTaskId?: string;
+    queueTaskTitle?: string;
+    missingGrants?: unknown[];
+    safetyWarnings?: unknown[];
+  }>;
+};
+
+type QueueApprovalInbox = {
+  count: number;
+  toolContextCount: number;
+  modelCallCount: number;
+  toolContext: Array<{
+    proposalId?: string;
+    queueTaskId?: string;
+    queueTaskTitle?: string;
+    missingGrants?: unknown[];
+    safetyWarnings?: unknown[];
+  }>;
+  modelCalls: Array<{
+    requestId?: string;
+    approvalRequestId?: string;
+    client?: string;
+    taskType?: string;
+    risk?: string;
+    selected?: { provider?: string; model?: string; reasoning?: string };
+    estimate?: { estimatedCostUsd?: number; inputTokens?: number };
+    warnings?: unknown[];
+  }>;
+};
+
+type AgentLanesResult = {
+  count: number;
+  lanes: Array<{
+    laneId: string;
+    queueTask?: {
+      queueTaskId?: string;
+      title?: string;
+      status?: string;
+    };
+    workerRun?: {
+      workerRunId?: string;
+      worker?: string;
+      status?: string;
+    };
+    latestEvent?: {
+      kind?: string;
+      body?: string;
+    };
+    progress?: {
+      label?: string;
+      lastActivityAt?: string;
+      summary?: string;
+      nextAction?: string;
+    };
+  }>;
+};
+
+type DashboardResult = {
+  queue: {
+    queueId: string;
+    projectPath: string;
+    status: string;
+    maxParallelAgents: number;
+  };
+  counts?: Record<string, number>;
+  activeWorkers?: number;
+  availableSlots?: number;
+  summaryStrip?: {
+    status?: string;
+    severity?: string;
+    nextAction?: string;
+    counts?: {
+      pendingApprovals?: number;
+      staleRunning?: number;
+      failed?: number;
+    };
+    risk?: {
+      highestOpenRisk?: string;
+      highRiskOpenCount?: number;
+      breakglassOpenCount?: number;
+    };
+    cost?: {
+      preflightCount?: number;
+      estimatedCostUsd?: number;
+    };
+  };
+  pipeline?: Array<{ stage?: string; status?: string }>;
+  queueBoard?: {
+    ready?: QueueTask[];
+    running?: QueueTask[];
+    review?: QueueTask[];
+    blocked?: Array<{ task?: QueueTask; reasons?: string[] }>;
+    done?: QueueTask[];
+    failed?: QueueTask[];
+  };
+  pendingApprovals?: Array<{ proposalId?: string }>;
+  agentLaneCount?: number;
+  agentLanes?: AgentLanesResult["lanes"];
+};
+
+type ReviewMatrixResult = {
+  queue: {
+    queueId: string;
+    projectPath: string;
+    status: string;
+  };
+  summary?: {
+    totalTasks?: number;
+    openTasks?: number;
+    readyDependencyFree?: number;
+    blockedByDependencies?: number;
+    schedulerBlocked?: number;
+    scheduledPreview?: number;
+    launchable?: number;
+    waitingForStart?: number;
+    approvalRequired?: number;
+    pendingToolContextApprovals?: number;
+    tasksRequiringContext?: number;
+    tasksNeedingToolContextApproval?: number;
+    tasksNeedingToolContextProposal?: number;
+    uniqueRequiredGrants?: number;
+    fileScopes?: number;
+    overlappingFileScopes?: number;
+    dependencyEdges?: number;
+    rootTasks?: number;
+    leafTasks?: number;
+  };
+  buckets?: {
+    risk?: Array<{ key?: string; count?: number; openCount?: number }>;
+    phase?: Array<{ key?: string; count?: number; openCount?: number }>;
+    category?: Array<{ key?: string; count?: number; openCount?: number }>;
+    parallelGroup?: Array<{ key?: string; count?: number; openCount?: number }>;
+  };
+  dependencies?: {
+    edgeCount?: number;
+    blockedTasks?: unknown[];
+  };
+  parallelism?: {
+    activeWorkers?: number;
+    availableSlots?: number;
+    maxParallelAgents?: number;
+    workerStartBlocked?: boolean;
+    workerStartBlockedReason?: string;
+    serialTasks?: unknown[];
+    parallelSafeTasks?: unknown[];
+    scheduledPreview?: {
+      launchable?: unknown[];
+      waitingForStart?: unknown[];
+      approvalRequired?: unknown[];
+      blocked?: unknown[];
+    };
+  };
+  fileScopes?: Array<{
+    path?: string;
+    taskCount?: number;
+    openTaskCount?: number;
+    overlap?: boolean;
+  }>;
+  toolContext?: {
+    grants?: Array<{
+      grantKey?: string;
+      kind?: string;
+      policyStatus?: string;
+      taskCount?: number;
+      openTaskCount?: number;
+    }>;
+    tasks?: unknown[];
+    pendingApprovals?: unknown[];
+  };
+  executionBlocked?: boolean;
+  blockedReason?: string;
+};
+
+type TimelineResult = {
+  queue: {
+    queueId: string;
+    projectPath: string;
+  };
+  count: number;
+  items: Array<{
+    timelineId?: string;
+    source?: string;
+    kind?: string;
+    timestamp?: string;
+    title?: string;
+    summary?: string;
+    severity?: string;
+    queueTaskTitle?: string;
+  }>;
+};
+
+type TaskDetailResult = {
+  queue: {
+    queueId: string;
+    projectPath: string;
+    status: string;
+  };
+  task: QueueTask;
+  graph?: {
+    dependencies?: Array<{ queueTaskId?: string; title?: string; status?: string; satisfied?: boolean; missing?: boolean }>;
+    dependents?: Array<{ queueTaskId?: string; title?: string; status?: string; unblockedByCurrentTask?: boolean }>;
+  };
+  readiness?: {
+    readyNow?: boolean;
+    state?: string;
+    reasons?: string[];
+    dependenciesReady?: boolean;
+  };
+  workerRuns?: Array<{
+    workerRun?: {
+      workerRunId?: string;
+      worker?: string;
+      status?: string;
+      workspacePath?: string;
+    };
+    latestEvent?: {
+      kind?: string;
+      body?: string;
+    };
+    progress?: {
+      label?: string;
+      summary?: string;
+      nextAction?: string;
+    };
+  }>;
+  toolContextProposals?: Array<{ proposalId?: string; status?: string; approvalRequired?: boolean }>;
+  modelApprovals?: Array<{ requestId?: string; status?: string; risk?: string; estimate?: { estimatedCostUsd?: number } }>;
+  resume?: {
+    fabricResume?: {
+      resumePrompt?: string;
+    };
+    taskPacket?: Record<string, unknown>;
+  };
+};
+
+type QueueResumeResult = {
+  queueTask: QueueTask;
+  fabricResume: {
+    resumePrompt: string;
+    projectPath: string;
+    workspacePath?: string;
+    modelProfile?: string;
+    contextPolicy?: string;
+    latestCheckpoint?: unknown;
+  };
+  taskPacket: Record<string, unknown>;
+};
+
+type FabricTaskStatusResult = {
+  taskId: string;
+  status: string;
+  projectPath?: string;
+  workerRuns?: Array<{ workerRunId?: string; workspacePath?: string; status?: string }>;
+  latestCheckpoint?: { workerRunId?: string; summary?: Record<string, unknown> };
+  checkpoints?: Array<{ workerRunId?: string; summary?: Record<string, unknown> }>;
+};
+
+type ReviewedPatchApplyResult = {
+  queueTaskId: string;
+  fabricTaskId: string;
+  workerRunId: string;
+  patchFile: string;
+  cwd: string;
+  patchApply: Record<string, unknown>;
+};
+
+type QueueTask = {
+  queueTaskId: string;
+  fabricTaskId?: string;
+  title: string;
+  goal: string;
+  status: string;
+  category?: string;
+  risk?: string;
+  phase?: string;
+  priority?: string;
+  parallelGroup?: string;
+  parallelSafe?: boolean;
+  dependsOn?: unknown[];
+  expectedFiles?: unknown[];
+  acceptanceCriteria?: unknown[];
+  patchRefs?: unknown[];
+  testRefs?: unknown[];
+  summary?: string;
+  requiredTools?: unknown[];
+  requiredMcpServers?: unknown[];
+  requiredMemories?: unknown[];
+  requiredContextRefs?: unknown[];
+  assignedWorkerRunId?: string;
+};
+
+type NextReadyResult = {
+  ready: QueueTask[];
+  blocked: unknown[];
+  activeWorkers: number;
+  availableSlots: number;
+  executionBlocked?: boolean;
+  blockedReason?: string;
+  workerStartBlocked?: boolean;
+  workerStartBlockedReason?: string;
+};
+
+type LaunchPlanResult = {
+  queueId: string;
+  launchable: Array<LaunchPlanEntry>;
+  waitingForStart: Array<LaunchPlanEntry>;
+  approvalRequired: Array<LaunchPlanEntry>;
+  blocked: unknown[];
+  activeWorkers: number;
+  availableSlots: number;
+  executionBlocked?: boolean;
+  blockedReason?: string;
+  workerStartBlocked?: boolean;
+  workerStartBlockedReason?: string;
+  summary?: {
+    scheduled?: number;
+    launchable?: number;
+    waitingForStart?: number;
+    approvalRequired?: number;
+    needsProposal?: number;
+  };
+};
+
+type LaunchPlanEntry = {
+  task?: QueueTask;
+  toolContextProposal?: {
+    proposalId?: string;
+    status?: string;
+    approvalRequired?: boolean;
+    missingGrants?: unknown[];
+  };
+  approvalRequired?: boolean;
+  readyToLaunch?: boolean;
+  workerStartBlocked?: boolean;
+  launchBlockedReason?: string;
+  noContextRequired?: boolean;
+  needsProposal?: boolean;
+  missingGrants?: unknown[];
+};
+
+type PrepareReadyResult = {
+  queueId: string;
+  prepared: Array<{
+    task?: QueueTask;
+    toolContextProposal?: {
+      proposalId?: string;
+      status?: string;
+      approvalRequired?: boolean;
+      missingGrants?: unknown[];
+    };
+    approvalRequired?: boolean;
+    readyToClaim?: boolean;
+    readyToLaunch?: boolean;
+    launchBlockedReason?: string;
+    noContextRequired?: boolean;
+    reusedProposal?: boolean;
+    missingGrants?: unknown[];
+    memorySuggestions?: unknown[];
+  }>;
+  blocked: unknown[];
+  activeWorkers: number;
+  availableSlots: number;
+  executionBlocked?: boolean;
+  blockedReason?: string;
+  workerStartBlocked?: boolean;
+  workerStartBlockedReason?: string;
+  summary?: {
+    readyToClaim?: number;
+    readyToLaunch?: number;
+    approvalRequired?: number;
+    noContextRequired?: number;
+    waitingForStart?: number;
+  };
+};
+
+type ClaimNextResult = {
+  queueId: string;
+  claimed?: QueueTask;
+  executionBlocked?: boolean;
+  blockedReason?: string;
+  approvalRequired?: boolean;
+  toolContextProposal?: {
+    proposalId?: string;
+    queueTaskId?: string;
+    fabricTaskId?: string;
+    approvalRequired?: boolean;
+    missingGrants?: unknown[];
+  };
+  workerRun?: {
+    workerRunId?: string;
+    worker?: string;
+    status?: string;
+    workspacePath?: string;
+  };
+  blocked: unknown[];
+  activeWorkers: number;
+  availableSlots: number;
+};
+
+type RecoverStaleResult = {
+  queueId: string;
+  staleAfterMinutes: number;
+  action: "requeue" | "fail";
+  dryRun: boolean;
+  count: number;
+  recovered: Array<{
+    queueTaskId?: string;
+    workerRunId?: string;
+    workerStatus?: string;
+    workerUpdatedAt?: string;
+    reason?: string;
+    queueTask?: { title?: string; status?: string };
+  }>;
+};
+
+type RetryTaskResult = {
+  queue?: {
+    queueId?: string;
+    status?: string;
+  };
+  task?: QueueTask;
+  previousStatus?: string;
+  previousWorkerRunId?: string;
+  clearOutputs?: boolean;
+};
+
+type ToolContextProposal = {
+  proposalId: string;
+  approvalRequired: boolean;
+  missingGrants?: unknown[];
+};
+
+type PolicyAliasResult = {
+  alias: string;
+  provider: string;
+  model: string;
+  reasoning: string;
+};
+
+type PreflightResult = {
+  requestId: string;
+  decision: "allow" | "needs_user_approval" | "compact_first";
+  risk: string;
+  warnings?: string[];
+  estimate?: {
+    inputTokens?: number;
+    estimatedCostUsd?: number;
+  };
+  selected?: {
+    provider?: string;
+    model?: string;
+    reasoning?: string;
+  };
+};
+
+export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
+  const args = [...argv];
+  const command = args.shift() ?? "help";
+  if (command === "help" || command === "--help" || command === "-h") return { command: "help", json: false };
+
+  if (command === "create") {
+    const flags = parseFlags(args);
+    return {
+      command: "create",
+      json: flags.json,
+      projectPath: required(flags.projectPath, "create requires --project <path>"),
+      prompt: flags.prompt,
+      promptFile: flags.promptFile,
+      promptSummary: flags.promptSummary,
+      title: flags.title,
+      pipelineProfile: parseProfile(flags.profile ?? "balanced"),
+      maxParallelAgents: flags.maxAgents ?? 4
+    };
+  }
+
+  if (command === "demo-seed") {
+    const flags = parseFlags(args);
+    return {
+      command: "demo-seed",
+      json: flags.json,
+      projectPath: flags.projectPath ?? "/tmp/agent-fabric-desktop-demo",
+      title: flags.title,
+      maxParallelAgents: flags.maxAgents ?? 4
+    };
+  }
+
+  if (command === "start-plan") {
+    const flags = parseFlags(args);
+    return {
+      command: "start-plan",
+      json: flags.json,
+      queueId: required(flags.queueId, "start-plan requires --queue <id>"),
+      task: flags.task,
+      taskFile: flags.taskFile,
+      maxRounds: flags.maxRounds,
+      budgetUsd: flags.budgetUsd,
+      outputFormat: flags.outputFormat ? parseOutputFormat(flags.outputFormat) : undefined
+    };
+  }
+
+  if (command === "configure") {
+    const flags = parseFlags(args);
+    return {
+      command: "configure",
+      json: flags.json,
+      queueId: required(flags.queueId, "configure requires --queue <id>"),
+      title: flags.title,
+      pipelineProfile: flags.profile ? parseProfile(flags.profile) : undefined,
+      maxParallelAgents: flags.maxAgents,
+      note: flags.note
+    };
+  }
+
+  if (command === "improve-prompt") {
+    const flags = parseFlags(args);
+    return {
+      command: "improve-prompt",
+      json: flags.json,
+      queueId: required(flags.queueId, "improve-prompt requires --queue <id>"),
+      prompt: flags.prompt,
+      promptFile: flags.promptFile,
+      factorsFile: flags.factorsFile,
+      modelAlias: flags.modelAlias ?? "prompt.improve.strong",
+      approvalToken: flags.approvalToken,
+      accept: flags.accept,
+      outputFile: flags.outputFile
+    };
+  }
+
+  if (command === "generate-tasks") {
+    const flags = parseFlags(args);
+    return {
+      command: "generate-tasks",
+      json: flags.json,
+      queueId: required(flags.queueId, "generate-tasks requires --queue <id>"),
+      planFile: required(flags.planFile, "generate-tasks requires --plan-file <path>"),
+      modelAlias: flags.modelAlias ?? "task.writer",
+      approvalToken: flags.approvalToken,
+      tasksFile: flags.tasksFile,
+      approveQueue: flags.approveQueue
+    };
+  }
+
+  if (command === "review-queue") {
+    const flags = parseFlags(args);
+    return {
+      command: "review-queue",
+      json: flags.json,
+      queueId: required(flags.queueId, "review-queue requires --queue <id>"),
+      approveQueue: flags.approveQueue
+    };
+  }
+
+  if (command === "claim-next") {
+    const flags = parseFlags(args);
+    return {
+      command: "claim-next",
+      json: flags.json,
+      queueId: required(flags.queueId, "claim-next requires --queue <id>"),
+      workerRunId: flags.workerRunId,
+      worker: flags.worker ? parseWorker(flags.worker) : undefined,
+      workspaceMode: flags.workspaceMode ? parseWorkspaceMode(flags.workspaceMode) : undefined,
+      workspacePath: flags.workspacePath,
+      modelProfile: flags.modelProfile,
+      contextPolicy: flags.contextPolicy,
+      maxRuntimeMinutes: flags.maxRuntimeMinutes,
+      commandLine: flags.commandLine
+    };
+  }
+
+  if (command === "prepare-ready") {
+    const flags = parseFlags(args);
+    return {
+      command: "prepare-ready",
+      json: flags.json,
+      queueId: required(flags.queueId, "prepare-ready requires --queue <id>"),
+      limit: flags.limit
+    };
+  }
+
+  if (command === "decide-queue") {
+    const flags = parseFlags(args);
+    return {
+      command: "decide-queue",
+      json: flags.json,
+      queueId: required(flags.queueId, "decide-queue requires --queue <id>"),
+      decision: required(flags.decision, "decide-queue requires --decision <decision>"),
+      note: flags.note
+    };
+  }
+
+  if (command === "recover-stale") {
+    const flags = parseFlags(args);
+    return {
+      command: "recover-stale",
+      json: flags.json,
+      queueId: required(flags.queueId, "recover-stale requires --queue <id>"),
+      staleAfterMinutes: flags.staleAfterMinutes,
+      action: parseRecoveryAction(flags.recoveryAction ?? "requeue"),
+      dryRun: flags.dryRun
+    };
+  }
+
+  if (command === "retry-task") {
+    const flags = parseFlags(args);
+    return {
+      command: "retry-task",
+      json: flags.json,
+      queueId: required(flags.queueId, "retry-task requires --queue <id>"),
+      queueTaskId: required(flags.queueTaskId, "retry-task requires --queue-task <id>"),
+      reason: flags.reason,
+      clearOutputs: !flags.keepOutputs
+    };
+  }
+
+  if (command === "edit-task") {
+    const flags = parseFlags(args);
+    return {
+      command: "edit-task",
+      json: flags.json,
+      queueId: required(flags.queueId, "edit-task requires --queue <id>"),
+      queueTaskId: required(flags.queueTaskId, "edit-task requires --queue-task <id>"),
+      metadataFile: required(flags.metadataFile, "edit-task requires --metadata-file <path>"),
+      note: flags.note
+    };
+  }
+
+  if (command === "review-patches") {
+    const flags = parseFlags(args);
+    if (flags.applyPatch && !flags.acceptTaskId) {
+      throw new FabricError("INVALID_INPUT", "review-patches --apply-patch requires --accept-task <queueTaskId>", false);
+    }
+    return {
+      command: "review-patches",
+      json: flags.json,
+      queueId: required(flags.queueId, "review-patches requires --queue <id>"),
+      acceptTaskId: flags.acceptTaskId,
+      applyPatch: flags.applyPatch,
+      applyCwd: flags.applyCwd
+    };
+  }
+
+  if (command === "write-task-packets") {
+    const flags = parseFlags(args);
+    return {
+      command: "write-task-packets",
+      json: flags.json,
+      queueId: required(flags.queueId, "write-task-packets requires --queue <id>"),
+      outDir: required(flags.outDir, "write-task-packets requires --out-dir <path>"),
+      format: parsePacketFormat(flags.format ?? "json"),
+      readyOnly: flags.readyOnly
+    };
+  }
+
+  if (command === "resume-task") {
+    const flags = parseFlags(args);
+    return {
+      command: "resume-task",
+      json: flags.json,
+      queueId: required(flags.queueId, "resume-task requires --queue <id>"),
+      queueTaskId: required(flags.queueTaskId, "resume-task requires --queue-task <id>"),
+      preferredWorker: flags.worker ? parseWorker(flags.worker) : undefined,
+      outputFile: flags.outputFile,
+      format: parsePacketFormat(flags.format ?? "markdown")
+    };
+  }
+
+  if (command === "run-task") {
+    const flags = parseFlags(args);
+    return {
+      command: "run-task",
+      json: flags.json,
+      queueId: required(flags.queueId, "run-task requires --queue <id>"),
+      queueTaskId: required(flags.queueTaskId, "run-task requires --queue-task <id>"),
+      commandLine: required(flags.commandLine, "run-task requires --command <command>"),
+      cwd: flags.cwd,
+      cwdPrep: parseCwdPrep(flags.cwdPrep ?? "auto"),
+      taskPacketPath: flags.taskPacketPath,
+      taskPacketFormat: parsePacketFormat(flags.taskPacketFormat ?? "json"),
+      worker: parseWorker(flags.worker ?? "local-cli"),
+      workspaceMode: parseWorkspaceMode(flags.workspaceMode ?? "in_place"),
+      modelProfile: flags.modelProfile ?? "execute.cheap",
+      maxRuntimeMinutes: flags.maxRuntimeMinutes,
+      approvalToken: flags.approvalToken,
+      successStatus: parseSuccessStatus(flags.successStatus ?? "patch_ready"),
+      maxOutputChars: flags.maxOutputChars ?? 8_000,
+      approveToolContext: flags.approveToolContext,
+      rememberToolContext: flags.rememberToolContext
+    };
+  }
+
+  if (command === "run-ready") {
+    const flags = parseFlags(args);
+    return {
+      command: "run-ready",
+      json: flags.json,
+      queueId: required(flags.queueId, "run-ready requires --queue <id>"),
+      commandTemplate: flags.commandTemplate,
+      cwd: flags.cwd,
+      cwdTemplate: flags.cwdTemplate,
+      cwdPrep: parseCwdPrep(flags.cwdPrep ?? "auto"),
+      taskPacketDir: flags.taskPacketDir,
+      taskPacketFormat: parsePacketFormat(flags.taskPacketFormat ?? "json"),
+      limit: flags.limit,
+      parallel: flags.parallel ?? 1,
+      allowSharedCwd: flags.allowSharedCwd,
+      worker: parseWorker(flags.worker ?? "local-cli"),
+      workspaceMode: parseWorkspaceMode(flags.workspaceMode ?? "in_place"),
+      modelProfile: flags.modelProfile ?? "execute.cheap",
+      maxRuntimeMinutes: flags.maxRuntimeMinutes,
+      approvalToken: flags.approvalToken,
+      successStatus: parseSuccessStatus(flags.successStatus ?? "patch_ready"),
+      maxOutputChars: flags.maxOutputChars ?? 8_000,
+      approveToolContext: flags.approveToolContext,
+      rememberToolContext: flags.rememberToolContext,
+      continueOnFailure: flags.continueOnFailure,
+      adaptiveRateLimit: flags.adaptiveRateLimit,
+      minParallel: flags.minParallel ?? 1,
+      allowConcurrentRunner: flags.allowConcurrentRunner
+    };
+  }
+
+  if (command === "factory-run") {
+    const flags = parseFlags(args);
+    return {
+      command: "factory-run",
+      json: flags.json,
+      queueId: required(flags.queueId, "factory-run requires --queue <id>"),
+      limit: flags.limit,
+      parallel: flags.parallel ?? 4,
+      minParallel: flags.minParallel ?? 1,
+      adaptiveRateLimit: !flags.noAdaptiveRateLimit,
+      taskPacketDir: flags.taskPacketDir,
+      cwdTemplate: flags.cwdTemplate,
+      deepSeekWorkerCommand: flags.deepSeekWorkerCommand ?? "agent-fabric-deepseek-worker",
+      deepSeekRole: parseDeepSeekRole(flags.deepSeekRole ?? "auto"),
+      sensitiveContextMode: parseSensitiveContextMode(flags.sensitiveContextMode ?? "basic", flags.allowSensitiveContext),
+      patchMode: parseFactoryPatchMode(flags.patchMode ?? "write"),
+      approvalToken: flags.approvalToken,
+      maxRuntimeMinutes: flags.maxRuntimeMinutes,
+      maxOutputChars: flags.maxOutputChars ?? 8_000,
+      approveToolContext: flags.approveToolContext,
+      rememberToolContext: flags.rememberToolContext,
+      continueOnFailure: flags.continueOnFailure,
+      startExecution: flags.startExecution,
+      dryRun: flags.dryRun,
+      allowSensitiveContext: flags.allowSensitiveContext,
+      allowConcurrentRunner: flags.allowConcurrentRunner
+    };
+  }
+
+  if (command === "launch-plan") {
+    const flags = parseFlags(args);
+    return {
+      command: "launch-plan",
+      json: flags.json,
+      queueId: required(flags.queueId, "launch-plan requires --queue <id>"),
+      limit: flags.limit
+    };
+  }
+
+  if (command === "import-tasks") {
+    const flags = parseFlags(args);
+    return {
+      command: "import-tasks",
+      json: flags.json,
+      queueId: required(flags.queueId, "import-tasks requires --queue <id>"),
+      tasksFile: required(flags.tasksFile, "import-tasks requires --tasks-file <path>"),
+      approveQueue: flags.approveQueue
+    };
+  }
+
+  if (command === "list") {
+    const flags = parseFlags(args);
+    return {
+      command: "list",
+      json: flags.json,
+      projectPath: flags.projectPath,
+      statuses: flags.queueStatuses ?? [],
+      includeClosed: flags.includeClosed,
+      limit: flags.limit
+    };
+  }
+
+  if (command === "approval-inbox") {
+    const flags = parseFlags(args);
+    return {
+      command: "approval-inbox",
+      json: flags.json,
+      projectPath: flags.projectPath,
+      queueId: flags.queueId,
+      limit: flags.limit
+    };
+  }
+
+  if (command === "memory-inbox") {
+    const flags = parseFlags(args);
+    return {
+      command: "memory-inbox",
+      json: flags.json,
+      status: flags.status ?? "pending_review",
+      archived: flags.archived,
+      limit: flags.limit
+    };
+  }
+
+  if (command === "review-memory") {
+    const flags = parseFlags(args);
+    const memoryId = args.shift() ?? flags.memoryId ?? flags.proposalId;
+    return {
+      command: "review-memory",
+      json: flags.json,
+      memoryId: required(memoryId, "review-memory requires <memoryId>"),
+      decision: parseMemoryReviewDecision(flags.decision ?? "approve"),
+      reason: flags.reason ?? flags.note
+    };
+  }
+
+  if (command === "queue-approvals") {
+    const flags = parseFlags(args);
+    return {
+      command: "queue-approvals",
+      json: flags.json,
+      queueId: required(flags.queueId, "queue-approvals requires --queue <id>"),
+      includeExpired: flags.includeExpired,
+      limit: flags.limit
+    };
+  }
+
+  if (command === "lanes") {
+    const flags = parseFlags(args);
+    return {
+      command: "lanes",
+      json: flags.json,
+      queueId: required(flags.queueId, "lanes requires --queue <id>"),
+      includeCompleted: flags.includeCompleted,
+      maxEventsPerLane: flags.maxEventsPerLane
+    };
+  }
+
+  if (command === "dashboard") {
+    const flags = parseFlags(args);
+    return {
+      command: "dashboard",
+      json: flags.json,
+      queueId: required(flags.queueId, "dashboard requires --queue <id>"),
+      includeCompletedLanes: flags.includeCompleted,
+      maxEventsPerLane: flags.maxEventsPerLane
+    };
+  }
+
+  if (command === "review-matrix") {
+    const flags = parseFlags(args);
+    return {
+      command: "review-matrix",
+      json: flags.json,
+      queueId: required(flags.queueId, "review-matrix requires --queue <id>"),
+      limit: flags.limit
+    };
+  }
+
+  if (command === "task-detail") {
+    const flags = parseFlags(args);
+    return {
+      command: "task-detail",
+      json: flags.json,
+      queueId: required(flags.queueId, "task-detail requires --queue <id>"),
+      queueTaskId: required(flags.queueTaskId, "task-detail requires --queue-task <id>"),
+      includeResume: flags.includeResume,
+      preferredWorker: flags.worker ? parseWorker(flags.worker) : undefined,
+      maxEventsPerRun: flags.maxEventsPerLane
+    };
+  }
+
+  if (command === "timeline") {
+    const flags = parseFlags(args);
+    return {
+      command: "timeline",
+      json: flags.json,
+      queueId: required(flags.queueId, "timeline requires --queue <id>"),
+      limit: flags.limit
+    };
+  }
+
+  if (command === "status") {
+    const flags = parseFlags(args);
+    return {
+      command: "status",
+      json: flags.json,
+      queueId: required(flags.queueId, "status requires --queue <id>")
+    };
+  }
+
+  if (command === "launch") {
+    const flags = parseFlags(args);
+    return {
+      command: "launch",
+      json: flags.json,
+      queueId: required(flags.queueId, "launch requires --queue <id>"),
+      limit: flags.limit,
+      worker: parseWorker(flags.worker ?? "local-cli"),
+      workspaceMode: parseWorkspaceMode(flags.workspaceMode ?? "git_worktree"),
+      modelProfile: flags.modelProfile ?? "execute.cheap",
+      workspacePath: flags.workspacePath,
+      maxRuntimeMinutes: flags.maxRuntimeMinutes
+    };
+  }
+
+  if (command === "approve-tool") {
+    const flags = parseFlags(args);
+    const proposalId = args.shift() ?? flags.proposalId;
+    return {
+      command: "approve-tool",
+      json: flags.json,
+      proposalId: required(proposalId, "approve-tool requires <proposalId>"),
+      remember: flags.remember,
+      note: flags.note
+    };
+  }
+
+  if (command === "decide-tool") {
+    const flags = parseFlags(args);
+    const proposalId = args.shift() ?? flags.proposalId;
+    return {
+      command: "decide-tool",
+      json: flags.json,
+      proposalId: required(proposalId, "decide-tool requires <proposalId>"),
+      decision: parseToolDecision(flags.decision ?? "approve"),
+      remember: flags.remember,
+      note: flags.note
+    };
+  }
+
+  if (command === "set-tool-policy") {
+    const flags = parseFlags(args);
+    return {
+      command: "set-tool-policy",
+      json: flags.json,
+      projectPath: required(flags.projectPath, "set-tool-policy requires --project <path>"),
+      grantKind: required(flags.grantKind, "set-tool-policy requires --kind <mcp_server|tool|memory|context>"),
+      value: required(flags.value, "set-tool-policy requires --value <value>"),
+      status: parsePolicyStatus(flags.status ?? "approved")
+    };
+  }
+
+  throw new FabricError("INVALID_INPUT", `Unknown project CLI command: ${command}`, false);
+}
+
+export async function runProjectCommand(
+  command: ProjectCliCommand,
+  call: ProjectToolCaller,
+  options: { runModel?: ProjectModelRunner } = {}
+): Promise<ProjectRunResult> {
+  if (command.command === "help") {
+    return { action: "help", message: projectHelp(), data: {} };
+  }
+  if (command.command === "create") {
+    return createQueue(command, call);
+  }
+  if (command.command === "demo-seed") {
+    return seedDemoProject(command, call);
+  }
+  if (command.command === "start-plan") {
+    return startPlan(command, call);
+  }
+  if (command.command === "configure") {
+    const result = await call<{ queue?: { queueId?: string; title?: string; pipelineProfile?: string; maxParallelAgents?: number } }>(
+      "project_queue_update_settings",
+      {
+        queueId: command.queueId,
+        title: command.title,
+        pipelineProfile: command.pipelineProfile,
+        maxParallelAgents: command.maxParallelAgents,
+        note: command.note
+      }
+    );
+    const queue = result.queue ?? {};
+    return {
+      action: "queue_configured",
+      message: `Configured queue ${queue.queueId ?? command.queueId}: title=${queue.title ?? "unchanged"}, profile=${
+        queue.pipelineProfile ?? "unchanged"
+      }, maxAgents=${queue.maxParallelAgents ?? "unchanged"}`,
+      data: result as unknown as Record<string, unknown>
+    };
+  }
+  if (command.command === "improve-prompt") {
+    return improvePrompt(command, call, options.runModel ?? defaultModelRunner);
+  }
+  if (command.command === "generate-tasks") {
+    return generateTasks(command, call, options.runModel ?? defaultModelRunner);
+  }
+  if (command.command === "review-queue") {
+    return reviewQueue(command, call);
+  }
+  if (command.command === "decide-queue") {
+    const result = await call<Record<string, unknown>>("project_queue_decide", {
+      queueId: command.queueId,
+      decision: command.decision,
+      note: command.note
+    });
+    return {
+      action: "queue_decided",
+      message: `Queue ${command.queueId} decision ${command.decision}; status=${result.status ?? "unknown"}`,
+      data: result
+    };
+  }
+  if (command.command === "claim-next") {
+    const claimed = await call<ClaimNextResult>("project_queue_claim_next", {
+      queueId: command.queueId,
+      workerRunId: command.workerRunId,
+      worker: command.worker,
+      workspaceMode: command.workspaceMode,
+      workspacePath: command.workspacePath,
+      modelProfile: command.modelProfile,
+      contextPolicy: command.contextPolicy,
+      maxRuntimeMinutes: command.maxRuntimeMinutes,
+      command: command.commandLine ? [command.commandLine] : undefined
+    });
+    return { action: "task_claimed", message: formatClaimNext(claimed), data: claimed as unknown as Record<string, unknown> };
+  }
+  if (command.command === "prepare-ready") {
+    const prepared = await call<PrepareReadyResult>("project_queue_prepare_ready", {
+      queueId: command.queueId,
+      limit: command.limit
+    });
+    return { action: "ready_tasks_prepared", message: formatPrepareReady(prepared), data: prepared as unknown as Record<string, unknown> };
+  }
+  if (command.command === "recover-stale") {
+    const recovered = await call<RecoverStaleResult>("project_queue_recover_stale", {
+      queueId: command.queueId,
+      staleAfterMinutes: command.staleAfterMinutes,
+      action: command.action,
+      dryRun: command.dryRun
+    });
+    return { action: "stale_recovered", message: formatRecoverStale(recovered), data: recovered as unknown as Record<string, unknown> };
+  }
+  if (command.command === "retry-task") {
+    const retried = await call<RetryTaskResult>("project_queue_retry_task", {
+      queueId: command.queueId,
+      queueTaskId: command.queueTaskId,
+      reason: command.reason,
+      clearOutputs: command.clearOutputs
+    });
+    return { action: "task_retried", message: formatRetryTask(retried), data: retried as unknown as Record<string, unknown> };
+  }
+  if (command.command === "edit-task") {
+    const metadata = parseTaskMetadataFile(command.metadataFile);
+    const edited = await call<{ queue?: { queueId?: string; status?: string }; task?: QueueTask; previousTask?: QueueTask }>("project_queue_update_task_metadata", {
+      queueId: command.queueId,
+      queueTaskId: command.queueTaskId,
+      note: command.note,
+      ...metadata
+    });
+    return {
+      action: "task_metadata_updated",
+      message: formatTaskMetadataUpdated(edited),
+      data: edited as unknown as Record<string, unknown>
+    };
+  }
+  if (command.command === "review-patches") {
+    return reviewPatches(command, call);
+  }
+  if (command.command === "write-task-packets") {
+    return writeTaskPackets(command, call);
+  }
+  if (command.command === "resume-task") {
+    return resumeQueueTask(command, call);
+  }
+  if (command.command === "run-task") {
+    return runTask(command, call);
+  }
+  if (command.command === "run-ready") {
+    return withQueueRunnerLock("run-ready", command.queueId, command.allowConcurrentRunner === true, () => runReady(command, call));
+  }
+  if (command.command === "factory-run") {
+    if (command.dryRun) return factoryRun(command, call);
+    return withQueueRunnerLock("factory-run", command.queueId, command.allowConcurrentRunner === true, () => factoryRun(command, call));
+  }
+  if (command.command === "launch-plan") {
+    const plan = await call<LaunchPlanResult>("project_queue_launch_plan", {
+      queueId: command.queueId,
+      limit: command.limit
+    });
+    return { action: "launch_plan", message: formatLaunchPlan(plan), data: plan as unknown as Record<string, unknown> };
+  }
+  if (command.command === "import-tasks") {
+    return importTasks(command, call);
+  }
+  if (command.command === "list") {
+    const list = await call<QueueListResult>("project_queue_list", {
+      projectPath: command.projectPath,
+      statuses: command.statuses,
+      includeClosed: command.includeClosed,
+      limit: command.limit
+    });
+    return { action: "queues_listed", message: formatQueueList(list), data: list as unknown as Record<string, unknown> };
+  }
+  if (command.command === "approval-inbox") {
+    const inbox = await call<PendingApprovalInbox>("tool_context_pending", {
+      projectPath: command.projectPath,
+      queueId: command.queueId,
+      limit: command.limit
+    });
+    return { action: "approval_inbox", message: formatApprovalInbox(inbox), data: inbox as unknown as Record<string, unknown> };
+  }
+  if (command.command === "memory-inbox") {
+    const inbox = await call<{ memories?: Record<string, unknown>[]; total?: number }>("memory_list", {
+      status: command.status,
+      archived: command.archived,
+      max: command.limit
+    });
+    return { action: "memory_inbox", message: formatMemoryInbox(inbox), data: inbox as unknown as Record<string, unknown> };
+  }
+  if (command.command === "review-memory") {
+    const reviewed = await call<Record<string, unknown>>("memory_review", {
+      id: command.memoryId,
+      decision: command.decision,
+      reason: command.reason
+    });
+    return { action: "memory_reviewed", message: formatMemoryReview(reviewed), data: reviewed };
+  }
+  if (command.command === "queue-approvals") {
+    const inbox = await call<QueueApprovalInbox>("project_queue_approval_inbox", {
+      queueId: command.queueId,
+      includeExpired: command.includeExpired,
+      limit: command.limit
+    });
+    return { action: "queue_approval_inbox", message: formatQueueApprovalInbox(command.queueId, inbox), data: inbox as unknown as Record<string, unknown> };
+  }
+  if (command.command === "lanes") {
+    const lanes = await call<AgentLanesResult>("project_queue_agent_lanes", {
+      queueId: command.queueId,
+      includeCompleted: command.includeCompleted,
+      maxEventsPerLane: command.maxEventsPerLane
+    });
+    return { action: "agent_lanes", message: formatAgentLanes(command.queueId, lanes), data: lanes as unknown as Record<string, unknown> };
+  }
+  if (command.command === "dashboard") {
+    const dashboard = await call<DashboardResult>("project_queue_dashboard", {
+      queueId: command.queueId,
+      includeCompletedLanes: command.includeCompletedLanes,
+      maxEventsPerLane: command.maxEventsPerLane
+    });
+    return { action: "dashboard", message: formatDashboard(dashboard), data: dashboard as unknown as Record<string, unknown> };
+  }
+  if (command.command === "review-matrix") {
+    const matrix = await call<ReviewMatrixResult>("project_queue_review_matrix", {
+      queueId: command.queueId,
+      limit: command.limit
+    });
+    return { action: "review_matrix", message: formatReviewMatrix(matrix), data: matrix as unknown as Record<string, unknown> };
+  }
+  if (command.command === "task-detail") {
+    const detail = await call<TaskDetailResult>("project_queue_task_detail", {
+      queueId: command.queueId,
+      queueTaskId: command.queueTaskId,
+      includeResume: command.includeResume,
+      preferredWorker: command.preferredWorker,
+      maxEventsPerRun: command.maxEventsPerRun
+    });
+    return { action: "task_detail", message: formatTaskDetail(detail), data: detail as unknown as Record<string, unknown> };
+  }
+  if (command.command === "timeline") {
+    const timeline = await call<TimelineResult>("project_queue_timeline", {
+      queueId: command.queueId,
+      limit: command.limit
+    });
+    return { action: "timeline", message: formatTimeline(timeline), data: timeline as unknown as Record<string, unknown> };
+  }
+  if (command.command === "status") {
+    const status = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+    return { action: "status", message: formatStatus(status), data: status as unknown as Record<string, unknown> };
+  }
+  if (command.command === "launch") {
+    return launchReadyWorkers(command, call);
+  }
+  if (command.command === "set-tool-policy") {
+    return setToolPolicy(command, call);
+  }
+  return decideToolProposal(command, call);
+}
+
+export function formatProjectResult(result: ProjectRunResult, json: boolean): string {
+  if (json) return JSON.stringify(result.data, null, 2);
+  return result.message;
+}
+
+export function projectHelp(): string {
+  return [
+    "Usage:",
+    "  agent-fabric-project create --project <path> (--prompt <text>|--prompt-file <file>|--prompt-summary <text>) [--title <text>] [--profile fast|balanced|careful|custom] [--max-agents <n>] [--json]",
+    "  agent-fabric-project demo-seed [--project <path>] [--title <text>] [--max-agents <n>] [--json]",
+    "  agent-fabric-project configure --queue <id> [--title <text>] [--profile fast|balanced|careful|custom] [--max-agents <n>] [--note <text>] [--json]",
+    "  agent-fabric-project improve-prompt --queue <id> (--prompt <text>|--prompt-file <file>) [--factors-file <file>] [--model-alias <alias>] [--approval-token <token>] [--accept] [--output-file <file>] [--json]",
+    "  agent-fabric-project start-plan --queue <id> (--task <text>|--task-file <file>) [--max-rounds <n>] [--budget-usd <n>] [--output-format markdown|adr] [--json]",
+    "  agent-fabric-project generate-tasks --queue <id> --plan-file <file> [--model-alias <alias>] [--approval-token <token>] [--tasks-file <file>] [--approve-queue] [--json]",
+    "  agent-fabric-project review-queue --queue <id> [--approve-queue] [--json]",
+    "  agent-fabric-project decide-queue --queue <id> --decision accept_improved_prompt|request_prompt_revision|accept_plan|request_plan_revision|approve_queue|start_execution|pause|resume|cancel|complete [--note <text>] [--json]",
+    "  agent-fabric-project claim-next --queue <id> [--worker-run <workerRunId>] [--worker local-cli|openhands|aider|smolagents|deepseek-direct|manual] [--workspace-mode in_place|git_worktree|clone|sandbox] [--workspace-path <path>] [--model-profile <alias>] [--context-policy <policy>] [--command <cmd>] [--json]",
+    "  agent-fabric-project prepare-ready --queue <id> [--limit <n>] [--json]",
+    "  agent-fabric-project recover-stale --queue <id> [--stale-after-minutes <n>] [--recovery-action requeue|fail] [--dry-run] [--json]",
+    "  agent-fabric-project retry-task --queue <id> --queue-task <queueTaskId> [--reason <text>] [--keep-outputs] [--json]",
+    "  agent-fabric-project edit-task --queue <id> --queue-task <queueTaskId> --metadata-file <file> [--note <text>] [--json]",
+    "  agent-fabric-project import-tasks --queue <id> --tasks-file <file> [--approve-queue] [--json]",
+    "  agent-fabric-project list [--project <path>] [--queue-status <status>] [--include-closed] [--limit <n>] [--json]",
+    "  agent-fabric-project approval-inbox [--project <path>] [--queue <id>] [--limit <n>] [--json]",
+    "  agent-fabric-project memory-inbox [--status pending_review|active|archived] [--archived] [--limit <n>] [--json]",
+    "  agent-fabric-project review-memory <memoryId> --decision approve|reject|archive [--reason <text>] [--json]",
+    "  agent-fabric-project queue-approvals --queue <id> [--include-expired] [--limit <n>] [--json]",
+    "  agent-fabric-project lanes --queue <id> [--include-completed] [--max-events <n>] [--json]",
+    "  agent-fabric-project dashboard --queue <id> [--include-completed] [--max-events <n>] [--json]",
+    "  agent-fabric-project review-matrix --queue <id> [--limit <n>] [--json]",
+    "  agent-fabric-project task-detail --queue <id> --queue-task <queueTaskId> [--include-resume] [--worker local-cli|openhands|aider|smolagents|deepseek-direct|manual] [--max-events <n>] [--json]",
+    "  agent-fabric-project timeline --queue <id> [--limit <n>] [--json]",
+    "  agent-fabric-project review-patches --queue <id> [--accept-task <queueTaskId>] [--apply-patch] [--apply-cwd <path>] [--json]",
+    "  agent-fabric-project write-task-packets --queue <id> --out-dir <dir> [--format json|markdown] [--ready-only] [--json]",
+    "  agent-fabric-project resume-task --queue <id> --queue-task <queueTaskId> [--worker local-cli|openhands|aider|smolagents|deepseek-direct|manual] [--output-file <file>] [--format json|markdown] [--json]",
+    "  agent-fabric-project run-task --queue <id> --queue-task <queueTaskId> --command <cmd> [--cwd <path>] [--cwd-prep auto|none|mkdir] [--task-packet <path>] [--task-packet-format json|markdown] [--approval-token <token>] [--approve-tool-context] [--remember-tool-context] [--success-status patch_ready|completed] [--json]",
+    "  agent-fabric-project run-ready --queue <id> [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--adaptive-rate-limit] [--command-template <cmd>] [--cwd-template <path>] [--cwd-prep auto|none|mkdir] [--task-packet-dir <dir>] [--task-packet-format json|markdown] [--worker local-cli|openhands|aider|smolagents|deepseek-direct|manual] [--approval-token <token>] [--approve-tool-context] [--allow-concurrent-runner] [--continue-on-failure] [--json]",
+    "  agent-fabric-project factory-run --queue <id> [--start-execution] [--dry-run] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--task-packet-dir <dir>] [--cwd-template <path>] [--deepseek-worker-command <cmd>] [--deepseek-role auto|implementer|reviewer|risk-reviewer|adjudicator|planner] [--sensitive-context-mode basic|strict|off] [--patch-mode report|write] [--approval-token <token>] [--approve-tool-context] [--allow-sensitive-context] [--allow-concurrent-runner] [--continue-on-failure] [--no-adaptive-rate-limit] [--json]",
+    "  agent-fabric-project launch-plan --queue <id> [--limit <n>] [--json]",
+    "  agent-fabric-project status --queue <id> [--json]",
+    "  agent-fabric-project launch --queue <id> [--limit <n>] [--worker local-cli|openhands|aider|smolagents|deepseek-direct|manual] [--workspace-mode in_place|git_worktree|clone|sandbox] [--model-profile <alias>] [--workspace-path <path>] [--max-runtime-minutes <n>] [--json]",
+    "  agent-fabric-project approve-tool <proposalId> [--remember] [--note <text>] [--json]",
+    "  agent-fabric-project decide-tool <proposalId> --decision approve|reject|revise [--remember] [--note <text>] [--json]",
+    "  agent-fabric-project set-tool-policy --project <path> --kind mcp_server|tool|memory|context --value <value> --status approved|rejected [--json]"
+  ].join("\n");
+}
+
+async function createQueue(
+  command: Extract<ProjectCliCommand, { command: "create" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const prompt = command.prompt ?? (command.promptFile ? readFile(command.promptFile) : undefined);
+  if (!prompt && !command.promptSummary) {
+    throw new FabricError("INVALID_INPUT", "create requires prompt, promptFile, or promptSummary", false);
+  }
+  const created = await call<Record<string, unknown>>("project_queue_create", {
+    projectPath: command.projectPath,
+    prompt,
+    promptSummary: command.promptSummary,
+    title: command.title,
+    pipelineProfile: command.pipelineProfile,
+    maxParallelAgents: command.maxParallelAgents
+  });
+  await call("project_queue_record_stage", {
+    queueId: created.queueId,
+    stage: "prompt_improvement",
+    status: "pending",
+    modelAlias: "prompt.improve.strong",
+    inputSummary: "Prompt captured by project CLI; raw prompt remains outside agent-fabric storage.",
+    warnings: ["Review the improved prompt before planning."]
+  });
+  return {
+    action: "created",
+    message: `Created queue ${String(created.queueId)} for ${command.projectPath}.\nNext: run start-plan after prompt improvement is accepted.`,
+    data: created
+  };
+}
+
+async function seedDemoProject(
+  command: Extract<ProjectCliCommand, { command: "demo-seed" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  mkdirSync(command.projectPath, { recursive: true });
+  const title = command.title ?? "Agent Fabric Console demo command center";
+  const created = await call<Record<string, unknown>>("project_queue_create", {
+    projectPath: command.projectPath,
+    promptSummary: "Demo a project-level Agent Fabric Console queue with live worker lanes, approvals, patch review, recovery, memory, and cost/risk surfaces.",
+    title,
+    pipelineProfile: "careful",
+    maxParallelAgents: command.maxParallelAgents
+  });
+  const queueId = String(created.queueId);
+
+  await recordDemoStage(call, queueId, {
+    stage: "prompt_improvement",
+    status: "completed",
+    modelAlias: "prompt.improve.strong",
+    outputSummary: "Improved prompt keeps the user's Desktop command-center goal and makes approval gates explicit."
+  });
+  await call("project_queue_decide", {
+    queueId,
+    decision: "accept_improved_prompt",
+    note: "Accepted by project CLI demo seed."
+  });
+  await recordDemoStage(call, queueId, {
+    stage: "planning",
+    status: "completed",
+    modelAlias: "plan.strong",
+    outputSummary: "Accepted plan keeps agent-fabric as durable substrate and Agent Fabric Console as the first command-center UI.",
+    artifacts: [{ kind: "demo_plan", ref: "agent-fabric-project demo-seed" }]
+  });
+  await call("project_queue_decide", {
+    queueId,
+    decision: "accept_plan",
+    note: "Accepted by project CLI demo seed."
+  });
+  await recordDemoStage(call, queueId, {
+    stage: "phasing",
+    status: "completed",
+    modelAlias: "phase.splitter",
+    outputSummary: "Plan split into Desktop telemetry, approval, review, recovery, queue health, and memory-context slices."
+  });
+  await recordDemoStage(call, queueId, {
+    stage: "task_writing",
+    status: "completed",
+    modelAlias: "task.writer",
+    outputSummary: "Concrete coding tasks include acceptance criteria, risk, dependencies, files, and required tools."
+  });
+  await recordDemoStage(call, queueId, {
+    stage: "queue_shaping",
+    status: "needs_review",
+    modelAlias: "tool.context.manager",
+    outputSummary: "Queue is shaped by dependency, risk, parallel safety, tool needs, and review state.",
+    warnings: ["GitHub MCP remains intentionally unapproved so the approval inbox has real work."]
+  });
+
+  const memory = await call<{ id?: string }>("memory_write", {
+    type: "procedural",
+    body: "For Agent Fabric Console demos, show real queue state: active lanes, approval inbox, patch-ready review, failed recovery, queue health, and memory suggestions.",
+    intent_keys: ["local-cli", "desktop", "demo", "queue", "review"],
+    refs: ["demo://agent-fabric-desktop-command-center"],
+    source: "auto",
+    derivation: "demo_seed",
+    initialConfidence: 0.72
+  });
+  const memoryId = String(memory.id ?? "");
+  if (!memoryId) throw new FabricError("PROJECT_DEMO_SEED_FAILED", "memory_write did not return a memory id", false);
+
+  const added = await call<Record<string, unknown>>("project_queue_add_tasks", {
+    queueId,
+    tasks: demoSeedTasks(memoryId)
+  });
+  const tasks = demoCreatedTaskMap(added);
+  const laneTelemetry = requireDemoTask(tasks, "lane-telemetry");
+  const toolApproval = requireDemoTask(tasks, "tool-approval");
+  const patchReview = requireDemoTask(tasks, "patch-review");
+  const recoveryDemo = requireDemoTask(tasks, "recovery-demo");
+  const queueHealth = requireDemoTask(tasks, "queue-health");
+  const blockedFollowup = requireDemoTask(tasks, "blocked-followup");
+  const memoryContext = requireDemoTask(tasks, "memory-context");
+
+  await call("tool_context_policy_set", {
+    projectPath: command.projectPath,
+    grantKind: "tool",
+    value: "shell",
+    status: "approved"
+  });
+  const prepared = await call<PrepareReadyResult>("project_queue_prepare_ready", {
+    queueId,
+    limit: command.maxParallelAgents
+  });
+  await recordDemoStage(call, queueId, {
+    stage: "tool_context",
+    status: "needs_review",
+    modelAlias: "tool.context.manager",
+    outputSummary: `Prepared ${prepared.prepared.length} ready task(s); approvals=${prepared.summary?.approvalRequired ?? 0}.`
+  });
+  await call("project_queue_decide", {
+    queueId,
+    decision: "approve_queue",
+    note: "Approved by project CLI demo seed after queue shaping."
+  });
+  await call("project_queue_decide", {
+    queueId,
+    decision: "start_execution",
+    note: "Started by project CLI demo seed."
+  });
+  await recordDemoStage(call, queueId, {
+    stage: "execution",
+    status: "running",
+    modelAlias: "execute.cheap",
+    outputSummary: "Two demo workers are running while approval, patch review, recovery, and blocked work remain visible."
+  });
+
+  const laneClaim = await claimDemoTask(call, queueId, {
+    worker: "local-cli",
+    modelProfile: "review.strong",
+    workspacePath: join(command.projectPath, "worktrees", "lane-telemetry"),
+    command: "demo-run lane-telemetry",
+    skipQueueTaskIds: [toolApproval.queueTaskId, patchReview.queueTaskId, recoveryDemo.queueTaskId, memoryContext.queueTaskId, blockedFollowup.queueTaskId]
+  });
+  await seedDemoLane(call, queueId, laneClaim, {
+    summary: "Mapped project_queue_agent_lanes and worker checkpoint state into the Desktop lane strip.",
+    file: "src/desktop/public/index.html",
+    command: "npm test -- project-cli",
+    nextAction: "Review the live lane state and keep checkpoint updates flowing."
+  });
+
+  const healthClaim = await claimDemoTask(call, queueId, {
+    worker: "openhands",
+    modelProfile: "execute.cheap",
+    workspacePath: join(command.projectPath, "worktrees", "queue-health"),
+    command: "demo-run queue-health",
+    skipQueueTaskIds: [
+      toolApproval.queueTaskId,
+      laneTelemetry.queueTaskId,
+      patchReview.queueTaskId,
+      recoveryDemo.queueTaskId,
+      memoryContext.queueTaskId,
+      blockedFollowup.queueTaskId
+    ]
+  });
+  await seedDemoLane(call, queueId, healthClaim, {
+    summary: "Validated queue health, pending approvals, and patch-ready counts for the Desktop dashboard.",
+    file: "src/surfaces/projectQueue.ts",
+    command: "npm test -- project-queue",
+    nextAction: "Use the health strip to decide whether to approve tools, review patches, or recover failed work."
+  });
+
+  await call("project_queue_update_task", {
+    queueId,
+    queueTaskId: patchReview.queueTaskId,
+    status: "patch_ready",
+    summary: "Seeded patch-ready output for the Desktop review surface.",
+    patchRefs: ["demo:patch-review/diff-summary.md"],
+    testRefs: ["npm test -- project-cli"]
+  });
+  await call("project_queue_update_task", {
+    queueId,
+    queueTaskId: recoveryDemo.queueTaskId,
+    status: "failed",
+    summary: "Seeded failed worker output so recovery and resume controls have real state.",
+    patchRefs: ["demo:recovery/partial-output.md"],
+    testRefs: ["npm test -- recovery-demo (failed intentionally)"]
+  });
+
+  const dashboard = await call<DashboardResult>("project_queue_dashboard", {
+    queueId,
+    includeCompletedLanes: false,
+    maxEventsPerLane: 5
+  });
+  const approvals = await call<QueueApprovalInbox>("project_queue_approval_inbox", {
+    queueId,
+    includeExpired: false,
+    limit: 10
+  });
+  const lanes = await call<AgentLanesResult>("project_queue_agent_lanes", {
+    queueId,
+    includeCompleted: false,
+    maxEventsPerLane: 5
+  });
+
+  return {
+    action: "demo_seeded",
+    message: [
+      `Seeded demo queue ${queueId} for ${command.projectPath}.`,
+      `Active lanes: ${lanes.count}; pending approvals: ${approvals.count}; active workers: ${dashboard.activeWorkers ?? 0}.`,
+      "Open the Desktop dashboard and select this queue to demo the full command-center flow."
+    ].join("\n"),
+    data: {
+      queueId,
+      projectPath: command.projectPath,
+      title,
+      memoryId,
+      activeWorkers: dashboard.activeWorkers ?? 0,
+      pendingApprovalCount: approvals.count,
+      laneCount: lanes.count,
+      counts: dashboard.counts,
+      tasks: {
+        laneTelemetry: laneTelemetry.queueTaskId,
+        toolApproval: toolApproval.queueTaskId,
+        patchReview: patchReview.queueTaskId,
+        recoveryDemo: recoveryDemo.queueTaskId,
+        queueHealth: queueHealth.queueTaskId,
+        blockedFollowup: blockedFollowup.queueTaskId,
+        memoryContext: memoryContext.queueTaskId
+      }
+    }
+  };
+}
+
+async function recordDemoStage(
+  call: ProjectToolCaller,
+  queueId: string,
+  stage: {
+    stage: string;
+    status: string;
+    modelAlias: string;
+    outputSummary: string;
+    artifacts?: unknown[];
+    warnings?: string[];
+  }
+): Promise<void> {
+  await call("project_queue_record_stage", {
+    queueId,
+    stage: stage.stage,
+    status: stage.status,
+    modelAlias: stage.modelAlias,
+    outputSummary: stage.outputSummary,
+    artifacts: stage.artifacts ?? [],
+    warnings: stage.warnings ?? []
+  });
+}
+
+function demoSeedTasks(memoryId: string): Array<Record<string, unknown>> {
+  return [
+    {
+      clientKey: "lane-telemetry",
+      title: "Wire live agent lane telemetry",
+      goal: "Keep Agent Fabric Console lane cards backed by real worker events, checkpoints, and queue task state.",
+      phase: "Desktop command center",
+      category: "desktop",
+      priority: "urgent",
+      parallelGroup: "desktop-lanes",
+      parallelSafe: true,
+      risk: "low",
+      expectedFiles: ["src/desktop/public/index.html", "src/runtime/project-cli.ts"],
+      acceptanceCriteria: ["Dashboard shows active lanes from worker runs.", "Each lane has latest event, checkpoint summary, and next action."],
+      requiredTools: ["shell"]
+    },
+    {
+      clientKey: "tool-approval",
+      title: "Gate GitHub MCP for issue-backed task intake",
+      goal: "Require a human approval before a worker can use the GitHub MCP integration for project task intake.",
+      phase: "Tool/context policy",
+      category: "approval",
+      priority: "high",
+      parallelGroup: "integrations",
+      parallelSafe: true,
+      risk: "medium",
+      expectedFiles: ["src/surfaces/projectQueue.ts"],
+      acceptanceCriteria: ["Approval inbox shows the missing GitHub MCP grant.", "The worker is not launched until the grant is approved."],
+      requiredTools: ["shell"],
+      requiredMcpServers: ["github"]
+    },
+    {
+      clientKey: "patch-review",
+      title: "Review patch-ready Desktop output",
+      goal: "Show a patch-ready result with test evidence so the review surface has real queue state.",
+      phase: "Review",
+      category: "review",
+      status: "patch_ready",
+      priority: "normal",
+      parallelSafe: true,
+      risk: "low",
+      expectedFiles: ["src/desktop/public/index.html"],
+      acceptanceCriteria: ["Patch-ready board column lists patch refs and test refs."]
+    },
+    {
+      clientKey: "recovery-demo",
+      title: "Recover interrupted worker run",
+      goal: "Expose a failed task with partial output so recovery and resume controls are visible.",
+      phase: "Recovery",
+      category: "recovery",
+      status: "failed",
+      priority: "normal",
+      parallelSafe: true,
+      risk: "medium",
+      expectedFiles: ["src/runtime/project-cli.ts"],
+      acceptanceCriteria: ["Recovery center can identify failed work.", "Resume packet can be generated for the task."]
+    },
+    {
+      clientKey: "queue-health",
+      title: "Surface queue health and cost/risk strip",
+      goal: "Validate the Desktop health strip from live queue counts, approvals, worker slots, risk, and cost estimates.",
+      phase: "Desktop command center",
+      category: "dashboard",
+      priority: "high",
+      parallelGroup: "queue-health",
+      parallelSafe: true,
+      risk: "low",
+      expectedFiles: ["src/surfaces/projectQueue.ts", "src/desktop/public/index.html"],
+      acceptanceCriteria: ["Health strip identifies pending approval and failed work.", "Queue board badges match substrate counts."],
+      requiredTools: ["shell"]
+    },
+    {
+      clientKey: "blocked-followup",
+      title: "Add lane checkpoint drilldown",
+      goal: "Add a follow-up lane drilldown once live lane telemetry is accepted.",
+      phase: "Desktop command center",
+      category: "desktop",
+      priority: "normal",
+      parallelGroup: "desktop-lanes",
+      parallelSafe: true,
+      risk: "low",
+      dependsOn: ["lane-telemetry"],
+      expectedFiles: ["src/desktop/public/index.html"],
+      acceptanceCriteria: ["Blocked task is hidden from ready work until the lane telemetry task is done."]
+    },
+    {
+      clientKey: "memory-context",
+      title: "Attach demo memory to future workers",
+      goal: "Use saved user preference memory only after the prerequisite tool approval path is reviewed.",
+      phase: "Memory",
+      category: "context",
+      priority: "low",
+      parallelSafe: true,
+      risk: "medium",
+      dependsOn: ["tool-approval"],
+      expectedFiles: ["src/runtime/project-cli.ts"],
+      acceptanceCriteria: ["Memory is proposed as context instead of attached by default."],
+      requiredMemories: [memoryId]
+    }
+  ];
+}
+
+function demoCreatedTaskMap(added: Record<string, unknown>): Map<string, { queueTaskId: string; fabricTaskId?: string; clientKey?: string }> {
+  const created = Array.isArray(added.created) ? added.created : [];
+  const mapped = new Map<string, { queueTaskId: string; fabricTaskId?: string; clientKey?: string }>();
+  for (const task of created) {
+    if (!task || typeof task !== "object" || Array.isArray(task)) continue;
+    const entry = task as Record<string, unknown>;
+    if (typeof entry.clientKey !== "string" || typeof entry.queueTaskId !== "string") continue;
+    mapped.set(entry.clientKey, {
+      queueTaskId: entry.queueTaskId,
+      fabricTaskId: typeof entry.fabricTaskId === "string" ? entry.fabricTaskId : undefined,
+      clientKey: entry.clientKey
+    });
+  }
+  return mapped;
+}
+
+function requireDemoTask(
+  tasks: Map<string, { queueTaskId: string; fabricTaskId?: string; clientKey?: string }>,
+  clientKey: string
+): { queueTaskId: string; fabricTaskId?: string; clientKey?: string } {
+  const task = tasks.get(clientKey);
+  if (!task) throw new FabricError("PROJECT_DEMO_SEED_FAILED", `demo task not created: ${clientKey}`, false);
+  return task;
+}
+
+async function claimDemoTask(
+  call: ProjectToolCaller,
+  queueId: string,
+  options: {
+    worker: "local-cli" | "openhands";
+    modelProfile: string;
+    workspacePath: string;
+    command: string;
+    skipQueueTaskIds: string[];
+  }
+): Promise<ClaimNextResult> {
+  const claim = await call<ClaimNextResult>("project_queue_claim_next", {
+    queueId,
+    worker: options.worker,
+    workspaceMode: "git_worktree",
+    workspacePath: options.workspacePath,
+    modelProfile: options.modelProfile,
+    command: [options.command],
+    skipQueueTaskIds: options.skipQueueTaskIds,
+    metadata: { source: "project-cli-demo-seed", demo: true }
+  });
+  if (!claim.claimed?.fabricTaskId || !claim.workerRun?.workerRunId) {
+    throw new FabricError("PROJECT_DEMO_SEED_FAILED", `could not claim demo task for ${options.worker}`, false);
+  }
+  return claim;
+}
+
+async function seedDemoLane(
+  call: ProjectToolCaller,
+  queueId: string,
+  claim: ClaimNextResult,
+  lane: {
+    summary: string;
+    file: string;
+    command: string;
+    nextAction: string;
+  }
+): Promise<void> {
+  const task = claim.claimed;
+  const workerRunId = claim.workerRun?.workerRunId;
+  if (!task?.fabricTaskId || !workerRunId) {
+    throw new FabricError("PROJECT_DEMO_SEED_FAILED", "claimed demo lane is missing worker state", false);
+  }
+  const metadata = { queueId, queueTaskId: task.queueTaskId, source: "project-cli-demo-seed" };
+  await call("fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    kind: "started",
+    body: "Demo worker lane started from seeded project queue state.",
+    metadata
+  });
+  await call("fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    kind: "thought_summary",
+    body: lane.summary,
+    metadata
+  });
+  await call("fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    kind: "file_changed",
+    refs: [lane.file],
+    metadata
+  });
+  await call("fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    kind: "command_finished",
+    body: `${lane.command} passed in the seeded demo run.`,
+    metadata: { ...metadata, command: lane.command, exitCode: 0 }
+  });
+  await call("fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    kind: "test_result",
+    body: "Seeded demo test evidence passed.",
+    metadata: { ...metadata, command: lane.command, exitCode: 0 }
+  });
+  await call("fabric_task_checkpoint", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    summary: {
+      currentGoal: task.goal,
+      filesTouched: [lane.file],
+      commandsRun: [lane.command],
+      testsRun: [lane.command],
+      failingTests: [],
+      decisions: ["Kept demo state backed by agent-fabric queue, worker, event, and checkpoint records."],
+      assumptions: ["This is seeded state for demo and QA, not a generated code patch."],
+      blockers: [],
+      summary: lane.summary,
+      nextAction: lane.nextAction
+    }
+  });
+}
+
+async function startPlan(
+  command: Extract<ProjectCliCommand, { command: "start-plan" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const task = command.task ?? (command.taskFile ? readFile(command.taskFile) : undefined);
+  if (!task) throw new FabricError("INVALID_INPUT", "start-plan requires task or taskFile", false);
+  const chain = await call<Record<string, unknown>>("plan_chain_start", {
+    task,
+    models: { a: "plan.strong", b: "plan.strong", c: "plan.strong" },
+    maxRounds: command.maxRounds,
+    budgetUsd: command.budgetUsd,
+    outputFormat: command.outputFormat
+  });
+  await call("project_queue_record_stage", {
+    queueId: command.queueId,
+    stage: "planning",
+    status: "running",
+    modelAlias: "plan.strong",
+    planChainId: chain.chainId,
+    inputSummary: "Plan chain started from project CLI.",
+    artifacts: [{ kind: "plan_chain", chainId: chain.chainId }]
+  });
+  return {
+    action: "plan_started",
+    message: `Started plan chain ${String(chain.chainId)} for queue ${command.queueId}.`,
+    data: chain
+  };
+}
+
+async function improvePrompt(
+  command: Extract<ProjectCliCommand, { command: "improve-prompt" }>,
+  call: ProjectToolCaller,
+  runModel: ProjectModelRunner
+): Promise<ProjectRunResult> {
+  const prompt = command.prompt ?? (command.promptFile ? readFile(command.promptFile) : undefined);
+  if (!prompt) throw new FabricError("INVALID_INPUT", "improve-prompt requires prompt or promptFile", false);
+  const queueStatus = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  const factors = command.factorsFile ? readFile(command.factorsFile) : undefined;
+  const route = await resolveAlias(command.modelAlias, "prompt_improvement", prompt.length, "medium", call);
+  const preflight = await preflightProjectModel({
+    call,
+    queueId: command.queueId,
+    taskType: "prompt_improvement",
+    modelAlias: command.modelAlias,
+    route,
+    text: prompt,
+    approvalToken: command.approvalToken,
+    contextSummary: {
+      inputTokens: estimateTokens(prompt) + estimateTokens(factors ?? ""),
+      source: "agent-fabric-project improve-prompt",
+      hasFactors: Boolean(factors)
+    }
+  });
+  if (preflight.decision !== "allow") {
+    await call("project_queue_record_stage", {
+      queueId: command.queueId,
+      stage: "prompt_improvement",
+      status: "needs_review",
+      modelAlias: command.modelAlias,
+      inputSummary: "Prompt improvement preflight requires human action before model execution.",
+      artifacts: [{ kind: "llm_preflight", requestId: preflight.requestId, decision: preflight.decision, risk: preflight.risk }],
+      warnings: preflight.warnings ?? []
+    });
+    return preflightBlockedResult("prompt_improvement_blocked", preflight);
+  }
+
+  const generated = await runModel({
+    kind: "prompt_improvement",
+    modelAlias: command.modelAlias,
+    route,
+    queue: queueStatus.queue as unknown as Record<string, unknown>,
+    input: {
+      prompt,
+      factors,
+      instructions: promptImprovementInstructions()
+    }
+  });
+  const improvedPrompt = requiredGeneratedString(generated, "improvedPrompt");
+  const summary = typeof generated.summary === "string" ? generated.summary : summarizeText(improvedPrompt);
+  const warnings = stringArray(generated.warnings);
+  if (command.outputFile) writeFileSync(command.outputFile, improvedPrompt, "utf8");
+  await call("project_queue_record_stage", {
+    queueId: command.queueId,
+    stage: "prompt_improvement",
+    status: command.accept ? "accepted" : "needs_review",
+    modelAlias: command.modelAlias,
+    inputSummary: "Prompt improved by configured project model runner.",
+    outputSummary: summary,
+    artifacts: [
+      { kind: "llm_preflight", requestId: preflight.requestId, decision: preflight.decision, risk: preflight.risk },
+      { kind: "improved_prompt", outputFile: command.outputFile, characterCount: improvedPrompt.length }
+    ],
+    warnings
+  });
+  if (command.accept) {
+    await call("project_queue_decide", {
+      queueId: command.queueId,
+      decision: "accept_improved_prompt",
+      note: "Accepted by project CLI improve-prompt command."
+    });
+  }
+  return {
+    action: "prompt_improved",
+    message: command.outputFile
+      ? `Improved prompt written to ${command.outputFile}.`
+      : `Improved prompt ready for review:\n\n${improvedPrompt}`,
+    data: { queueId: command.queueId, improvedPrompt, summary, warnings, outputFile: command.outputFile, preflight }
+  };
+}
+
+async function generateTasks(
+  command: Extract<ProjectCliCommand, { command: "generate-tasks" }>,
+  call: ProjectToolCaller,
+  runModel: ProjectModelRunner
+): Promise<ProjectRunResult> {
+  const plan = readFile(command.planFile);
+  const queueStatus = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  const route = await resolveAlias(command.modelAlias, "task_generation", plan.length, "medium", call);
+  const preflight = await preflightProjectModel({
+    call,
+    queueId: command.queueId,
+    taskType: "task_generation",
+    modelAlias: command.modelAlias,
+    route,
+    text: plan,
+    approvalToken: command.approvalToken,
+    contextSummary: {
+      inputTokens: estimateTokens(plan),
+      source: "agent-fabric-project generate-tasks",
+      planFile: command.planFile
+    }
+  });
+  if (preflight.decision !== "allow") {
+    await call("project_queue_record_stage", {
+      queueId: command.queueId,
+      stage: "task_writing",
+      status: "needs_review",
+      modelAlias: command.modelAlias,
+      inputSummary: "Task-generation preflight requires human action before model execution.",
+      artifacts: [{ kind: "llm_preflight", requestId: preflight.requestId, decision: preflight.decision, risk: preflight.risk }],
+      warnings: preflight.warnings ?? []
+    });
+    return preflightBlockedResult("task_generation_blocked", preflight);
+  }
+
+  const generated = await runModel({
+    kind: "task_generation",
+    modelAlias: command.modelAlias,
+    route,
+    queue: queueStatus.queue as unknown as Record<string, unknown>,
+    input: {
+      plan,
+      instructions: taskGenerationInstructions()
+    }
+  });
+  const payload = normalizeGeneratedTasks(generated);
+  if (command.tasksFile) writeFileSync(command.tasksFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  await call("project_queue_record_stage", {
+    queueId: command.queueId,
+    stage: "phasing",
+    status: "completed",
+    modelAlias: "phase.splitter",
+    outputSummary: `Generated ${payload.phases.length} phase(s).`
+  });
+  await call("project_queue_record_stage", {
+    queueId: command.queueId,
+    stage: "task_writing",
+    status: "completed",
+    modelAlias: command.modelAlias,
+    outputSummary: `Generated ${payload.tasks.length} coding task(s).`
+  });
+  const added = await call<Record<string, unknown>>("project_queue_add_tasks", {
+    queueId: command.queueId,
+    tasks: payload.tasks
+  });
+  await call("project_queue_record_stage", {
+    queueId: command.queueId,
+    stage: "queue_shaping",
+    status: "completed",
+    modelAlias: command.modelAlias,
+    outputSummary: "Generated tasks were validated and added to the dependency-aware queue.",
+    artifacts: [
+      { kind: "llm_preflight", requestId: preflight.requestId, decision: preflight.decision, risk: preflight.risk },
+      { kind: "generated_tasks", tasksFile: command.tasksFile, taskCount: payload.tasks.length }
+    ]
+  });
+  if (command.approveQueue) {
+    await call("project_queue_decide", {
+      queueId: command.queueId,
+      decision: "approve_queue",
+      note: "Approved by project CLI generate-tasks command."
+    });
+  }
+  return {
+    action: "tasks_generated",
+    message: `Generated and imported ${payload.tasks.length} task(s) for queue ${command.queueId}.`,
+    data: { queueId: command.queueId, phases: payload.phases, tasks: payload.tasks, added, tasksFile: command.tasksFile, preflight }
+  };
+}
+
+async function reviewQueue(
+  command: Extract<ProjectCliCommand, { command: "review-queue" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const status = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  const next = await call<NextReadyResult>("project_queue_next_ready", { queueId: command.queueId });
+  if (command.approveQueue) {
+    await call("project_queue_decide", {
+      queueId: command.queueId,
+      decision: "approve_queue",
+      note: "Approved by project CLI review-queue command."
+    });
+  }
+  return {
+    action: command.approveQueue ? "queue_reviewed_and_approved" : "queue_reviewed",
+    message: formatQueueReview(status, next, command.approveQueue),
+    data: { status, nextReady: next, approved: command.approveQueue }
+  };
+}
+
+async function reviewPatches(
+  command: Extract<ProjectCliCommand, { command: "review-patches" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const status = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  let applyResult: ReviewedPatchApplyResult | undefined;
+  if (command.acceptTaskId) {
+    const task = status.tasks.find((entry) => entry.queueTaskId === command.acceptTaskId);
+    if (!task) throw new FabricError("PROJECT_QUEUE_TASK_NOT_FOUND", `Queue task not found: ${command.acceptTaskId}`, false);
+    if (command.applyPatch) {
+      applyResult = await applyReviewedPatch(command, status, task, call);
+    }
+    await call("project_queue_update_task", {
+      queueId: command.queueId,
+      queueTaskId: command.acceptTaskId,
+      status: "accepted",
+      summary: applyResult ? `Applied reviewed patch ${applyResult.patchFile}.` : "Accepted by project CLI review-patches command.",
+      patchRefs: applyResult ? uniqueStrings([...stringArray(task.patchRefs), applyResult.patchFile]) : [],
+      testRefs: stringArray(task.testRefs)
+    });
+  }
+  const refreshed = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  const patchReady = refreshed.tasks.filter((task) => ["patch_ready", "review", "accepted"].includes(task.status));
+  return {
+    action: applyResult ? "patch_applied_and_accepted" : command.acceptTaskId ? "patch_accepted" : "patches_reviewed",
+    message: formatPatchReview(refreshed.queue.queueId, patchReady, command.acceptTaskId, applyResult),
+    data: { queueId: command.queueId, patchReady, acceptedTaskId: command.acceptTaskId, appliedPatch: applyResult }
+  };
+}
+
+async function applyReviewedPatch(
+  command: Extract<ProjectCliCommand, { command: "review-patches" }>,
+  status: QueueStatus,
+  task: QueueTask,
+  call: ProjectToolCaller
+): Promise<ReviewedPatchApplyResult> {
+  if (!task.fabricTaskId) throw new FabricError("FABRIC_TASK_NOT_FOUND", `Queue task has no linked fabric task: ${task.queueTaskId}`, false);
+  if (!["patch_ready", "review", "accepted"].includes(task.status)) {
+    throw new FabricError("PATCH_NOT_APPLYABLE", `Task ${task.queueTaskId} is not patch-ready`, false);
+  }
+  const fabricStatus = await call<FabricTaskStatusResult>("fabric_task_status", {
+    taskId: task.fabricTaskId,
+    includeEvents: true,
+    includeCheckpoints: true
+  });
+  const candidate = resolveReviewedPatchCandidate(task, fabricStatus);
+  if (candidate.structuredResult?.patchMode !== "write") {
+    throw new FabricError("PATCH_NOT_APPLYABLE", "review-patches --apply-patch requires a worker artifact from --patch-mode write", false);
+  }
+  const cwd = command.applyCwd ?? candidate.workspacePath ?? fabricStatus.projectPath ?? status.queue.projectPath;
+  const patchFile = resolveReviewPatchFile(candidate.patchFile, cwd);
+  const patch = readFileSync(patchFile, "utf8");
+  validateGitStylePatch(patch, cwd);
+  const patchApply = await applyPatchWithSystemPatch(patch, cwd);
+  await call("fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId: candidate.workerRunId,
+    kind: "checkpoint",
+    body: `Applied reviewed patch ${patchFile}.`,
+    metadata: {
+      action: "review_patch_apply",
+      queueId: command.queueId,
+      queueTaskId: task.queueTaskId,
+      patchFile,
+      cwd,
+      patchApply
+    }
+  });
+  await call("fabric_task_checkpoint", {
+    taskId: task.fabricTaskId,
+    workerRunId: candidate.workerRunId,
+    summary: {
+      currentGoal: task.goal,
+      filesTouched: uniqueStrings([...stringArray(task.patchRefs), patchFile]),
+      commandsRun: ["review-patches --apply-patch"],
+      testsRun: stringArray(task.testRefs),
+      decisions: ["Applied reviewed patch after explicit review-patches acceptance."],
+      assumptions: [],
+      blockers: [],
+      nextAction: "Run final verification for the accepted patch.",
+      patchApply,
+      patchFile,
+      cwd
+    }
+  });
+  await call("fabric_task_finish", {
+    taskId: task.fabricTaskId,
+    workerRunId: candidate.workerRunId,
+    status: "completed",
+    summary: `Applied reviewed patch ${patchFile}.`,
+    patchRefs: uniqueStrings([...stringArray(task.patchRefs), patchFile]),
+    testRefs: stringArray(task.testRefs)
+  });
+  return {
+    queueTaskId: task.queueTaskId,
+    fabricTaskId: task.fabricTaskId,
+    workerRunId: candidate.workerRunId,
+    patchFile,
+    cwd,
+    patchApply
+  };
+}
+
+function resolveReviewedPatchCandidate(
+  task: QueueTask,
+  fabricStatus: FabricTaskStatusResult
+): { workerRunId: string; patchFile: string; workspacePath?: string; structuredResult?: StructuredWorkerResult } {
+  const structured = latestStructuredResultFromCheckpoints(fabricStatus);
+  const patchFile = structured?.patchFile ?? stringArray(task.patchRefs).find((ref) => ref.endsWith(".patch"));
+  if (!patchFile) {
+    throw new FabricError("PATCH_NOT_APPLYABLE", "No reviewed patch file is available for this task", false);
+  }
+  const workerRunId = checkpointWorkerRunIdForStructuredResult(fabricStatus, structured) ?? task.assignedWorkerRunId;
+  if (!workerRunId) {
+    throw new FabricError("PATCH_NOT_APPLYABLE", "No worker run is available for reviewed patch application", false);
+  }
+  const workspacePath = fabricStatus.workerRuns?.find((run) => run.workerRunId === workerRunId)?.workspacePath;
+  return { workerRunId, patchFile, workspacePath, structuredResult: structured };
+}
+
+function latestStructuredResultFromCheckpoints(fabricStatus: FabricTaskStatusResult): StructuredWorkerResult | undefined {
+  const checkpoints = [...(fabricStatus.checkpoints ?? [])].reverse();
+  for (const checkpoint of checkpoints) {
+    const structured = structuredResultFromCheckpointSummary(checkpoint.summary);
+    if (structured) return structured;
+  }
+  return structuredResultFromCheckpointSummary(fabricStatus.latestCheckpoint?.summary);
+}
+
+function checkpointWorkerRunIdForStructuredResult(fabricStatus: FabricTaskStatusResult, structured: StructuredWorkerResult | undefined): string | undefined {
+  if (!structured) return undefined;
+  const checkpoints = [...(fabricStatus.checkpoints ?? [])].reverse();
+  for (const checkpoint of checkpoints) {
+    if (structuredResultFromCheckpointSummary(checkpoint.summary)?.source === structured.source) return checkpoint.workerRunId;
+  }
+  return fabricStatus.latestCheckpoint?.workerRunId;
+}
+
+function structuredResultFromCheckpointSummary(summary: Record<string, unknown> | undefined): StructuredWorkerResult | undefined {
+  if (!summary) return undefined;
+  const value = summary.structuredResult;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as StructuredWorkerResult;
+}
+
+function resolveReviewPatchFile(patchFile: string, cwd: string): string {
+  const resolved = isAbsolute(patchFile) ? resolve(patchFile) : resolve(cwd, patchFile);
+  if (!isPathInside(resolved, cwd)) {
+    throw new FabricError("PATCH_NOT_APPLYABLE", `Reviewed patch file must be inside apply cwd: ${resolved}`, false);
+  }
+  return resolved;
+}
+
+function isPathInside(path: string, root: string): boolean {
+  const rel = relative(resolve(root), resolve(path));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+async function writeTaskPackets(
+  command: Extract<ProjectCliCommand, { command: "write-task-packets" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const status = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  const next = command.readyOnly ? await call<NextReadyResult>("project_queue_next_ready", { queueId: command.queueId }) : undefined;
+  const readyIds = new Set(next?.ready.map((task) => task.queueTaskId));
+  const tasks = command.readyOnly ? status.tasks.filter((task) => readyIds.has(task.queueTaskId)) : status.tasks;
+  const packets = tasks.map((task) => writeTaskPacket(status, task, command.outDir, command.format));
+  return {
+    action: "task_packets_written",
+    message: formatTaskPacketsWritten(command.queueId, packets),
+    data: { queueId: command.queueId, outDir: command.outDir, format: command.format, packets }
+  };
+}
+
+async function resumeQueueTask(
+  command: Extract<ProjectCliCommand, { command: "resume-task" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const result = await call<QueueResumeResult>("project_queue_resume_task", {
+    queueId: command.queueId,
+    queueTaskId: command.queueTaskId,
+    preferredWorker: command.preferredWorker
+  });
+  if (command.outputFile) {
+    const body =
+      command.format === "markdown"
+        ? formatResumePacketMarkdown(result.taskPacket)
+        : `${JSON.stringify(result.taskPacket, null, 2)}\n`;
+    writeFileSync(command.outputFile, body, "utf8");
+  }
+  return {
+    action: "resume_task",
+    message: formatResumeTaskResult(command, result),
+    data: { ...result, outputFile: command.outputFile, format: command.format } as unknown as Record<string, unknown>
+  };
+}
+
+async function runTask(
+  command: Extract<ProjectCliCommand, { command: "run-task" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const status = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  const task = status.tasks.find((entry) => entry.queueTaskId === command.queueTaskId);
+  if (!task) throw new FabricError("PROJECT_QUEUE_TASK_NOT_FOUND", `Queue task not found: ${command.queueTaskId}`, false);
+  if (!task.fabricTaskId) throw new FabricError("FABRIC_TASK_NOT_FOUND", `Queue task has no linked fabric task: ${command.queueTaskId}`, false);
+  assertQueueRunnable(status.queue.status);
+  const cwd = command.cwd ?? status.queue.projectPath;
+  const proposal = await call<ToolContextProposal>("tool_context_propose", {
+    queueId: command.queueId,
+    queueTaskId: task.queueTaskId,
+    fabricTaskId: task.fabricTaskId,
+    mcpServers: stringArray(task.requiredMcpServers),
+    tools: uniqueStrings(["shell", ...stringArray(task.requiredTools)]),
+    memories: stringArray(task.requiredMemories),
+    contextRefs: stringArray(task.requiredContextRefs),
+    modelAlias: "tool.context.manager",
+    reasoning: `Run explicit command for queue task ${task.queueTaskId}.`
+  });
+  if (proposal.approvalRequired) {
+    if (!command.approveToolContext) {
+      return {
+        action: "run_task_blocked",
+        message: `Tool/context approval required before running shell command. proposal=${proposal.proposalId}`,
+        data: { queueId: command.queueId, queueTaskId: task.queueTaskId, proposalId: proposal.proposalId, missingGrants: proposal.missingGrants ?? [] }
+      };
+    }
+    await call("tool_context_decide", {
+      proposalId: proposal.proposalId,
+      decision: "approve",
+      remember: command.rememberToolContext,
+      note: "Approved by project CLI run-task command."
+    });
+  }
+
+  const modelPreflight = await preflightDeepSeekWorkerCommand(command, task, status, call);
+  if (modelPreflight && modelPreflight.decision !== "allow") {
+    return {
+      action: "run_task_blocked",
+      message: `DeepSeek direct model approval required before running worker command. request=${modelPreflight.requestId}`,
+      data: { queueId: command.queueId, queueTaskId: task.queueTaskId, preflight: modelPreflight }
+    };
+  }
+
+  prepareRunWorkspace(command.workspaceMode, cwd, command.cwdPrep ?? "auto");
+
+  let workerRunId = task.assignedWorkerRunId;
+  if (!workerRunId) {
+    const worker = await call<Record<string, unknown>>("fabric_task_start_worker", {
+      taskId: task.fabricTaskId,
+      worker: command.worker,
+      projectPath: status.queue.projectPath,
+      workspaceMode: command.workspaceMode,
+      workspacePath: cwd,
+      modelProfile: command.modelProfile,
+      contextPolicy: `tool_context:${proposal.proposalId}`,
+      maxRuntimeMinutes: command.maxRuntimeMinutes,
+      command: [command.commandLine],
+      metadata: taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat)
+    });
+    workerRunId = String(worker.workerRunId);
+    await call("project_queue_assign_worker", {
+      queueId: command.queueId,
+      queueTaskId: task.queueTaskId,
+      workerRunId
+    });
+    await call("fabric_task_event", {
+      taskId: task.fabricTaskId,
+      workerRunId,
+      kind: "started",
+      body: "Worker run started by project CLI run-task command.",
+      metadata: {
+        queueId: command.queueId,
+        queueTaskId: task.queueTaskId,
+        toolContextProposalId: proposal.proposalId,
+        ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat)
+      }
+    });
+  }
+
+  const before = snapshotFiles(cwd);
+  await call("fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    kind: "command_started",
+    body: command.commandLine,
+    metadata: { cwd, queueId: command.queueId, queueTaskId: task.queueTaskId, ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat) }
+  });
+  const startedAt = Date.now();
+  const result = await runShellCommand(command.commandLine, cwd, command.maxOutputChars);
+  const durationMs = Date.now() - startedAt;
+  await call("fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    kind: "command_finished",
+    body: tailText(result.stdout || result.stderr, command.maxOutputChars),
+    metadata: {
+      cwd,
+      command: command.commandLine,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      durationMs,
+      stdoutTail: tailText(result.stdout, command.maxOutputChars),
+      stderrTail: tailText(result.stderr, command.maxOutputChars)
+    }
+  });
+  if (looksLikeTestCommand(command.commandLine)) {
+    await call("fabric_task_event", {
+      taskId: task.fabricTaskId,
+      workerRunId,
+      kind: "test_result",
+      body: result.exitCode === 0 ? "Test command passed." : "Test command failed.",
+      metadata: { command: command.commandLine, exitCode: result.exitCode, durationMs }
+    });
+  }
+
+  const changedFiles = diffSnapshots(before, snapshotFiles(cwd));
+  const structuredResult = loadStructuredWorkerResult(cwd, result.stdout, changedFiles);
+  const structuredStatus = structuredResult?.status;
+  const structuredSummary = structuredResult?.summary;
+  const suggestedFiles = structuredResult?.changedFilesSuggested ?? [];
+  const suggestedTests = structuredResult?.testsSuggested ?? [];
+  const structuredPatchRefs = structuredResult?.patchFile ? [structuredResult.patchFile] : [];
+  for (const file of changedFiles.slice(0, 50)) {
+    await call("fabric_task_event", {
+      taskId: task.fabricTaskId,
+      workerRunId,
+      kind: "file_changed",
+      refs: [file],
+      metadata: { cwd }
+    });
+  }
+  if (structuredResult) {
+    await call("fabric_task_event", {
+      taskId: task.fabricTaskId,
+      workerRunId,
+      kind: "checkpoint",
+      body: structuredSummary,
+      metadata: {
+        cwd,
+        structuredResult,
+        structuredResultSource: structuredResult.source
+      }
+    });
+  }
+  const finalStatus =
+    result.exitCode !== 0 || structuredStatus === "failed" || structuredStatus === "blocked"
+      ? "failed"
+      : structuredStatus === "completed"
+        ? "completed"
+        : command.successStatus;
+  await call("fabric_task_checkpoint", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    summary: {
+      currentGoal: task.goal,
+      filesTouched: uniqueStrings([...changedFiles, ...suggestedFiles, ...structuredPatchRefs]),
+      commandsRun: [command.commandLine],
+      testsRun: looksLikeTestCommand(command.commandLine) ? [command.commandLine] : [],
+      failingTests: looksLikeTestCommand(command.commandLine) && result.exitCode !== 0 ? [command.commandLine] : [],
+      decisions: [],
+      assumptions: [],
+      blockers: workerBlockers(result.exitCode, structuredStatus, structuredResult),
+      nextAction: finalStatus === "failed" ? "Inspect command failure or structured blocker and rerun." : "Review patch-ready output.",
+      structuredResult,
+      testsSuggested: suggestedTests,
+      stdoutTail: tailText(result.stdout, command.maxOutputChars),
+      stderrTail: tailText(result.stderr, command.maxOutputChars)
+    }
+  });
+  await call("fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    kind: finalStatus === "failed" ? "failed" : finalStatus === "completed" ? "completed" : "patch_ready",
+    body: structuredSummary ?? (result.exitCode === 0 ? "Worker command completed." : `Worker command failed with exit code ${result.exitCode}.`),
+    refs: uniqueStrings([...changedFiles, ...suggestedFiles, ...structuredPatchRefs])
+  });
+  await call("project_queue_update_task", {
+    queueId: command.queueId,
+    queueTaskId: task.queueTaskId,
+    workerRunId,
+    status: finalStatus,
+    summary: structuredSummary ?? (result.exitCode === 0 ? "Worker command completed." : `Worker command failed with exit code ${result.exitCode}.`),
+    patchRefs: uniqueStrings([...changedFiles, ...suggestedFiles, ...structuredPatchRefs]),
+    testRefs: looksLikeTestCommand(command.commandLine) ? [command.commandLine] : []
+  });
+
+  return {
+    action: finalStatus === "failed" ? "task_run_failed" : "task_run_completed",
+    message: formatRunTaskResult(task, workerRunId, result.exitCode, changedFiles),
+    data: {
+      queueId: command.queueId,
+      queueTaskId: task.queueTaskId,
+      fabricTaskId: task.fabricTaskId,
+      workerRunId,
+      exitCode: result.exitCode,
+      changedFiles,
+      structuredResult,
+      stdoutTail: tailText(result.stdout, command.maxOutputChars),
+      stderrTail: tailText(result.stderr, command.maxOutputChars),
+      ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat)
+    }
+  };
+}
+
+async function runReady(
+  command: Extract<ProjectCliCommand, { command: "run-ready" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const status = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  const next = await call<NextReadyResult>("project_queue_next_ready", { queueId: command.queueId, limit: command.limit });
+  let currentParallel = normalizeParallel(command.parallel);
+  const minParallel = normalizeMinParallel(command.minParallel ?? 1, currentParallel);
+  const ready = next.ready;
+  assertParallelCwdPolicy(command, ready, status.queue.projectPath, currentParallel);
+  const runs: ProjectRunResult[] = [];
+  const skipped: Record<string, unknown>[] = [];
+  const parallelAdjustments: Record<string, unknown>[] = [];
+  let rateLimitSignals = 0;
+
+  for (let index = 0; index < ready.length; ) {
+    const batchParallel = currentParallel;
+    const batch = ready.slice(index, index + batchParallel);
+    const batchResults = await Promise.all(
+      batch.map(async (task) => {
+        if (!task.fabricTaskId) {
+          return { skipped: { queueTaskId: task.queueTaskId, title: task.title, reason: "missing fabricTaskId" } };
+        }
+        const taskPacket = command.taskPacketDir ? writeTaskPacket(status, task, command.taskPacketDir, command.taskPacketFormat) : undefined;
+        const commandLine = commandLineForReadyTask(command, task, status.queue.projectPath, taskPacket?.path);
+        const result = await runTask(
+          {
+            command: "run-task",
+            json: command.json,
+            queueId: command.queueId,
+            queueTaskId: task.queueTaskId,
+            commandLine,
+            taskPacketPath: taskPacket?.path,
+            taskPacketFormat: taskPacket?.format === "markdown" ? "markdown" : "json",
+            cwd: cwdForReadyTask(command, task, status.queue.projectPath),
+            cwdPrep: command.cwdPrep ?? "auto",
+            worker: command.worker,
+            workspaceMode: command.workspaceMode,
+            modelProfile: command.modelProfile,
+            maxRuntimeMinutes: command.maxRuntimeMinutes,
+            approvalToken: command.approvalToken,
+            successStatus: command.successStatus,
+            maxOutputChars: command.maxOutputChars,
+            approveToolContext: command.approveToolContext,
+            rememberToolContext: command.rememberToolContext
+          },
+          call
+        );
+        return {
+          result: taskPacket
+            ? { ...result, data: { ...result.data, taskPacketPath: taskPacket.path, taskPacketFormat: taskPacket.format } }
+            : result
+        };
+      })
+    );
+    index += batch.length;
+    for (const entry of batchResults) {
+      if (entry.skipped) skipped.push(entry.skipped);
+      if (entry.result) {
+        if (entry.result.action === "run_task_blocked") {
+          skipped.push({ queueTaskId: entry.result.data.queueTaskId, reason: "tool/context approval required", proposalId: entry.result.data.proposalId });
+        } else {
+          runs.push(entry.result);
+        }
+      }
+    }
+    const batchRateLimitSignals = batchResults.filter((entry) => entry.result && isRateLimitRunResult(entry.result)).length;
+    rateLimitSignals += batchRateLimitSignals;
+    if (command.adaptiveRateLimit === true && batchRateLimitSignals > 0 && currentParallel > minParallel) {
+      const nextParallel = Math.max(minParallel, Math.floor(currentParallel / 2));
+      parallelAdjustments.push({
+        reason: "deepseek_rate_limit",
+        batchStart: index,
+        signals: batchRateLimitSignals,
+        from: currentParallel,
+        to: nextParallel
+      });
+      currentParallel = nextParallel;
+    }
+    const failed = batchResults.some((entry) => entry.result?.action === "task_run_failed");
+    if (!command.continueOnFailure && failed && !(command.adaptiveRateLimit === true && batchRateLimitSignals > 0)) break;
+  }
+
+  return {
+    action: "ready_tasks_run",
+    message: formatRunReadyResult(command.queueId, runs, skipped, next),
+    data: {
+      queueId: command.queueId,
+      runCount: runs.length,
+      skipped,
+      runs: runs.map((result) => ({ action: result.action, ...result.data })),
+      activeWorkers: next.activeWorkers,
+      availableSlots: next.availableSlots,
+      initialParallel: normalizeParallel(command.parallel),
+      finalParallel: currentParallel,
+      minParallel,
+      adaptiveRateLimit: command.adaptiveRateLimit === true,
+      rateLimitSignals,
+      parallelAdjustments
+    }
+  };
+}
+
+async function withQueueRunnerLock<T>(commandName: string, queueId: string, allowConcurrentRunner: boolean, run: () => Promise<T>): Promise<T> {
+  if (allowConcurrentRunner) return run();
+  const root = join(tmpdir(), "agent-fabric-runner-locks");
+  mkdirSync(root, { recursive: true });
+  const lockDir = join(root, `${safePathPart(queueId)}.lock`);
+  acquireQueueRunnerLock(commandName, queueId, lockDir);
+  try {
+    return await run();
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+}
+
+function acquireQueueRunnerLock(commandName: string, queueId: string, lockDir: string): void {
+  try {
+    mkdirSync(lockDir);
+    writeFileSync(
+      join(lockDir, "owner.json"),
+      `${JSON.stringify({ command: commandName, queueId, pid: process.pid, createdAt: new Date().toISOString() }, null, 2)}\n`,
+      "utf8"
+    );
+    return;
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (code !== "EEXIST") throw error;
+  }
+
+  const ageMs = Date.now() - statSync(lockDir).mtimeMs;
+  if (ageMs > RUNNER_LOCK_STALE_MS) {
+    rmSync(lockDir, { recursive: true, force: true });
+    mkdirSync(lockDir);
+    writeFileSync(
+      join(lockDir, "owner.json"),
+      `${JSON.stringify({ command: commandName, queueId, pid: process.pid, createdAt: new Date().toISOString(), replacedStaleLock: true }, null, 2)}\n`,
+      "utf8"
+    );
+    return;
+  }
+
+  throw new FabricError(
+    "PROJECT_QUEUE_RUNNER_ACTIVE",
+    `Another local queue runner appears active for ${queueId}. Use --allow-concurrent-runner only when you intentionally want overlapping schedulers.`,
+    true
+  );
+}
+
+async function factoryRun(
+  command: Extract<ProjectCliCommand, { command: "factory-run" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const status = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  const reviewMatrix = await call<ReviewMatrixResult>("project_queue_review_matrix", { queueId: command.queueId, limit: command.limit });
+  const prepared = await call<PrepareReadyResult>("project_queue_prepare_ready", { queueId: command.queueId, limit: command.limit });
+  const launchPlan = await call<LaunchPlanResult>("project_queue_launch_plan", { queueId: command.queueId, limit: command.limit });
+  let startDecision: Record<string, unknown> | undefined;
+  if (command.startExecution && status.queue.status !== "running") {
+    startDecision = await call<Record<string, unknown>>("project_queue_decide", {
+      queueId: command.queueId,
+      decision: "start_execution",
+      note: "Started by project CLI factory-run."
+    });
+  }
+
+  const packetDir = command.taskPacketDir ?? join(tmpdir(), "agent-fabric-factory", command.queueId, "task-packets");
+  const cwdTemplate = command.cwdTemplate ?? join(tmpdir(), "agent-fabric-factory", command.queueId, "sandboxes", "{{queueTaskId}}");
+  const commandTemplate = [
+    command.deepSeekWorkerCommand,
+    "run-task",
+    "--json",
+    "--task-packet",
+    "{{taskPacket}}",
+    "--fabric-task",
+    "{{fabricTaskId}}",
+    "--role",
+    command.deepSeekRole === "auto" ? "{{deepseekRole}}" : command.deepSeekRole,
+    "--patch-mode",
+    command.patchMode
+  ].join(" ");
+  const sensitiveFlag =
+    command.allowSensitiveContext || command.sensitiveContextMode === "off"
+      ? "--allow-sensitive-context"
+      : command.sensitiveContextMode === "strict"
+        ? "--sensitive-context-mode strict"
+        : "";
+  const commandTemplateWithFlags = [commandTemplate, sensitiveFlag].filter(Boolean).join(" ");
+
+  if (command.dryRun) {
+    return {
+      action: "factory_run_preview",
+      message: formatFactoryRunPreview(command.queueId, reviewMatrix, prepared, launchPlan, packetDir, cwdTemplate),
+      data: {
+        queueId: command.queueId,
+        reviewMatrix: reviewMatrix as unknown as Record<string, unknown>,
+        prepared: prepared as unknown as Record<string, unknown>,
+        launchPlan: launchPlan as unknown as Record<string, unknown>,
+        packetDir,
+        cwdTemplate,
+        commandTemplate: commandTemplateWithFlags,
+        startDecision
+      }
+    };
+  }
+
+  const run = await runReady(
+    {
+      command: "run-ready",
+      json: command.json,
+      queueId: command.queueId,
+      commandTemplate: commandTemplateWithFlags,
+      cwdTemplate,
+      cwdPrep: "auto",
+      taskPacketDir: packetDir,
+      taskPacketFormat: "json",
+      limit: command.limit,
+      parallel: command.parallel,
+      minParallel: command.minParallel,
+      adaptiveRateLimit: command.adaptiveRateLimit,
+      allowSharedCwd: false,
+      worker: "deepseek-direct",
+      workspaceMode: "sandbox",
+      modelProfile: "deepseek-v4-pro:max",
+      maxRuntimeMinutes: command.maxRuntimeMinutes,
+      approvalToken: command.approvalToken,
+      successStatus: command.patchMode === "write" ? "patch_ready" : "completed",
+      maxOutputChars: command.maxOutputChars,
+      approveToolContext: command.approveToolContext,
+      rememberToolContext: command.rememberToolContext,
+      continueOnFailure: command.continueOnFailure
+    },
+    call
+  );
+
+  return {
+    action: "factory_run_completed",
+    message: formatFactoryRunCompleted(command.queueId, run, reviewMatrix, prepared, launchPlan),
+    data: {
+      queueId: command.queueId,
+      packetDir,
+      cwdTemplate,
+      commandTemplate: commandTemplateWithFlags,
+      startDecision,
+      reviewMatrix: reviewMatrix as unknown as Record<string, unknown>,
+      prepared: prepared as unknown as Record<string, unknown>,
+      launchPlan: launchPlan as unknown as Record<string, unknown>,
+      run: run.data
+    }
+  };
+}
+
+async function importTasks(
+  command: Extract<ProjectCliCommand, { command: "import-tasks" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const payload = parseTasksFile(command.tasksFile);
+  await call("project_queue_record_stage", {
+    queueId: command.queueId,
+    stage: "task_writing",
+    status: "completed",
+    modelAlias: "task.writer",
+    outputSummary: `Imported ${payload.tasks.length} task(s) from ${command.tasksFile}.`
+  });
+  const added = await call<Record<string, unknown>>("project_queue_add_tasks", {
+    queueId: command.queueId,
+    tasks: payload.tasks
+  });
+  await call("project_queue_record_stage", {
+    queueId: command.queueId,
+    stage: "queue_shaping",
+    status: "completed",
+    modelAlias: "task.writer",
+    outputSummary: "Tasks are dependency-aware and ready for review."
+  });
+  if (command.approveQueue) {
+    await call("project_queue_decide", {
+      queueId: command.queueId,
+      decision: "approve_queue",
+      note: "Approved by project CLI import."
+    });
+  }
+  const created = Array.isArray(added.created) ? added.created.length : payload.tasks.length;
+  return {
+    action: "tasks_imported",
+    message: `Imported ${created} task(s) into queue ${command.queueId}.`,
+    data: added
+  };
+}
+
+async function launchReadyWorkers(
+  command: Extract<ProjectCliCommand, { command: "launch" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const next = await call<NextReadyResult>("project_queue_next_ready", { queueId: command.queueId, limit: command.limit });
+  const started: Record<string, unknown>[] = [];
+  const skipped: Record<string, unknown>[] = [];
+  const skipQueueTaskIds: string[] = [];
+  const limit = command.limit ?? next.ready.length;
+
+  for (let index = 0; index < limit; index += 1) {
+    const claimed = await call<ClaimNextResult>("project_queue_claim_next", {
+      queueId: command.queueId,
+      worker: command.worker,
+      workspaceMode: command.workspaceMode,
+      workspacePath: command.workspacePath,
+      modelProfile: command.modelProfile,
+      maxRuntimeMinutes: command.maxRuntimeMinutes,
+      command: [],
+      skipQueueTaskIds,
+      metadata: { source: "project-cli-launch" }
+    });
+    if (claimed.approvalRequired && claimed.toolContextProposal) {
+      const proposal = claimed.toolContextProposal;
+      const queueTaskId = proposal.queueTaskId ?? "unknown";
+      skipped.push({
+        queueTaskId,
+        reason: "tool/context approval required",
+        proposalId: proposal.proposalId,
+        missingGrants: proposal.missingGrants ?? []
+      });
+      if (proposal.queueTaskId) {
+        skipQueueTaskIds.push(proposal.queueTaskId);
+        continue;
+      }
+      break;
+    }
+    if (claimed.executionBlocked) {
+      skipped.push({ queueTaskId: "queue", reason: claimed.blockedReason ?? "queue is not runnable", executionBlocked: true });
+      break;
+    }
+    if (!claimed.claimed) break;
+    if (!claimed.workerRun?.workerRunId || !claimed.claimed.fabricTaskId) {
+      skipped.push({ queueTaskId: claimed.claimed.queueTaskId, title: claimed.claimed.title, reason: "missing worker run or fabricTaskId" });
+      continue;
+    }
+    await call("fabric_task_event", {
+      taskId: claimed.claimed.fabricTaskId,
+      workerRunId: claimed.workerRun.workerRunId,
+      kind: "started",
+      body: "Worker run registered by project CLI launcher.",
+      metadata: { queueId: command.queueId, queueTaskId: claimed.claimed.queueTaskId, toolContextProposalId: claimed.toolContextProposal?.proposalId }
+    });
+    started.push({
+      queueTaskId: claimed.claimed.queueTaskId,
+      fabricTaskId: claimed.claimed.fabricTaskId,
+      workerRunId: claimed.workerRun.workerRunId,
+      title: claimed.claimed.title
+    });
+  }
+
+  return {
+    action: "workers_launched",
+    message: formatLaunchResult(command.queueId, started, skipped, next),
+    data: { queueId: command.queueId, started, skipped, activeWorkers: next.activeWorkers, availableSlots: next.availableSlots }
+  };
+}
+
+async function decideToolProposal(
+  command: Extract<ProjectCliCommand, { command: "approve-tool" | "decide-tool" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const decision = command.command === "approve-tool" ? "approve" : command.decision;
+  const result = await call<Record<string, unknown>>("tool_context_decide", {
+    proposalId: command.proposalId,
+    decision,
+    remember: command.remember,
+    note: command.note
+  });
+  return {
+    action: `tool_context_${decision}`,
+    message: `Recorded ${decision} for tool/context proposal ${command.proposalId}${command.remember ? " and remembered grants" : ""}.`,
+    data: result
+  };
+}
+
+async function setToolPolicy(
+  command: Extract<ProjectCliCommand, { command: "set-tool-policy" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const result = await call<Record<string, unknown>>("tool_context_policy_set", {
+    projectPath: command.projectPath,
+    grantKind: command.grantKind,
+    value: command.value,
+    status: command.status
+  });
+  return {
+    action: "tool_context_policy_set",
+    message: `Set ${command.grantKind}:${command.value} to ${command.status} for ${command.projectPath}.`,
+    data: result
+  };
+}
+
+function parseTasksFile(path: string): { tasks: unknown[] } {
+  const parsed = JSON.parse(readFile(path)) as unknown;
+  if (Array.isArray(parsed)) return { tasks: parsed };
+  if (parsed && typeof parsed === "object" && Array.isArray((parsed as { tasks?: unknown }).tasks)) {
+    return { tasks: (parsed as { tasks: unknown[] }).tasks };
+  }
+  throw new FabricError("INVALID_INPUT", "tasks file must be a JSON array or an object with a tasks array", false);
+}
+
+function parseTaskMetadataFile(path: string): Record<string, unknown> {
+  const parsed = JSON.parse(readFile(path)) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new FabricError("INVALID_INPUT", "metadata file must be a JSON object", false);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function formatStatus(status: QueueStatus): string {
+  const counts = status.tasks.reduce<Record<string, number>>((acc, task) => {
+    acc[task.status] = (acc[task.status] ?? 0) + 1;
+    return acc;
+  }, {});
+  const policies = status.toolContextPolicies ?? [];
+  const approvedPolicies = policies.filter((policy) => policy.status === "approved").length;
+  const rejectedPolicies = policies.filter((policy) => policy.status === "rejected").length;
+  const lines = [
+    `Queue ${status.queue.queueId}`,
+    `Project: ${status.queue.projectPath}`,
+    `Status: ${status.queue.status}`,
+    `Max parallel agents: ${status.queue.maxParallelAgents}`,
+    `Tool/context proposals: ${status.toolContextProposals?.length ?? 0}; policies: approved=${approvedPolicies}, rejected=${rejectedPolicies}`,
+    `Tasks: ${Object.entries(counts)
+      .map(([key, value]) => `${key}=${value}`)
+      .join(", ")}`
+  ];
+  for (const task of status.tasks) {
+    lines.push(`  ${task.queueTaskId} ${task.status} ${task.title}`);
+  }
+  return lines.join("\n");
+}
+
+function formatQueueList(result: QueueListResult): string {
+  const lines = [`Project queues: ${result.count}`];
+  if (result.queues.length === 0) {
+    lines.push("No queues.");
+    return lines.join("\n");
+  }
+  for (const queue of result.queues) {
+    const counts = queue.counts
+      ? Object.entries(queue.counts)
+          .map(([key, value]) => `${key}=${value}`)
+          .join(",")
+      : "";
+    lines.push(
+      `  ${queue.queueId} ${queue.status} ready=${queue.readyCount ?? 0} blocked=${queue.blockedCount ?? 0} active=${queue.activeWorkers ?? 0} approvals=${
+        queue.pendingApprovals ?? 0
+      } ${queue.title} (${queue.projectPath})${counts ? ` [${counts}]` : ""}`
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatApprovalInbox(result: PendingApprovalInbox): string {
+  const lines = [`Pending tool/context approvals: ${result.count}`];
+  if (result.pending.length === 0) {
+    lines.push("No pending approvals.");
+    return lines.join("\n");
+  }
+  for (const item of result.pending) {
+    lines.push(`  ${item.proposalId} queue=${item.queueId} task=${item.queueTaskId ?? ""} ${item.queueTaskTitle ?? item.queueTitle ?? ""}`);
+    const missing = Array.isArray(item.missingGrants) ? item.missingGrants : [];
+    if (missing.length > 0) lines.push(`    missing: ${missing.map((grant) => grantSummary(grant)).join(", ")}`);
+    const warnings = Array.isArray(item.safetyWarnings) ? item.safetyWarnings : [];
+    if (warnings.length > 0) lines.push(`    warnings: ${warnings.join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+function formatMemoryInbox(result: { memories?: Record<string, unknown>[]; total?: number }): string {
+  const memories = result.memories ?? [];
+  const lines = [`Pending memory review: ${result.total ?? memories.length}`];
+  if (memories.length === 0) {
+    lines.push("No pending memories.");
+    return lines.join("\n");
+  }
+  for (const memory of memories) {
+    const confidence = typeof memory.confidence === "number" ? memory.confidence.toFixed(2) : String(memory.confidence ?? "?");
+    lines.push(`  ${memory.id ?? ""} ${memory.type ?? "memory"} ${memory.status ?? ""} confidence=${confidence}`);
+    lines.push(`    ${memory.body ?? ""}`);
+  }
+  return lines.join("\n");
+}
+
+function formatMemoryReview(result: Record<string, unknown>): string {
+  return `Memory ${result.id ?? ""} ${result.decision ?? "reviewed"}: ${result.previousStatus ?? "unknown"} -> ${result.status ?? "unknown"}`;
+}
+
+function formatQueueApprovalInbox(queueId: string, result: QueueApprovalInbox): string {
+  const lines = [
+    `Queue ${queueId} approvals: ${result.count}`,
+    `Tool/context: ${result.toolContextCount}; model calls: ${result.modelCallCount}`
+  ];
+  if (result.count === 0) {
+    lines.push("No pending queue approvals.");
+    return lines.join("\n");
+  }
+  for (const item of result.toolContext) {
+    lines.push(`  tool ${item.proposalId ?? ""} task=${item.queueTaskId ?? ""} ${item.queueTaskTitle ?? ""}`);
+    const missing = Array.isArray(item.missingGrants) ? item.missingGrants : [];
+    if (missing.length > 0) lines.push(`    missing: ${missing.map((grant) => grantSummary(grant)).join(", ")}`);
+    const warnings = Array.isArray(item.safetyWarnings) ? item.safetyWarnings : [];
+    if (warnings.length > 0) lines.push(`    warnings: ${warnings.join(", ")}`);
+  }
+  for (const item of result.modelCalls) {
+    const selected = item.selected ? `${item.selected.provider ?? ""}/${item.selected.model ?? ""}/${item.selected.reasoning ?? ""}` : "unknown";
+    const cost = typeof item.estimate?.estimatedCostUsd === "number" ? ` $${item.estimate.estimatedCostUsd.toFixed(4)}` : "";
+    lines.push(`  model ${item.requestId ?? item.approvalRequestId ?? ""} ${item.risk ?? "risk"} ${selected}${cost}`);
+    const warnings = Array.isArray(item.warnings) ? item.warnings : [];
+    if (warnings.length > 0) lines.push(`    warnings: ${warnings.join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+function formatAgentLanes(queueId: string, result: AgentLanesResult): string {
+  const lines = [`Queue ${queueId} agent lanes: ${result.count}`];
+  if (result.lanes.length === 0) {
+    lines.push("No active lanes.");
+    return lines.join("\n");
+  }
+  for (const lane of result.lanes) {
+    const task = lane.queueTask;
+    const worker = lane.workerRun;
+    const progress = lane.progress;
+    const title = task?.title ?? task?.queueTaskId ?? lane.laneId;
+    lines.push(
+      `  ${lane.laneId} ${worker?.worker ?? "worker"} ${progress?.label ?? worker?.status ?? task?.status ?? "unknown"} ${title}`
+    );
+    if (progress?.summary) lines.push(`    summary: ${progress.summary}`);
+    if (lane.latestEvent?.kind) lines.push(`    latest: ${lane.latestEvent.kind}${lane.latestEvent.body ? ` - ${lane.latestEvent.body}` : ""}`);
+    if (progress?.nextAction) lines.push(`    next: ${progress.nextAction}`);
+    if (progress?.lastActivityAt) lines.push(`    updated: ${progress.lastActivityAt}`);
+  }
+  return lines.join("\n");
+}
+
+function formatDashboard(result: DashboardResult): string {
+  const board = result.queueBoard ?? {};
+  const lines = [
+    `Queue ${result.queue.queueId} dashboard`,
+    `Project: ${result.queue.projectPath}`,
+    `Status: ${result.queue.status}`,
+    `Workers: active=${result.activeWorkers ?? 0}, slots=${result.availableSlots ?? 0}, lanes=${result.agentLaneCount ?? 0}`,
+    `Board: ready=${board.ready?.length ?? 0}, running=${board.running?.length ?? 0}, review=${board.review?.length ?? 0}, blocked=${
+      board.blocked?.length ?? 0
+    }, done=${board.done?.length ?? 0}, failed=${board.failed?.length ?? 0}`,
+    `Approvals: ${result.pendingApprovals?.length ?? 0}`
+  ];
+  if (result.summaryStrip) {
+    const summary = result.summaryStrip;
+    const cost = summary.cost?.estimatedCostUsd;
+    lines.push(
+      `Health: ${summary.status ?? "unknown"} ${summary.severity ?? "unknown"}; risk=${summary.risk?.highestOpenRisk ?? "none"}; preflights=${
+        summary.cost?.preflightCount ?? 0
+      }${typeof cost === "number" ? `; estimated=$${cost.toFixed(6)}` : ""}`
+    );
+    if (summary.nextAction) lines.push(`Next: ${summary.nextAction}`);
+  }
+  if (result.pipeline?.length) {
+    lines.push(`Pipeline: ${result.pipeline.map((stage) => `${stage.stage ?? "stage"}=${stage.status ?? "unknown"}`).join(", ")}`);
+  }
+  for (const task of board.ready ?? []) {
+    lines.push(`  ready ${task.queueTaskId} ${task.title}`);
+  }
+  for (const lane of result.agentLanes ?? []) {
+    lines.push(`  lane ${lane.laneId} ${lane.progress?.label ?? lane.workerRun?.status ?? "unknown"} ${lane.queueTask?.title ?? ""}`);
+  }
+  return lines.join("\n");
+}
+
+function formatReviewMatrix(result: ReviewMatrixResult): string {
+  const summary = result.summary ?? {};
+  const parallelism = result.parallelism ?? {};
+  const scheduled = parallelism.scheduledPreview ?? {};
+  const lines = [
+    `Queue ${result.queue.queueId} review matrix`,
+    `Project: ${result.queue.projectPath}`,
+    `Status: ${result.queue.status}`,
+    `Tasks: total=${summary.totalTasks ?? 0}, open=${summary.openTasks ?? 0}, roots=${summary.rootTasks ?? 0}, leaves=${summary.leafTasks ?? 0}, edges=${
+      summary.dependencyEdges ?? result.dependencies?.edgeCount ?? 0
+    }`,
+    `Readiness: dependency-free=${summary.readyDependencyFree ?? 0}, dependency-blocked=${summary.blockedByDependencies ?? 0}, scheduler-blocked=${
+      summary.schedulerBlocked ?? 0
+    }, launchable=${summary.launchable ?? 0}, approvals=${summary.approvalRequired ?? 0}, waiting-start=${summary.waitingForStart ?? 0}`,
+    `Parallelism: active=${parallelism.activeWorkers ?? 0}, slots=${parallelism.availableSlots ?? 0}, max=${parallelism.maxParallelAgents ?? 0}, serial=${
+      parallelism.serialTasks?.length ?? 0
+    }, parallel-safe=${parallelism.parallelSafeTasks?.length ?? 0}`,
+    `Tool/context: required-tasks=${summary.tasksRequiringContext ?? 0}, approval-tasks=${
+      summary.tasksNeedingToolContextApproval ?? 0
+    }, proposal-needed=${summary.tasksNeedingToolContextProposal ?? 0}, pending=${summary.pendingToolContextApprovals ?? 0}, grants=${
+      summary.uniqueRequiredGrants ?? 0
+    }`,
+    `Files: scopes=${summary.fileScopes ?? 0}, overlaps=${summary.overlappingFileScopes ?? 0}`
+  ];
+  if (result.executionBlocked) lines.push(`Execution blocked: ${result.blockedReason ?? "queue is not runnable"}.`);
+  if (parallelism.workerStartBlocked) lines.push(`Worker start blocked: ${parallelism.workerStartBlockedReason ?? "queue gate is not open"}.`);
+  const risk = bucketLine("Risk", result.buckets?.risk);
+  const phase = bucketLine("Phase", result.buckets?.phase);
+  const category = bucketLine("Category", result.buckets?.category);
+  if (risk) lines.push(risk);
+  if (phase) lines.push(phase);
+  if (category) lines.push(category);
+  const launchable = scheduled.launchable?.length ?? 0;
+  const approvals = scheduled.approvalRequired?.length ?? 0;
+  const blocked = scheduled.blocked?.length ?? 0;
+  lines.push(`Preview: launchable=${launchable}, approvals=${approvals}, blocked=${blocked}`);
+  const overlappingFiles = (result.fileScopes ?? []).filter((scope) => scope.overlap).slice(0, 5);
+  for (const scope of overlappingFiles) {
+    lines.push(`  file-overlap ${scope.openTaskCount ?? scope.taskCount ?? 0} ${scope.path ?? ""}`.trimEnd());
+  }
+  const rejectedGrants = (result.toolContext?.grants ?? []).filter((grant) => grant.policyStatus === "rejected").slice(0, 5);
+  for (const grant of rejectedGrants) {
+    lines.push(`  rejected ${grant.kind ?? "grant"} ${grant.grantKey ?? ""} tasks=${grant.taskCount ?? 0}`.trimEnd());
+  }
+  return lines.join("\n");
+}
+
+function bucketLine(label: string, buckets: Array<{ key?: string; count?: number; openCount?: number }> | undefined): string | undefined {
+  if (!buckets || buckets.length === 0) return undefined;
+  return `${label}: ${buckets
+    .slice(0, 6)
+    .map((bucket) => `${bucket.key ?? "none"}=${bucket.count ?? 0}${bucket.openCount !== undefined ? `/${bucket.openCount}` : ""}`)
+    .join(", ")}`;
+}
+
+function formatTaskDetail(result: TaskDetailResult): string {
+  const task = result.task;
+  const readiness = result.readiness;
+  const lines = [
+    `Queue ${result.queue.queueId} task ${task.queueTaskId}`,
+    `Project: ${result.queue.projectPath}`,
+    `Task: ${task.title}`,
+    `Status: ${task.status}; risk=${task.risk ?? "medium"}; priority=${task.priority ?? "normal"}`,
+    `Ready now: ${String(readiness?.readyNow ?? false)}${readiness?.state ? ` (${readiness.state})` : ""}`
+  ];
+  if (readiness?.reasons?.length) lines.push(`Reasons: ${readiness.reasons.join("; ")}`);
+  const dependencies = result.graph?.dependencies ?? [];
+  const dependents = result.graph?.dependents ?? [];
+  lines.push(`Dependencies: ${dependencies.length}; dependents: ${dependents.length}`);
+  for (const dependency of dependencies) {
+    const status = dependency.missing ? "missing" : dependency.status ?? "unknown";
+    lines.push(`  depends ${dependency.queueTaskId ?? ""} ${status} ${dependency.title ?? ""}`.trimEnd());
+  }
+  for (const run of result.workerRuns ?? []) {
+    const worker = run.workerRun;
+    lines.push(`  worker ${worker?.workerRunId ?? ""} ${worker?.worker ?? "worker"} ${worker?.status ?? "unknown"} ${worker?.workspacePath ?? ""}`.trimEnd());
+    if (run.latestEvent?.kind) lines.push(`    latest: ${run.latestEvent.kind}${run.latestEvent.body ? ` - ${run.latestEvent.body}` : ""}`);
+    if (run.progress?.nextAction) lines.push(`    next: ${run.progress.nextAction}`);
+  }
+  const pendingTools = (result.toolContextProposals ?? []).filter((proposal) => proposal.status === "proposed" && proposal.approvalRequired);
+  const pendingModels = (result.modelApprovals ?? []).filter((approval) => approval.status === "pending");
+  lines.push(`Approvals: tool/context=${pendingTools.length}; model=${pendingModels.length}`);
+  if (result.resume?.taskPacket) lines.push("Resume packet: included");
+  return lines.join("\n");
+}
+
+function formatTimeline(result: TimelineResult): string {
+  const lines = [`Queue ${result.queue.queueId} timeline: ${result.count}`];
+  if (result.items.length === 0) {
+    lines.push("No timeline items.");
+    return lines.join("\n");
+  }
+  for (const item of result.items) {
+    const prefix = item.timestamp ? `${item.timestamp} ` : "";
+    lines.push(`  ${prefix}${item.source ?? "event"} ${item.kind ?? "event"} ${item.title ?? item.timelineId ?? ""}`.trimEnd());
+    if (item.summary) lines.push(`    ${item.summary}`);
+  }
+  return lines.join("\n");
+}
+
+function grantSummary(value: unknown): string {
+  if (value && typeof value === "object" && typeof (value as { grantKey?: unknown }).grantKey === "string") {
+    return (value as { grantKey: string }).grantKey;
+  }
+  return String(value);
+}
+
+function formatQueueReview(status: QueueStatus, next: NextReadyResult, approved: boolean): string {
+  const highRisk = status.tasks.filter((task) => task.risk === "high" || task.risk === "breakglass");
+  const parallelSafe = status.tasks.filter((task) => task.parallelSafe !== false);
+  const serial = status.tasks.filter((task) => task.parallelSafe === false);
+  const lines = [
+    `Queue ${status.queue.queueId} review${approved ? " (approved)" : ""}`,
+    `Project: ${status.queue.projectPath}`,
+    `Status: ${status.queue.status}`,
+    `Ready now: ${next.ready.length}; blocked: ${next.blocked.length}; active workers: ${next.activeWorkers}; slots: ${next.availableSlots}`,
+    `Parallel-safe: ${parallelSafe.length}; serial: ${serial.length}; high-risk: ${highRisk.length}`
+  ];
+  if (next.executionBlocked) lines.push(`Execution blocked: ${next.blockedReason ?? "queue is not runnable"}.`);
+  if (next.ready.length > 0) {
+    lines.push("Ready tasks:");
+    for (const task of next.ready) {
+      lines.push(`  ${task.queueTaskId} ${task.priority ?? "normal"} ${task.risk ?? "medium"} ${task.title}`);
+    }
+  }
+  if (highRisk.length > 0) {
+    lines.push("High-risk tasks:");
+    for (const task of highRisk) {
+      lines.push(`  ${task.queueTaskId} ${task.risk} ${task.title}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatClaimNext(result: ClaimNextResult): string {
+  const lines = [
+    `Queue ${result.queueId} claim-next`,
+    `Active workers: ${result.activeWorkers}; slots: ${result.availableSlots}`
+  ];
+  if (!result.claimed) {
+    if (result.executionBlocked) {
+      lines.push(`Execution blocked: ${result.blockedReason ?? "queue is not runnable"}.`);
+      return lines.join("\n");
+    }
+    if (result.approvalRequired && result.toolContextProposal?.proposalId) {
+      lines.push(`Tool/context approval required before claim. proposal=${result.toolContextProposal.proposalId}`);
+      const missing = Array.isArray(result.toolContextProposal.missingGrants) ? result.toolContextProposal.missingGrants : [];
+      if (missing.length > 0) lines.push(`Missing: ${missing.map((grant) => grantSummary(grant)).join(", ")}`);
+      return lines.join("\n");
+    }
+    lines.push(`No task claimed. Blocked: ${result.blocked.length}.`);
+    return lines.join("\n");
+  }
+  lines.push(`Claimed ${result.claimed.queueTaskId} ${result.claimed.priority ?? "normal"} ${result.claimed.risk ?? "medium"} ${result.claimed.title}`);
+  if (result.claimed.fabricTaskId) lines.push(`Fabric task: ${result.claimed.fabricTaskId}`);
+  if (result.workerRun?.workerRunId) {
+    lines.push(`Worker run: ${result.workerRun.workerRunId} ${result.workerRun.worker ?? ""} ${result.workerRun.workspacePath ?? ""}`.trim());
+  }
+  return lines.join("\n");
+}
+
+function formatPrepareReady(result: PrepareReadyResult): string {
+  const lines = [
+    `Queue ${result.queueId} prepare-ready`,
+    `Prepared: ${result.prepared.length}; launchable=${result.summary?.readyToLaunch ?? result.summary?.readyToClaim ?? 0}; approvals=${
+      result.summary?.approvalRequired ?? 0
+    }; waiting-start=${result.summary?.waitingForStart ?? 0}; no-context=${result.summary?.noContextRequired ?? 0}`,
+    `Active workers: ${result.activeWorkers}; slots: ${result.availableSlots}`
+  ];
+  if (result.executionBlocked) {
+    lines.push(`Execution blocked: ${result.blockedReason ?? "queue is not runnable"}.`);
+    return lines.join("\n");
+  }
+  if (result.workerStartBlocked) {
+    lines.push(`Worker start blocked: ${result.workerStartBlockedReason ?? "queue gate is not open"}.`);
+  }
+  for (const item of result.prepared) {
+    const task = item.task;
+    const proposal = item.toolContextProposal;
+    const status = item.approvalRequired ? "approval_required" : item.readyToLaunch ? "launchable" : "waiting_start";
+    const reused = item.reusedProposal ? " reused" : "";
+    lines.push(`  ${status}${reused} ${task?.queueTaskId ?? ""} ${task?.title ?? ""}`.trimEnd());
+    if (proposal?.proposalId) lines.push(`    proposal: ${proposal.proposalId}${proposal.status ? ` (${proposal.status})` : ""}`);
+    const missing = Array.isArray(item.missingGrants) ? item.missingGrants : [];
+    if (missing.length > 0) lines.push(`    missing: ${missing.map((grant) => grantSummary(grant)).join(", ")}`);
+  }
+  if (result.blocked.length > 0) lines.push(`Blocked: ${result.blocked.length}`);
+  return lines.join("\n");
+}
+
+function formatLaunchPlan(result: LaunchPlanResult): string {
+  const lines = [
+    `Queue ${result.queueId} launch plan`,
+    `Scheduled: ${result.summary?.scheduled ?? 0}; launchable=${result.summary?.launchable ?? result.launchable.length}; approvals=${
+      result.summary?.approvalRequired ?? result.approvalRequired.length
+    }; waiting-start=${result.summary?.waitingForStart ?? result.waitingForStart.length}; needs-proposal=${result.summary?.needsProposal ?? 0}`,
+    `Active workers: ${result.activeWorkers}; slots: ${result.availableSlots}`
+  ];
+  if (result.executionBlocked) {
+    lines.push(`Execution blocked: ${result.blockedReason ?? "queue is not runnable"}.`);
+  } else if (result.workerStartBlocked) {
+    lines.push(`Worker start blocked: ${result.workerStartBlockedReason ?? "queue gate is not open"}.`);
+  }
+  appendLaunchPlanGroup(lines, "Launchable", result.launchable);
+  appendLaunchPlanGroup(lines, "Waiting for start", result.waitingForStart);
+  appendLaunchPlanGroup(lines, "Approval required", result.approvalRequired);
+  if (result.blocked.length > 0) lines.push(`Blocked: ${result.blocked.length}`);
+  return lines.join("\n");
+}
+
+function appendLaunchPlanGroup(lines: string[], label: string, entries: Array<LaunchPlanEntry>): void {
+  if (entries.length === 0) return;
+  lines.push(`${label}:`);
+  for (const entry of entries) {
+    const task = entry.task;
+    lines.push(`  ${task?.queueTaskId ?? "unknown"} ${task?.priority ?? "normal"} ${task?.risk ?? "medium"} ${task?.title ?? ""}`.trimEnd());
+    if (entry.launchBlockedReason) lines.push(`    blocked: ${entry.launchBlockedReason}`);
+    if (entry.toolContextProposal?.proposalId) lines.push(`    proposal: ${entry.toolContextProposal.proposalId}${entry.toolContextProposal.status ? ` (${entry.toolContextProposal.status})` : ""}`);
+    const missing = Array.isArray(entry.missingGrants) ? entry.missingGrants : [];
+    if (missing.length > 0) lines.push(`    missing: ${missing.map((grant) => grantSummary(grant)).join(", ")}`);
+  }
+}
+
+function formatRecoverStale(result: RecoverStaleResult): string {
+  const lines = [
+    `Queue ${result.queueId} stale recovery${result.dryRun ? " (dry run)" : ""}`,
+    `Action: ${result.action}; stale after: ${result.staleAfterMinutes} minute(s); matched: ${result.count}`
+  ];
+  if (result.recovered.length === 0) {
+    lines.push("No stale running tasks.");
+    return lines.join("\n");
+  }
+  for (const item of result.recovered) {
+    const title = item.queueTask?.title ? ` ${item.queueTask.title}` : "";
+    const worker = item.workerRunId ? ` worker=${item.workerRunId}` : "";
+    const reason = item.reason ? ` reason=${item.reason}` : "";
+    lines.push(`  ${item.queueTaskId ?? "unknown"}${title}${worker}${reason}`);
+  }
+  return lines.join("\n");
+}
+
+function formatRetryTask(result: RetryTaskResult): string {
+  const task = result.task;
+  const lines = [
+    `Retried task ${task?.queueTaskId ?? "unknown"}${task?.title ? ` (${task.title})` : ""}.`,
+    `Previous status: ${result.previousStatus ?? "unknown"}; current status: ${task?.status ?? "unknown"}.`
+  ];
+  if (result.previousWorkerRunId) lines.push(`Previous worker run marked stale: ${result.previousWorkerRunId}.`);
+  if (result.clearOutputs === false) lines.push("Patch and test refs were retained.");
+  if (result.queue?.status) lines.push(`Queue status: ${result.queue.status}.`);
+  return lines.join("\n");
+}
+
+function formatTaskMetadataUpdated(result: { queue?: { queueId?: string; status?: string }; task?: QueueTask; previousTask?: QueueTask }): string {
+  const task = result.task;
+  const previous = result.previousTask;
+  const lines = [`Updated task metadata ${task?.queueTaskId ?? "unknown"}${task?.title ? ` (${task.title})` : ""}.`];
+  if (previous && task) {
+    const changed: string[] = [];
+    if (previous.title !== task.title) changed.push("title");
+    if (previous.goal !== task.goal) changed.push("goal");
+    if (previous.phase !== task.phase) changed.push("phase");
+    if (previous.category !== task.category) changed.push("category");
+    if (previous.priority !== task.priority) changed.push("priority");
+    if (previous.parallelGroup !== task.parallelGroup) changed.push("parallelGroup");
+    if (previous.parallelSafe !== task.parallelSafe) changed.push("parallelSafe");
+    if (previous.risk !== task.risk) changed.push("risk");
+    if (JSON.stringify(previous.dependsOn ?? []) !== JSON.stringify(task.dependsOn ?? [])) changed.push("dependsOn");
+    if (JSON.stringify(previous.requiredTools ?? []) !== JSON.stringify(task.requiredTools ?? [])) changed.push("requiredTools");
+    if (JSON.stringify(previous.requiredMcpServers ?? []) !== JSON.stringify(task.requiredMcpServers ?? [])) changed.push("requiredMcpServers");
+    if (JSON.stringify(previous.requiredMemories ?? []) !== JSON.stringify(task.requiredMemories ?? [])) changed.push("requiredMemories");
+    if (JSON.stringify(previous.requiredContextRefs ?? []) !== JSON.stringify(task.requiredContextRefs ?? [])) changed.push("requiredContextRefs");
+    if (changed.length > 0) lines.push(`Changed: ${changed.join(", ")}.`);
+  }
+  if (result.queue?.status) lines.push(`Queue status: ${result.queue.status}.`);
+  return lines.join("\n");
+}
+
+function formatPatchReview(queueId: string, tasks: QueueTask[], acceptedTaskId: string | undefined, appliedPatch?: ReviewedPatchApplyResult): string {
+  const lines = [`Queue ${queueId} patch review${acceptedTaskId ? ` accepted=${acceptedTaskId}` : ""}`];
+  if (appliedPatch) {
+    lines.push(`Applied patch: ${appliedPatch.patchFile}`);
+    lines.push(`Apply cwd: ${appliedPatch.cwd}`);
+  }
+  if (tasks.length === 0) {
+    lines.push("No patch-ready tasks.");
+    return lines.join("\n");
+  }
+  for (const task of tasks) {
+    lines.push(`  ${task.queueTaskId} ${task.status} ${task.title}`);
+    if (task.summary) lines.push(`    summary: ${task.summary}`);
+    if (task.patchRefs?.length) lines.push(`    patches: ${task.patchRefs.join(", ")}`);
+    if (task.testRefs?.length) lines.push(`    tests: ${task.testRefs.join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+function formatRunTaskResult(task: QueueTask, workerRunId: string, exitCode: number, changedFiles: string[]): string {
+  const lines = [
+    `Ran task ${task.queueTaskId} (${task.title}) with worker run ${workerRunId}.`,
+    `Exit code: ${exitCode}. Changed files: ${changedFiles.length}.`
+  ];
+  for (const file of changedFiles.slice(0, 20)) {
+    lines.push(`  ${file}`);
+  }
+  if (changedFiles.length > 20) lines.push(`  ...and ${changedFiles.length - 20} more`);
+  return lines.join("\n");
+}
+
+function formatTaskPacketsWritten(queueId: string, packets: Array<{ queueTaskId: string; path: string }>): string {
+  const lines = [`Queue ${queueId}: wrote ${packets.length} task packet(s).`];
+  for (const packet of packets.slice(0, 20)) {
+    lines.push(`  ${packet.queueTaskId}: ${packet.path}`);
+  }
+  if (packets.length > 20) lines.push(`  ...and ${packets.length - 20} more`);
+  return lines.join("\n");
+}
+
+function formatResumeTaskResult(command: Extract<ProjectCliCommand, { command: "resume-task" }>, result: QueueResumeResult): string {
+  const lines = [
+    `Resume packet for ${result.queueTask.queueTaskId} (${result.queueTask.title}).`,
+    `Workspace: ${result.fabricResume.workspacePath ?? result.fabricResume.projectPath}.`,
+    `Model profile: ${result.fabricResume.modelProfile ?? "unspecified"}.`
+  ];
+  if (command.outputFile) lines.push(`Wrote ${command.format} resume packet to ${command.outputFile}.`);
+  else lines.push(result.fabricResume.resumePrompt);
+  return lines.join("\n");
+}
+
+function formatRunReadyResult(queueId: string, runs: ProjectRunResult[], skipped: Record<string, unknown>[], next: NextReadyResult): string {
+  const lines = [
+    `Queue ${queueId}: ran ${runs.length} ready task(s), skipped ${skipped.length}.`,
+    `Active before run: ${next.activeWorkers}; slots before run: ${next.availableSlots}.`
+  ];
+  if (next.executionBlocked) lines.push(`Execution blocked: ${next.blockedReason ?? "queue is not runnable"}.`);
+  for (const run of runs) {
+    lines.push(`  ${run.action} ${String(run.data.queueTaskId)} exit=${String(run.data.exitCode ?? "n/a")}`);
+  }
+  for (const item of skipped) {
+    lines.push(`  skipped ${String(item.queueTaskId)}: ${String(item.reason)}`);
+  }
+  return lines.join("\n");
+}
+
+function formatFactoryRunPreview(
+  queueId: string,
+  reviewMatrix: ReviewMatrixResult,
+  prepared: PrepareReadyResult,
+  launchPlan: LaunchPlanResult,
+  packetDir: string,
+  cwdTemplate: string
+): string {
+  const lines = [
+    `Queue ${queueId}: factory-run preview.`,
+    `Tasks: ${reviewMatrix.summary?.totalTasks ?? "unknown"} total; ready=${reviewMatrix.summary?.readyDependencyFree ?? "unknown"}; overlaps=${
+      reviewMatrix.summary?.overlappingFileScopes ?? 0
+    }.`,
+    `Prepared: ${prepared.prepared.length}; launchable=${launchPlan.launchable.length}; approvals=${launchPlan.approvalRequired.length}; waiting-start=${launchPlan.waitingForStart.length}.`,
+    `Packet dir: ${packetDir}`,
+    `Sandbox template: ${cwdTemplate}`
+  ];
+  if (launchPlan.executionBlocked) lines.push(`Execution blocked: ${launchPlan.blockedReason ?? "queue is not runnable"}.`);
+  return lines.join("\n");
+}
+
+function formatFactoryRunCompleted(
+  queueId: string,
+  run: ProjectRunResult,
+  reviewMatrix: ReviewMatrixResult,
+  prepared: PrepareReadyResult,
+  launchPlan: LaunchPlanResult
+): string {
+  const data = run.data;
+  const lines = [
+    `Queue ${queueId}: factory-run completed.`,
+    `Runs: ${String(data.runCount ?? 0)}; skipped=${Array.isArray(data.skipped) ? data.skipped.length : 0}; initialParallel=${String(data.initialParallel ?? "unknown")}; finalParallel=${String(data.finalParallel ?? "unknown")}.`,
+    `Rate-limit signals: ${String(data.rateLimitSignals ?? 0)}; adjustments=${Array.isArray(data.parallelAdjustments) ? data.parallelAdjustments.length : 0}.`,
+    `Review matrix: tasks=${reviewMatrix.summary?.totalTasks ?? "unknown"}; overlap scopes=${reviewMatrix.summary?.overlappingFileScopes ?? 0}.`,
+    `Prepared: ${prepared.prepared.length}; launchable before run=${launchPlan.launchable.length}; approvals before run=${launchPlan.approvalRequired.length}.`
+  ];
+  if (run.message) lines.push("", run.message);
+  return lines.join("\n");
+}
+
+function formatLaunchResult(
+  queueId: string,
+  started: Record<string, unknown>[],
+  skipped: Record<string, unknown>[],
+  next: NextReadyResult
+): string {
+  const lines = [
+    `Queue ${queueId}: launched ${started.length} worker(s), skipped ${skipped.length}.`,
+    `Active before launch: ${next.activeWorkers}; slots before launch: ${next.availableSlots}.`
+  ];
+  if (next.executionBlocked) lines.push(`Execution blocked: ${next.blockedReason ?? "queue is not runnable"}.`);
+  for (const item of started) {
+    lines.push(`  started ${String(item.queueTaskId)} -> ${String(item.workerRunId)} ${String(item.title)}`);
+  }
+  for (const item of skipped) {
+    const proposal = item.proposalId ? ` proposal=${String(item.proposalId)}` : "";
+    lines.push(`  skipped ${String(item.queueTaskId)}: ${String(item.reason)}${proposal}`);
+  }
+  return lines.join("\n");
+}
+
+function defaultWorkspacePath(projectPath: string, queueTaskId: string, mode: string): string {
+  if (mode === "in_place") return projectPath;
+  return join(`${projectPath}.worktrees`, queueTaskId);
+}
+
+function defaultWorkerCommand(worker: string, fabricTaskId: string): string[] {
+  if (worker === "manual") return [];
+  if (worker === "aider") return ["aider", "--message", `Work on fabric task ${fabricTaskId}`];
+  if (worker === "deepseek-direct") return ["agent-fabric-deepseek-worker", "run-task", "--fabric-task", fabricTaskId];
+  return [worker, "run", "--fabric-task", fabricTaskId];
+}
+
+function commandLineForReadyTask(
+  command: Extract<ProjectCliCommand, { command: "run-ready" }>,
+  task: QueueTask,
+  projectPath: string,
+  taskPacketPath?: string
+): string {
+  if (!command.commandTemplate && command.worker === "deepseek-direct") {
+    if (!taskPacketPath) {
+      throw new FabricError("INVALID_INPUT", "deepseek-direct run-ready requires --task-packet-dir or an explicit --command-template", false);
+    }
+    return expandCommandTemplate("agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}} --fabric-task {{fabricTaskId}} --role {{deepseekRole}}", task, projectPath, taskPacketPath);
+  }
+  const template = command.commandTemplate ?? defaultWorkerCommand(command.worker, task.fabricTaskId ?? "").map(shellQuote).join(" ");
+  if (!template) {
+    throw new FabricError("INVALID_INPUT", "run-ready requires --command-template when worker has no default command", false);
+  }
+  return expandCommandTemplate(template, task, projectPath, taskPacketPath);
+}
+
+function cwdForReadyTask(command: Extract<ProjectCliCommand, { command: "run-ready" }>, task: QueueTask, projectPath: string): string {
+  if (command.cwdTemplate) return expandPathTemplate(command.cwdTemplate, task, projectPath);
+  return command.cwd ?? projectPath;
+}
+
+function prepareRunWorkspace(workspaceMode: "in_place" | "git_worktree" | "clone" | "sandbox", cwd: string, cwdPrep: CwdPrepMode): void {
+  if (cwdPrep === "none" || workspaceMode === "in_place") return;
+  if (cwdPrep === "mkdir") {
+    if (workspaceMode === "git_worktree" || workspaceMode === "clone") {
+      throw new FabricError("INVALID_INPUT", "cwd-prep mkdir cannot create git_worktree or clone workspaces", false);
+    }
+    mkdirSync(cwd, { recursive: true });
+    return;
+  }
+  if (workspaceMode === "sandbox") {
+    mkdirSync(cwd, { recursive: true });
+    return;
+  }
+  assertWorkspaceDirectoryExists(cwd, workspaceMode);
+}
+
+function assertWorkspaceDirectoryExists(cwd: string, workspaceMode: string): void {
+  try {
+    if (statSync(cwd).isDirectory()) return;
+  } catch {
+    // Fall through to a clear error below.
+  }
+  throw new FabricError("WORKSPACE_NOT_FOUND", `${workspaceMode} workspace does not exist: ${cwd}`, false);
+}
+
+function assertParallelCwdPolicy(
+  command: Extract<ProjectCliCommand, { command: "run-ready" }>,
+  tasks: QueueTask[],
+  projectPath: string,
+  parallel: number
+): void {
+  if (parallel <= 1 || tasks.length <= 1 || command.allowSharedCwd) return;
+  const cwds = tasks.map((task) => cwdForReadyTask(command, task, projectPath));
+  if (new Set(cwds).size !== cwds.length) {
+    throw new FabricError(
+      "PROJECT_RUN_READY_SHARED_CWD",
+      "Parallel run-ready would execute multiple tasks in the same cwd; pass --cwd-template for isolated directories or --allow-shared-cwd explicitly",
+      false
+    );
+  }
+}
+
+function normalizeParallel(value: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > 16) {
+    throw new FabricError("INVALID_INPUT", "parallel must be an integer between 1 and 16", false);
+  }
+  return value;
+}
+
+function normalizeMinParallel(value: number, maxParallel: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > maxParallel) {
+    throw new FabricError("INVALID_INPUT", "min-parallel must be an integer between 1 and parallel", false);
+  }
+  return value;
+}
+
+function isRateLimitRunResult(result: ProjectRunResult): boolean {
+  if (result.action !== "task_run_failed") return false;
+  if (structuredRateLimitSignal(result.data.structuredResult)) return true;
+  if (jsonErrorRateLimitSignal(String(result.data.stderrTail ?? "")) || jsonErrorRateLimitSignal(String(result.data.stdoutTail ?? ""))) return true;
+  const haystack = [
+    result.message,
+    result.data.stderrTail,
+    result.data.stdoutTail,
+    result.data.structuredResult ? JSON.stringify(result.data.structuredResult) : ""
+  ].join("\n");
+  return /DEEPSEEK_RATE_LIMITED|DeepSeek API returned 429|Too Many Requests/i.test(haystack);
+}
+
+function structuredRateLimitSignal(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const error = record.error && typeof record.error === "object" && !Array.isArray(record.error) ? (record.error as Record<string, unknown>) : {};
+  const codes = [record.code, record.errorCode, record.status, error.code].filter((entry): entry is string => typeof entry === "string");
+  return codes.some((code) => code === "DEEPSEEK_RATE_LIMITED" || /rate[_ -]?limit|too many requests/i.test(code));
+}
+
+function jsonErrorRateLimitSignal(text: string): boolean {
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) continue;
+    try {
+      if (structuredRateLimitSignal(JSON.parse(trimmed) as unknown)) return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+function expandCommandTemplate(template: string, task: QueueTask, projectPath: string, taskPacketPath?: string): string {
+  const values: Record<string, string> = {
+    queueTaskId: task.queueTaskId,
+    fabricTaskId: task.fabricTaskId ?? "",
+    title: task.title,
+    goal: task.goal,
+    projectPath,
+    taskPacket: taskPacketPath ?? "",
+    deepseekRole: deepSeekRoleForTask(task)
+  };
+  if (template.includes("{{taskPacket") && !taskPacketPath) {
+    throw new FabricError("INVALID_INPUT", "--task-packet-dir is required when command-template uses {{taskPacket}}", false);
+  }
+  return template.replace(/\{\{\s*(queueTaskId|fabricTaskId|title|goal|projectPath|taskPacket|deepseekRole)\s*\}\}/g, (_match, key: string) =>
+    shellQuote(values[key] ?? "")
+  );
+}
+
+function deepSeekRoleForTask(task: QueueTask): "implementer" | "reviewer" | "risk-reviewer" | "adjudicator" | "planner" {
+  const exactCategory = (task.category ?? "").toLowerCase();
+  if (["implementer", "reviewer", "risk-reviewer", "adjudicator", "planner"].includes(exactCategory)) {
+    return exactCategory as "implementer" | "reviewer" | "risk-reviewer" | "adjudicator" | "planner";
+  }
+  const value = `${task.category ?? ""} ${task.phase ?? ""} ${task.title ?? ""}`.toLowerCase();
+  if (value.includes("risk")) return "risk-reviewer";
+  if (value.includes("adjudicat")) return "adjudicator";
+  if (value.includes("plan")) return "planner";
+  if (value.includes("review") || value.includes("test") || value.includes("docs")) return "reviewer";
+  return "implementer";
+}
+
+function expandPathTemplate(template: string, task: QueueTask, projectPath: string): string {
+  const values: Record<string, string> = {
+    queueTaskId: task.queueTaskId,
+    fabricTaskId: task.fabricTaskId ?? "",
+    title: task.title,
+    goal: task.goal,
+    projectPath
+  };
+  return template.replace(/\{\{\s*(queueTaskId|fabricTaskId|title|goal|projectPath)\s*\}\}/g, (_match, key: string) => values[key] ?? "");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function safePathPart(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 96) || "queue";
+}
+
+function writeTaskPacket(
+  status: QueueStatus,
+  task: QueueTask,
+  outDir: string,
+  format: "json" | "markdown"
+): { queueTaskId: string; path: string; format: string } {
+  mkdirSync(outDir, { recursive: true });
+  const extension = format === "markdown" ? "md" : "json";
+  const path = join(outDir, `${task.queueTaskId}.${extension}`);
+  const packet = taskPacket(status, task);
+  const body = format === "markdown" ? formatTaskPacketMarkdown(packet) : `${JSON.stringify(packet, null, 2)}\n`;
+  writeFileSync(path, body, "utf8");
+  return { queueTaskId: task.queueTaskId, path, format };
+}
+
+function taskPacketMetadata(taskPacketPath?: string, taskPacketFormat?: "json" | "markdown"): Record<string, string> {
+  if (!taskPacketPath) return {};
+  return { taskPacketPath, taskPacketFormat: taskPacketFormat ?? "json" };
+}
+
+function taskPacket(status: QueueStatus, task: QueueTask): Record<string, unknown> {
+  return {
+    schema: "agent-fabric.task-packet.v1",
+    queue: {
+      queueId: status.queue.queueId,
+      projectPath: status.queue.projectPath,
+      status: status.queue.status,
+      planChainId: status.queue.planChainId
+    },
+    task,
+    terminalToolGuidance: {
+      automationSafe: {
+        rg: "Use for source/text search.",
+        fd: "Use for filename/path discovery.",
+        jq: "Use for JSON payloads, logs, and config.",
+        gh: "Use only for explicit GitHub work.",
+        btop: "Use only for human-supervised resource diagnostics."
+      },
+      humanFacingOrOptional: {
+        bat: "Readable file viewing; do not depend on aliases or colorized output in automation.",
+        eza: "Readable directory listings; do not depend on aliases or icons in automation.",
+        fzf: "Interactive operator selection only.",
+        zoxide: "Human shell navigation only; unattended workers should use explicit paths.",
+        atuin: "Interactive shell history only; do not use as task memory or evidence.",
+        tmux: "Persistent human-facing sessions only.",
+        zellij: "Optional human-facing terminal workspace.",
+        delta: "Human diff review when git/diff work is explicitly allowed.",
+        glab: "GitLab-only and non-default; use only for explicit GitLab tasks."
+      }
+    },
+    operatorInstructions: [
+      "Work only on this task unless the queue state says otherwise.",
+      "Use only approved tools and context.",
+      "Prefer rg for source/text search, fd for filename/path discovery, and jq for JSON payloads/logs/config.",
+      "Use gh only for explicit GitHub work, btop only for human-supervised diagnostics, and glab only for explicit GitLab work.",
+      "Do not run git operations unless the task or project rules explicitly allow them.",
+      "Treat bat, eza, fzf, zoxide, atuin, tmux, and zellij as human-facing or optional helpers; do not depend on aliases or shell history for unattended execution.",
+      "Record command, file, test, checkpoint, patch-ready, failed, or completed events through agent-fabric.",
+      "Return patch-ready output with test evidence or an explicit blocker."
+    ]
+  };
+}
+
+function formatTaskPacketMarkdown(packet: Record<string, unknown>): string {
+  const queue = packet.queue as Record<string, unknown>;
+  const task = packet.task as QueueTask;
+  const instructions = Array.isArray(packet.operatorInstructions) ? packet.operatorInstructions : [];
+  const terminalToolGuidance = packet.terminalToolGuidance as Record<string, Record<string, string>> | undefined;
+  return [
+    `# ${task.title}`,
+    "",
+    `Queue: ${String(queue.queueId)}`,
+    `Project: ${String(queue.projectPath)}`,
+    `Queue task: ${task.queueTaskId}`,
+    `Fabric task: ${task.fabricTaskId ?? ""}`,
+    `Status: ${task.status}`,
+    `Risk: ${task.risk ?? "medium"}`,
+    "",
+    "## Goal",
+    "",
+    task.goal,
+    "",
+    "## Task Metadata",
+    "",
+    `Phase: ${task.phase ?? ""}`,
+    `Priority: ${task.priority ?? "normal"}`,
+    `Parallel safe: ${String(task.parallelSafe ?? true)}`,
+    `Depends on: ${JSON.stringify(task.dependsOn ?? [])}`,
+    `Required tools: ${JSON.stringify(task.requiredTools ?? [])}`,
+    `Required MCP servers: ${JSON.stringify(task.requiredMcpServers ?? [])}`,
+    `Required memories: ${JSON.stringify(task.requiredMemories ?? [])}`,
+    `Required context refs: ${JSON.stringify(task.requiredContextRefs ?? [])}`,
+    "",
+    "## Expected Files",
+    "",
+    ...formatPacketList(task.expectedFiles),
+    "",
+    "## Acceptance Criteria",
+    "",
+    ...formatPacketList(task.acceptanceCriteria),
+    "",
+    "## Terminal Tool Guidance",
+    "",
+    ...formatTerminalToolGuidance(terminalToolGuidance),
+    "",
+    "## Instructions",
+    "",
+    ...instructions.map((instruction) => `- ${String(instruction)}`),
+    ""
+  ].join("\n");
+}
+
+function formatResumePacketMarkdown(packet: Record<string, unknown>): string {
+  const queue = packet.queue as Record<string, unknown>;
+  const task = packet.task as QueueTask;
+  const resume = packet.fabricResume as QueueResumeResult["fabricResume"];
+  const instructions = Array.isArray(packet.operatorInstructions) ? packet.operatorInstructions : [];
+  const terminalToolGuidance = packet.terminalToolGuidance as Record<string, Record<string, string>> | undefined;
+  return [
+    `# Resume ${task.title}`,
+    "",
+    `Queue: ${String(queue.queueId)}`,
+    `Project: ${String(queue.projectPath)}`,
+    `Queue task: ${task.queueTaskId}`,
+    `Fabric task: ${task.fabricTaskId ?? ""}`,
+    `Task status: ${task.status}`,
+    `Workspace: ${resume.workspacePath ?? resume.projectPath}`,
+    `Model profile: ${resume.modelProfile ?? ""}`,
+    `Context policy: ${resume.contextPolicy ?? ""}`,
+    "",
+    "## Resume Prompt",
+    "",
+    resume.resumePrompt,
+    "",
+    "## Latest Checkpoint",
+    "",
+    "```json",
+    JSON.stringify(resume.latestCheckpoint ?? null, null, 2),
+    "```",
+    "",
+    "## Required Context",
+    "",
+    `Required tools: ${JSON.stringify(packet.requiredTools ?? [])}`,
+    `Required MCP servers: ${JSON.stringify(packet.requiredMcpServers ?? [])}`,
+    `Required memories: ${JSON.stringify(packet.requiredMemories ?? [])}`,
+    `Required context refs: ${JSON.stringify(packet.requiredContextRefs ?? [])}`,
+    "",
+    "## Terminal Tool Guidance",
+    "",
+    ...formatTerminalToolGuidance(terminalToolGuidance),
+    "",
+    "## Instructions",
+    "",
+    ...instructions.map((instruction) => `- ${String(instruction)}`),
+    ""
+  ].join("\n");
+}
+
+function formatPacketList(values: unknown[] | undefined): string[] {
+  if (!values || values.length === 0) return ["- (unspecified)"];
+  return values.map((value) => `- ${String(value)}`);
+}
+
+function formatTerminalToolGuidance(guidance: Record<string, Record<string, string>> | undefined): string[] {
+  if (!guidance) return ["- (unspecified)"];
+  const lines: string[] = [];
+  for (const [group, tools] of Object.entries(guidance)) {
+    lines.push(`### ${group}`);
+    for (const [tool, note] of Object.entries(tools)) {
+      lines.push(`- \`${tool}\`: ${note}`);
+    }
+    lines.push("");
+  }
+  return lines;
+}
+
+type ShellResult = {
+  exitCode: number;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+};
+
+type StructuredWorkerResult = {
+  source: string;
+  status?: string;
+  summary?: string;
+  patchMode?: string;
+  patchFile?: string;
+  proposedPatch?: string;
+  patchApply?: unknown;
+  changedFilesSuggested?: string[];
+  testsSuggested?: string[];
+  blockers?: string[];
+  raw: Record<string, unknown>;
+};
+
+async function runShellCommand(command: string, cwd: string, maxOutputChars: number): Promise<ShellResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, { cwd, shell: true, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout = tailText(stdout + chunk, maxOutputChars);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = tailText(stderr + chunk, maxOutputChars);
+    });
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      resolve({ exitCode: code ?? 1, signal, stdout, stderr });
+    });
+  });
+}
+
+type SnapshotEntry = {
+  size: number;
+  mtimeMs: number;
+};
+
+type FileSnapshot = {
+  root: string;
+  entries: Map<string, SnapshotEntry>;
+  truncated: boolean;
+};
+
+const SNAPSHOT_SKIP_NAMES = new Set([
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  ".next",
+  ".nuxt",
+  ".turbo",
+  "dist",
+  "build",
+  "coverage",
+  ".cache",
+  ".agent-fabric"
+]);
+
+function snapshotFiles(root: string): FileSnapshot {
+  const entries = new Map<string, SnapshotEntry>();
+  let truncated = false;
+  const maxFiles = 10_000;
+  const visit = (dir: string): void => {
+    if (entries.size >= maxFiles) {
+      truncated = true;
+      return;
+    }
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (SNAPSHOT_SKIP_NAMES.has(name)) continue;
+      const path = join(dir, name);
+      let stat;
+      try {
+        stat = statSync(path);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) {
+        visit(path);
+      } else if (stat.isFile()) {
+        const ref = relative(root, path);
+        entries.set(ref, { size: stat.size, mtimeMs: stat.mtimeMs });
+      }
+      if (entries.size >= maxFiles) {
+        truncated = true;
+        return;
+      }
+    }
+  };
+  visit(root);
+  return { root, entries, truncated };
+}
+
+function diffSnapshots(before: FileSnapshot, after: FileSnapshot): string[] {
+  const changed = new Set<string>();
+  for (const [path, current] of after.entries.entries()) {
+    const previous = before.entries.get(path);
+    if (!previous || previous.size !== current.size || previous.mtimeMs !== current.mtimeMs) {
+      changed.add(path);
+    }
+  }
+  for (const path of before.entries.keys()) {
+    if (!after.entries.has(path)) changed.add(path);
+  }
+  return [...changed].sort();
+}
+
+function looksLikeTestCommand(command: string): boolean {
+  return /\b(npm|pnpm|yarn|bun)\s+(run\s+)?test\b|\b(vitest|pytest|cargo\s+test|go\s+test|mvn\s+test|gradle\s+test)\b/.test(command);
+}
+
+function loadStructuredWorkerResult(cwd: string, stdout: string, changedFiles: string[]): StructuredWorkerResult | undefined {
+  const stdoutResult = parseStructuredWorkerJson(stdout, "stdout");
+  if (stdoutResult) return stdoutResult;
+  for (const file of changedFiles) {
+    if (!file.endsWith(".json")) continue;
+    try {
+      const body = readFileSync(join(cwd, file), "utf8");
+      const parsed = parseStructuredWorkerJson(body, file);
+      if (parsed) return parsed;
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
+function parseStructuredWorkerJson(value: string, source: string): StructuredWorkerResult | undefined {
+  const trimmed = stripJsonFence(value.trim());
+  if (!trimmed.startsWith("{")) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const record = parsed as Record<string, unknown>;
+    const isDeepSeekArtifact = record.schema === "agent-fabric.deepseek-worker-result.v1";
+    const payload = isDeepSeekArtifact && record.result && typeof record.result === "object" && !Array.isArray(record.result)
+      ? (record.result as Record<string, unknown>)
+      : record;
+    if (!isDeepSeekArtifact && !("status" in payload) && !("summary" in payload)) return undefined;
+    return {
+      source,
+      status: typeof payload.status === "string" ? payload.status : undefined,
+      summary: typeof payload.summary === "string" ? payload.summary : undefined,
+      patchMode: typeof record.patchMode === "string" ? record.patchMode : typeof payload.patchMode === "string" ? payload.patchMode : undefined,
+      patchFile: typeof record.patchFile === "string" ? record.patchFile : typeof payload.patchFile === "string" ? payload.patchFile : undefined,
+      proposedPatch: typeof payload.proposedPatch === "string" ? payload.proposedPatch : undefined,
+      patchApply: record.patchApply,
+      changedFilesSuggested: stringArray(payload.changedFilesSuggested),
+      testsSuggested: stringArray(payload.testsSuggested),
+      blockers: stringArray(payload.blockers),
+      raw: record
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function stripJsonFence(text: string): string {
+  const match = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  return match ? match[1].trim() : text;
+}
+
+function workerBlockers(exitCode: number, status?: string, result?: StructuredWorkerResult): string[] {
+  if (exitCode !== 0) return [`Command exited ${exitCode}`];
+  if (status === "blocked") return result?.blockers?.length ? result.blockers : ["Structured worker result reported blocked."];
+  if (status === "failed") return result?.blockers?.length ? result.blockers : ["Structured worker result reported failed."];
+  return [];
+}
+
+function tailText(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  return value.slice(value.length - maxChars);
+}
+
+async function resolveAlias(
+  alias: string,
+  taskType: string,
+  contextSize: number,
+  risk: string,
+  call: ProjectToolCaller
+): Promise<PolicyAliasResult> {
+  return call<PolicyAliasResult>("policy_resolve_alias", {
+    alias,
+    taskType,
+    contextSize,
+    risk
+  });
+}
+
+async function preflightProjectModel(input: {
+  call: ProjectToolCaller;
+  queueId: string;
+  taskType: string;
+  modelAlias: string;
+  route: PolicyAliasResult;
+  text: string;
+  contextSummary: Record<string, unknown>;
+  approvalToken?: string;
+}): Promise<PreflightResult> {
+  return input.call<PreflightResult>("llm_preflight", {
+    task: {
+      type: input.taskType,
+      queueId: input.queueId,
+      modelAlias: input.modelAlias
+    },
+    client: "agent-fabric-project",
+    candidateModel: input.route.model,
+    requestedProvider: input.route.provider,
+    requestedReasoning: input.route.reasoning,
+    contextPackageSummary: input.contextSummary,
+    budgetScope: `project_queue:${input.queueId}`,
+    approvalToken: input.approvalToken
+  });
+}
+
+async function preflightDeepSeekWorkerCommand(
+  command: Extract<ProjectCliCommand, { command: "run-task" }>,
+  task: QueueTask,
+  status: QueueStatus,
+  call: ProjectToolCaller
+): Promise<PreflightResult | undefined> {
+  if (command.worker !== "deepseek-direct" && !/\bagent-fabric-deepseek-worker\b/.test(command.commandLine)) return undefined;
+  const contextText = [task.title, task.goal, command.commandLine, command.taskPacketPath ?? ""].join("\n");
+  return call<PreflightResult>("llm_preflight", {
+    task: {
+      type: task.risk === "high" || task.risk === "breakglass" ? "code_edit" : "worker_deepseek_direct",
+      queueId: command.queueId,
+      queueTaskId: task.queueTaskId,
+      modelAlias: command.modelProfile
+    },
+    client: "agent-fabric-project",
+    candidateModel: "deepseek-v4-pro",
+    requestedProvider: "deepseek",
+    requestedReasoning: "max",
+    contextPackageSummary: {
+      taskTitle: task.title,
+      taskRisk: task.risk ?? "medium",
+      taskPacketPath: command.taskPacketPath,
+      commandPreview: summarizeText(command.commandLine),
+      estimatedTokens: estimateTokens(contextText)
+    },
+    budgetScope: `project_queue:${command.queueId}`,
+    boundResourceId: command.queueTaskId,
+    approvalToken: command.approvalToken
+  });
+}
+
+function preflightBlockedResult(action: string, preflight: PreflightResult): ProjectRunResult {
+  const request = preflight.requestId ? ` request=${preflight.requestId}` : "";
+  return {
+    action,
+    message: `Preflight returned ${preflight.decision} (${preflight.risk}).${request}`,
+    data: { preflight }
+  };
+}
+
+async function defaultModelRunner(request: ProjectModelRequest): Promise<Record<string, unknown>> {
+  const command = process.env.AGENT_FABRIC_PROJECT_MODEL_COMMAND;
+  if (!command) {
+    throw new FabricError(
+      "PROJECT_MODEL_COMMAND_MISSING",
+      "AGENT_FABRIC_PROJECT_MODEL_COMMAND is required for model-backed project generation",
+      false
+    );
+  }
+  return runJsonCommand(command, request);
+}
+
+async function runJsonCommand(command: string, payload: unknown): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, { shell: true, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new FabricError("PROJECT_MODEL_COMMAND_FAILED", stderr.trim() || `model command exited ${code}`, false));
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          reject(new FabricError("PROJECT_MODEL_COMMAND_INVALID_JSON", "model command must return a JSON object", false));
+          return;
+        }
+        resolve(parsed as Record<string, unknown>);
+      } catch (error) {
+        reject(new FabricError("PROJECT_MODEL_COMMAND_INVALID_JSON", error instanceof Error ? error.message : String(error), false));
+      }
+    });
+    child.stdin.end(`${JSON.stringify(payload)}\n`);
+  });
+}
+
+function promptImprovementInstructions(): string {
+  return [
+    "Improve the user prompt for a project-level coding queue.",
+    "Preserve user intent and explicit decisions.",
+    "Clarify goals, constraints, acceptance criteria, risk gates, and missing questions.",
+    "Return JSON with improvedPrompt, summary, and optional warnings."
+  ].join(" ");
+}
+
+function taskGenerationInstructions(): string {
+  return [
+    "Split the accepted plan into phases and concrete coding tasks.",
+    "Every task must include title, goal, acceptanceCriteria, risk, priority, expectedFiles, requiredTools, requiredMcpServers, requiredMemories, requiredContextRefs, parallelSafe, and dependsOn.",
+    "Use clientKey values for dependencies within the generated batch.",
+    "Return JSON with phases and tasks."
+  ].join(" ");
+}
+
+function requiredGeneratedString(record: Record<string, unknown>, field: string): string {
+  const value = record[field];
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new FabricError("PROJECT_MODEL_OUTPUT_INVALID", `model output must contain non-empty ${field}`, false);
+  }
+  return value;
+}
+
+function normalizeGeneratedTasks(record: Record<string, unknown>): { phases: unknown[]; tasks: unknown[] } {
+  const phases = Array.isArray(record.phases) ? record.phases : [];
+  const tasks = Array.isArray(record.tasks) ? record.tasks : [];
+  if (tasks.length === 0) {
+    throw new FabricError("PROJECT_MODEL_OUTPUT_INVALID", "model output must contain a non-empty tasks array", false);
+  }
+  for (const [index, task] of tasks.entries()) {
+    if (!task || typeof task !== "object" || Array.isArray(task)) {
+      throw new FabricError("PROJECT_MODEL_OUTPUT_INVALID", `tasks[${index}] must be an object`, false);
+    }
+    const item = task as Record<string, unknown>;
+    if (typeof item.title !== "string" || typeof item.goal !== "string") {
+      throw new FabricError("PROJECT_MODEL_OUTPUT_INVALID", `tasks[${index}] must contain title and goal`, false);
+    }
+  }
+  return { phases, tasks };
+}
+
+function summarizeText(value: string): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function estimateTokens(value: string): number {
+  return Math.max(1, Math.ceil(value.length / 4));
+}
+
+function readFile(path: string): string {
+  return readFileSync(path, "utf8");
+}
+
+type ParsedFlags = {
+  json: boolean;
+  projectPath?: string;
+  prompt?: string;
+  promptFile?: string;
+  promptSummary?: string;
+  factorsFile?: string;
+  title?: string;
+  profile?: string;
+  modelAlias?: string;
+  approvalToken?: string;
+  accept: boolean;
+  outputFile?: string;
+  maxAgents?: number;
+  queueId?: string;
+  task?: string;
+  taskFile?: string;
+  planFile?: string;
+  maxRounds?: number;
+  budgetUsd?: number;
+  outputFormat?: string;
+  tasksFile?: string;
+  metadataFile?: string;
+  approveQueue: boolean;
+  acceptTaskId?: string;
+  applyPatch: boolean;
+  applyCwd?: string;
+  queueTaskId?: string;
+  commandLine?: string;
+  commandTemplate?: string;
+  cwd?: string;
+  cwdTemplate?: string;
+  cwdPrep?: string;
+  taskPacketPath?: string;
+  taskPacketDir?: string;
+  taskPacketFormat?: string;
+  outDir?: string;
+  format?: string;
+  readyOnly: boolean;
+  successStatus?: string;
+  patchMode?: string;
+  maxOutputChars?: number;
+  parallel?: number;
+  minParallel?: number;
+  adaptiveRateLimit: boolean;
+  noAdaptiveRateLimit: boolean;
+  deepSeekWorkerCommand?: string;
+  deepSeekRole?: string;
+  sensitiveContextMode?: string;
+  startExecution: boolean;
+  allowSensitiveContext: boolean;
+  allowConcurrentRunner: boolean;
+  allowSharedCwd: boolean;
+  approveToolContext: boolean;
+  rememberToolContext: boolean;
+  continueOnFailure: boolean;
+  limit?: number;
+  worker?: string;
+  workerRunId?: string;
+  workspaceMode?: string;
+  modelProfile?: string;
+  contextPolicy?: string;
+  workspacePath?: string;
+  maxRuntimeMinutes?: number;
+  proposalId?: string;
+  memoryId?: string;
+  grantKind?: string;
+  value?: string;
+  status?: string;
+  decision?: string;
+  queueStatuses?: string[];
+  includeClosed: boolean;
+  includeCompleted: boolean;
+  includeExpired: boolean;
+  includeResume: boolean;
+  archived: boolean;
+  maxEventsPerLane?: number;
+  staleAfterMinutes?: number;
+  recoveryAction?: string;
+  dryRun: boolean;
+  remember: boolean;
+  keepOutputs: boolean;
+  reason?: string;
+  note?: string;
+};
+
+function parseFlags(args: string[]): ParsedFlags {
+  const flags: ParsedFlags = {
+    json: false,
+    approveQueue: false,
+    remember: false,
+    accept: false,
+    applyPatch: false,
+    approveToolContext: false,
+    rememberToolContext: false,
+    continueOnFailure: false,
+    adaptiveRateLimit: false,
+    noAdaptiveRateLimit: false,
+    startExecution: false,
+    allowSensitiveContext: false,
+    allowConcurrentRunner: false,
+    allowSharedCwd: false,
+    readyOnly: false,
+    includeClosed: false,
+    includeCompleted: false,
+    includeExpired: false,
+    includeResume: false,
+    archived: false,
+    dryRun: false,
+    keepOutputs: false
+  };
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--json") flags.json = true;
+    else if (arg === "--project") flags.projectPath = requiredValue(args, ++i, arg);
+    else if (arg === "--prompt") flags.prompt = requiredValue(args, ++i, arg);
+    else if (arg === "--prompt-file") flags.promptFile = requiredValue(args, ++i, arg);
+    else if (arg === "--prompt-summary") flags.promptSummary = requiredValue(args, ++i, arg);
+    else if (arg === "--factors-file") flags.factorsFile = requiredValue(args, ++i, arg);
+    else if (arg === "--title") flags.title = requiredValue(args, ++i, arg);
+    else if (arg === "--profile") flags.profile = requiredValue(args, ++i, arg);
+    else if (arg === "--model-alias") flags.modelAlias = requiredValue(args, ++i, arg);
+    else if (arg === "--approval-token") flags.approvalToken = requiredValue(args, ++i, arg);
+    else if (arg === "--accept") flags.accept = true;
+    else if (arg === "--output-file") flags.outputFile = requiredValue(args, ++i, arg);
+    else if (arg === "--max-agents") flags.maxAgents = positiveInt(requiredValue(args, ++i, arg), "max-agents");
+    else if (arg === "--queue") flags.queueId = requiredValue(args, ++i, arg);
+    else if (arg === "--task") flags.task = requiredValue(args, ++i, arg);
+    else if (arg === "--task-file") flags.taskFile = requiredValue(args, ++i, arg);
+    else if (arg === "--plan-file") flags.planFile = requiredValue(args, ++i, arg);
+    else if (arg === "--max-rounds") flags.maxRounds = positiveInt(requiredValue(args, ++i, arg), "max-rounds");
+    else if (arg === "--budget-usd") flags.budgetUsd = positiveNumber(requiredValue(args, ++i, arg), "budget-usd");
+    else if (arg === "--output-format") flags.outputFormat = requiredValue(args, ++i, arg);
+    else if (arg === "--tasks-file") flags.tasksFile = requiredValue(args, ++i, arg);
+    else if (arg === "--metadata-file") flags.metadataFile = requiredValue(args, ++i, arg);
+    else if (arg === "--approve-queue") flags.approveQueue = true;
+    else if (arg === "--accept-task") flags.acceptTaskId = requiredValue(args, ++i, arg);
+    else if (arg === "--apply-patch") flags.applyPatch = true;
+    else if (arg === "--apply-cwd") flags.applyCwd = requiredValue(args, ++i, arg);
+    else if (arg === "--queue-task") flags.queueTaskId = requiredValue(args, ++i, arg);
+    else if (arg === "--command") flags.commandLine = requiredValue(args, ++i, arg);
+    else if (arg === "--command-template") flags.commandTemplate = requiredValue(args, ++i, arg);
+    else if (arg === "--cwd") flags.cwd = requiredValue(args, ++i, arg);
+    else if (arg === "--cwd-template") flags.cwdTemplate = requiredValue(args, ++i, arg);
+    else if (arg === "--cwd-prep") flags.cwdPrep = requiredValue(args, ++i, arg);
+    else if (arg === "--task-packet") flags.taskPacketPath = requiredValue(args, ++i, arg);
+    else if (arg === "--task-packet-dir") flags.taskPacketDir = requiredValue(args, ++i, arg);
+    else if (arg === "--task-packet-format") flags.taskPacketFormat = requiredValue(args, ++i, arg);
+    else if (arg === "--out-dir") flags.outDir = requiredValue(args, ++i, arg);
+    else if (arg === "--format") flags.format = requiredValue(args, ++i, arg);
+    else if (arg === "--ready-only") flags.readyOnly = true;
+    else if (arg === "--success-status") flags.successStatus = requiredValue(args, ++i, arg);
+    else if (arg === "--patch-mode") flags.patchMode = requiredValue(args, ++i, arg);
+    else if (arg === "--max-output-chars") flags.maxOutputChars = positiveInt(requiredValue(args, ++i, arg), "max-output-chars");
+    else if (arg === "--parallel") flags.parallel = positiveInt(requiredValue(args, ++i, arg), "parallel");
+    else if (arg === "--min-parallel") flags.minParallel = positiveInt(requiredValue(args, ++i, arg), "min-parallel");
+    else if (arg === "--adaptive-rate-limit") flags.adaptiveRateLimit = true;
+    else if (arg === "--no-adaptive-rate-limit") flags.noAdaptiveRateLimit = true;
+    else if (arg === "--deepseek-worker-command") flags.deepSeekWorkerCommand = requiredValue(args, ++i, arg);
+    else if (arg === "--deepseek-role") flags.deepSeekRole = requiredValue(args, ++i, arg);
+    else if (arg === "--sensitive-context-mode") flags.sensitiveContextMode = requiredValue(args, ++i, arg);
+    else if (arg === "--start-execution") flags.startExecution = true;
+    else if (arg === "--allow-sensitive-context") flags.allowSensitiveContext = true;
+    else if (arg === "--allow-concurrent-runner") flags.allowConcurrentRunner = true;
+    else if (arg === "--allow-shared-cwd") flags.allowSharedCwd = true;
+    else if (arg === "--approve-tool-context") flags.approveToolContext = true;
+    else if (arg === "--remember-tool-context") flags.rememberToolContext = true;
+    else if (arg === "--continue-on-failure") flags.continueOnFailure = true;
+    else if (arg === "--limit") flags.limit = positiveInt(requiredValue(args, ++i, arg), "limit");
+    else if (arg === "--worker") flags.worker = requiredValue(args, ++i, arg);
+    else if (arg === "--worker-run") flags.workerRunId = requiredValue(args, ++i, arg);
+    else if (arg === "--workspace-mode") flags.workspaceMode = requiredValue(args, ++i, arg);
+    else if (arg === "--model-profile") flags.modelProfile = requiredValue(args, ++i, arg);
+    else if (arg === "--context-policy") flags.contextPolicy = requiredValue(args, ++i, arg);
+    else if (arg === "--workspace-path") flags.workspacePath = requiredValue(args, ++i, arg);
+    else if (arg === "--max-runtime-minutes") flags.maxRuntimeMinutes = positiveInt(requiredValue(args, ++i, arg), "max-runtime-minutes");
+    else if (arg === "--proposal") flags.proposalId = requiredValue(args, ++i, arg);
+    else if (arg === "--memory") flags.memoryId = requiredValue(args, ++i, arg);
+    else if (arg === "--kind") flags.grantKind = requiredValue(args, ++i, arg);
+    else if (arg === "--value") flags.value = requiredValue(args, ++i, arg);
+    else if (arg === "--status") flags.status = requiredValue(args, ++i, arg);
+    else if (arg === "--decision") flags.decision = requiredValue(args, ++i, arg);
+    else if (arg === "--queue-status") flags.queueStatuses = [...(flags.queueStatuses ?? []), requiredValue(args, ++i, arg)];
+    else if (arg === "--include-closed") flags.includeClosed = true;
+    else if (arg === "--include-completed") flags.includeCompleted = true;
+    else if (arg === "--include-expired") flags.includeExpired = true;
+    else if (arg === "--include-resume") flags.includeResume = true;
+    else if (arg === "--archived") flags.archived = true;
+    else if (arg === "--max-events") flags.maxEventsPerLane = positiveInt(requiredValue(args, ++i, arg), "max-events");
+    else if (arg === "--stale-after-minutes") flags.staleAfterMinutes = positiveInt(requiredValue(args, ++i, arg), "stale-after-minutes");
+    else if (arg === "--recovery-action") flags.recoveryAction = requiredValue(args, ++i, arg);
+    else if (arg === "--dry-run") flags.dryRun = true;
+    else if (arg === "--keep-outputs") flags.keepOutputs = true;
+    else if (arg === "--reason") flags.reason = requiredValue(args, ++i, arg);
+    else if (arg === "--remember") flags.remember = true;
+    else if (arg === "--note") flags.note = requiredValue(args, ++i, arg);
+    else if (arg.startsWith("-")) throw new FabricError("INVALID_INPUT", `Unknown flag: ${arg}`, false);
+    else if (!flags.proposalId) flags.proposalId = arg;
+    else throw new FabricError("INVALID_INPUT", `Unexpected argument: ${arg}`, false);
+  }
+  return flags;
+}
+
+function requiredValue(args: string[], index: number, flag: string): string {
+  const value = args[index];
+  if (!value) throw new FabricError("INVALID_INPUT", `${flag} requires a value`, false);
+  return value;
+}
+
+function required(value: string | undefined, message: string): string {
+  if (!value) throw new FabricError("INVALID_INPUT", message, false);
+  return value;
+}
+
+function positiveInt(value: string, field: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) throw new FabricError("INVALID_INPUT", `${field} must be a positive integer`, false);
+  return parsed;
+}
+
+function positiveNumber(value: string, field: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new FabricError("INVALID_INPUT", `${field} must be a positive number`, false);
+  return parsed;
+}
+
+function parseProfile(value: string): "fast" | "balanced" | "careful" | "custom" {
+  if (["fast", "balanced", "careful", "custom"].includes(value)) return value as "fast" | "balanced" | "careful" | "custom";
+  throw new FabricError("INVALID_INPUT", "profile must be fast, balanced, careful, or custom", false);
+}
+
+function parseOutputFormat(value: string): "markdown" | "adr" {
+  if (["markdown", "adr"].includes(value)) return value as "markdown" | "adr";
+  throw new FabricError("INVALID_INPUT", "output-format must be markdown or adr", false);
+}
+
+function parseWorker(value: string): WorkerKind {
+  if (["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"].includes(value)) return value as WorkerKind;
+  throw new FabricError("INVALID_INPUT", "worker must be local-cli, openhands, aider, smolagents, deepseek-direct, or manual", false);
+}
+
+function parseWorkspaceMode(value: string): "in_place" | "git_worktree" | "clone" | "sandbox" {
+  if (["in_place", "git_worktree", "clone", "sandbox"].includes(value)) return value as "in_place" | "git_worktree" | "clone" | "sandbox";
+  throw new FabricError("INVALID_INPUT", "workspace-mode must be in_place, git_worktree, clone, or sandbox", false);
+}
+
+function parseCwdPrep(value: string): CwdPrepMode {
+  if (["auto", "none", "mkdir"].includes(value)) return value as CwdPrepMode;
+  throw new FabricError("INVALID_INPUT", "cwd-prep must be auto, none, or mkdir", false);
+}
+
+function parseSuccessStatus(value: string): "patch_ready" | "completed" {
+  if (["patch_ready", "completed"].includes(value)) return value as "patch_ready" | "completed";
+  throw new FabricError("INVALID_INPUT", "success-status must be patch_ready or completed", false);
+}
+
+function parseFactoryPatchMode(value: string): "report" | "write" {
+  if (value === "report" || value === "write") return value;
+  throw new FabricError("INVALID_INPUT", "factory-run patch-mode must be report or write", false);
+}
+
+function parseDeepSeekRole(value: string): DeepSeekRole {
+  if (["auto", "implementer", "reviewer", "risk-reviewer", "adjudicator", "planner"].includes(value)) return value as DeepSeekRole;
+  throw new FabricError("INVALID_INPUT", "deepseek-role must be auto, implementer, reviewer, risk-reviewer, adjudicator, or planner", false);
+}
+
+function parseSensitiveContextMode(value: string, allowSensitiveContext: boolean): SensitiveContextMode {
+  if (allowSensitiveContext) return "off";
+  if (value === "basic" || value === "strict" || value === "off") return value;
+  throw new FabricError("INVALID_INPUT", "sensitive-context-mode must be basic, strict, or off", false);
+}
+
+function parsePacketFormat(value: string): "json" | "markdown" {
+  if (["json", "markdown"].includes(value)) return value as "json" | "markdown";
+  throw new FabricError("INVALID_INPUT", "format must be json or markdown", false);
+}
+
+function parsePolicyStatus(value: string): "approved" | "rejected" {
+  if (["approved", "rejected"].includes(value)) return value as "approved" | "rejected";
+  throw new FabricError("INVALID_INPUT", "status must be approved or rejected", false);
+}
+
+function parseToolDecision(value: string): "approve" | "reject" | "revise" {
+  if (["approve", "reject", "revise"].includes(value)) return value as "approve" | "reject" | "revise";
+  throw new FabricError("INVALID_INPUT", "decision must be approve, reject, or revise", false);
+}
+
+function parseMemoryReviewDecision(value: string): "approve" | "reject" | "archive" {
+  if (["approve", "reject", "archive"].includes(value)) return value as "approve" | "reject" | "archive";
+  throw new FabricError("INVALID_INPUT", "decision must be approve, reject, or archive", false);
+}
+
+function assertQueueRunnable(status: string): void {
+  if (status === "running") return;
+  if (status === "queue_review") {
+    throw new FabricError("PROJECT_QUEUE_EXECUTION_BLOCKED", "Queue is waiting for start_execution before starting work", false);
+  }
+  throw new FabricError("PROJECT_QUEUE_EXECUTION_BLOCKED", `Queue is ${status}; record start_execution or resume before starting work`, false);
+}
+
+function parseRecoveryAction(value: string): "requeue" | "fail" {
+  if (["requeue", "fail"].includes(value)) return value as "requeue" | "fail";
+  throw new FabricError("INVALID_INPUT", "recovery-action must be requeue or fail", false);
+}
+
+export function defaultQueueTitle(projectPath: string): string {
+  return `${basename(projectPath)} project queue`;
+}

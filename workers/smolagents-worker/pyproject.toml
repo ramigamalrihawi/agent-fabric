@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-fabric-smolagents-worker"
+version = "0.1.0"
+description = "Safe smolagents worker sidecar for agent-fabric."
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+agent = [
+  "smolagents>=1.0.0; python_version >= '3.10'",
+  "litellm>=1.0.0"
+]
+dev = [
+  "pytest>=8.0"
+]
+
+[project.scripts]
+agent-fabric-smolagents-worker = "smolagents_worker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

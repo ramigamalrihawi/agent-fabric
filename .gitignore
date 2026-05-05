@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+.vitest/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+*.sqlite
+*.sqlite-*
+*.db
+*.sock
+
+.DS_Store
