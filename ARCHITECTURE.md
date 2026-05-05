@@ -5,11 +5,12 @@ Agent Fabric is a local daemon with a durable SQLite core. Runtime clients conne
 ## Components
 
 ```text
-client harness
+senior harness / client
   -> MCP bridge / Unix socket / local HTTP
   -> FabricDaemon
   -> SQLite
   -> projections: SSE events, generated views, task packets, command center reads
+  -> optional worker lanes: DeepSeek, local models, CLI harnesses, custom runners
 ```
 
 ## Design Principles
@@ -17,9 +18,22 @@ client harness
 - **SQLite is canonical.** Live pushes, generated markdown views, and worker packets are projections.
 - **Durable first.** Mutations commit before best-effort fan-out or external worker activity.
 - **Runtime agnostic.** Agent Fabric tracks work; coding harnesses perform the work.
+- **Senior model stays in judgment.** Premium supervisor lanes can coordinate cheaper parallel workers while retaining final patch and risk decisions.
 - **Idempotent mutation surface.** Session-scoped idempotency keys protect callers from retry duplication.
 - **Explicit trust gates.** Model calls, tool grants, worker patches, and memory promotion can require approval.
 - **Coverage-honest costs.** Estimated model spend and provider billing data are separate ledgers, not blended fiction.
+
+## Senior Supervisor Topology
+
+Agent Fabric supports a supervisor-worker pattern for high-quality work at lower blended cost:
+
+1. A senior harness, such as a GPT-5.5 or Claude Opus 4.7 session, owns prompt improvement, decomposition, risk judgment, and final integration.
+2. The queue fans out independent tasks to cheaper DeepSeek V4 Pro max-reasoning workers with focused task packets and approved context.
+3. The senior harness and DeepSeek workers can communicate bidirectionally through `collab_send`, durable inbox reads, live SSE fan-out, asks/replies, decisions, and checkpoints.
+4. Review lanes inspect implementation outputs, test logs, risks, docs, and patch artifacts before anything is applied.
+5. The senior harness reviews the evidence, accepts or rejects findings, runs final checks, and hands off the result.
+
+This keeps expensive senior-model tokens focused on judgment while allowing liberal DeepSeek token use for breadth, adversarial review, and long-context investigation.
 
 ## Major Surfaces
 

@@ -31,9 +31,32 @@ Projects such as [Ruflo](https://github.com/ruvnet/ruflo) emphasize Claude-orien
 | Live plus async collaboration with durable inbox fallback | Often live coordination or chat without the same local database contract |
 | Cost preflight, approval tokens, and coverage-honest ledgers | Cost tracking is often an add-on |
 | Review-gated patch lanes and task packets | Worker output may be more directly applied |
+| Senior-model supervisor mode for cheaper parallel worker depth | Expensive models often do more of the worker labor themselves |
 | Local-first, single-developer control plane | Often designed as a broader swarm platform |
 
 The point is not to replace agent runtimes. The point is to make them safer and more useful together.
+
+## Senior Mode
+
+Agent Fabric is designed for a practical cost-quality pattern: keep a premium "senior" model or harness in charge, then fan out cheaper high-context workers for breadth.
+
+For example, a developer can run GPT-5.5 in Codex, Claude Opus 4.7 in Claude Code, or another top-tier model as the supervisor. That senior lane improves the prompt, splits the work, chooses which files and tools are safe to grant, and makes the final engineering judgment. It then uses Agent Fabric to launch many DeepSeek V4 Pro max-reasoning workers for planning variants, implementation slices, code review, risk review, test review, docs review, and adjudication.
+
+The economic idea is simple: spend senior-model tokens on coordination and judgment, and spend DeepSeek tokens liberally on parallel depth. Agent Fabric keeps that pattern controlled with:
+
+- durable queues and task packets
+- per-task sandbox or worktree paths
+- explicit file/tool/context grants
+- bidirectional `collab_send` / inbox handoffs between the senior harness and worker lanes
+- worker checkpoints and heartbeats
+- review-gated patch application
+- cost preflight and provider spend records
+- sensitive-context scanning before DeepSeek calls
+- final integration by the supervising harness, not blind worker output
+
+Claude Code can therefore talk back and forth with DeepSeek workers instead of only launching one-way jobs. A Claude Code session can ask a DeepSeek lane for analysis, receive the durable reply or live SSE push, request a revision, send a reviewer finding, or hand an implementation result to another DeepSeek review lane. The same pattern works for Codex, OpenCode-style shells, local CLIs, and custom harnesses because the conversation is recorded in Agent Fabric rather than trapped in one tool.
+
+This gives a single senior session leverage over a larger review-and-implementation factory without turning the workflow into an untracked swarm.
 
 ## Current Capabilities
 
@@ -43,7 +66,7 @@ The point is not to replace agent runtimes. The point is to make them safer and 
 - **Memory:** typed memories, pending-review promotion, confirmations, invalidation, outcome reporting, and guarded injection.
 - **Cost control:** model preflight, budget checks, approval tokens, context inspection, provider spend ingestion, anomaly detection, and coverage reporting.
 - **Command center:** local browser console over the same daemon APIs for queues, approvals, lanes, memory review, and patch review.
-- **DeepSeek side lanes:** optional direct DeepSeek worker adapter for high-context planning, implementation, and review tasks, with sensitive-context scanning.
+- **DeepSeek side lanes:** optional direct DeepSeek worker adapter for high-context planning, implementation, review, risk review, and adjudication tasks, with sensitive-context scanning.
 - **MCP bridge:** stdio MCP surface so IDEs and harnesses can call Agent Fabric tools.
 
 ## Architecture
