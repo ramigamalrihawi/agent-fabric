@@ -25,7 +25,7 @@ Every long-running lane should emit worker events, heartbeats, and checkpoints t
 
 DeepSeek cost estimates use built-in defaults unless the runner provides `AGENT_FABRIC_DEEPSEEK_PRICING_JSON` or `AGENT_FABRIC_DEEPSEEK_PRICING_FILE` with per-million-token `hit`, `miss`, and `output` prices. Worker artifacts include the cost estimate source so stale pricing can be spotted during review.
 
-Use the separate `jcode-deepseek` worker value when a queue task should run through a Jcode DeepSeek provider/runtime while staying inside Agent Fabric's durable worker lifecycle. Configure the dispatcher with `AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER`; see [../workers/jcode-deepseek/README.md](../workers/jcode-deepseek/README.md).
+Use the separate `jcode-deepseek` worker value when a queue task should run through a Jcode DeepSeek provider/runtime while staying inside Agent Fabric's durable worker lifecycle. The default path uses the bundled `agent-fabric-jcode-deepseek-worker` adapter and `JCODE_BIN`; `AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER` is only a legacy/private override. See [../workers/jcode-deepseek/README.md](../workers/jcode-deepseek/README.md).
 
 Senior-mode supervisors should not substitute untracked local worker pools for DeepSeek lanes. With `AGENT_FABRIC_SENIOR_MODE=permissive`, the project CLI validates execution workers before they can start, rejects DeepSeek-labeled command templates that launch Codex/Claude/local harnesses, and defaults broad work to queue-backed `deepseek-direct` lanes in git worktrees. A worker counts only after `fabric_task_start_worker`, `project_queue_assign_worker`, and `fabric_task_*` events/checkpoints make it visible in the queue.
 

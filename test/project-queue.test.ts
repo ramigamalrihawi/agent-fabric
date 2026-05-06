@@ -72,6 +72,28 @@ describe("project queue substrate", () => {
     daemon.close();
   });
 
+  it("allows a project-root CLI session to resume a queue created from another harness workspace", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const codexSession = daemon.registerBridge(registerPayload({ root: "/Users/me/projects/agent-fabric", agentId: "codex" }));
+    const cliSession = daemon.registerBridge(registerPayload({ root: "/tmp/workspace/app", agentId: "project-cli" }));
+    const unrelatedSession = daemon.registerBridge(registerPayload({ root: "/tmp/other", agentId: "project-cli" }));
+
+    const created = createQueue(daemon, codexSession, "cross-root-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+
+    const resumed = daemon.callTool("project_queue_status", { queueId: created.data.queueId }, contextFor(cliSession, "cross-root-resume"));
+    expect(resumed.ok).toBe(true);
+    if (!resumed.ok) throw new Error("project-root resume failed");
+    expect(resumed.data.queue).toMatchObject({ queueId: created.data.queueId, projectPath: "/tmp/workspace/app" });
+
+    const hidden = daemon.callTool("project_queue_status", { queueId: created.data.queueId }, contextFor(unrelatedSession, "cross-root-hidden"));
+    expect(hidden.ok).toBe(false);
+    if (hidden.ok) throw new Error("unrelated workspace unexpectedly accessed queue");
+    expect(hidden.message).toContain("The queue exists for workspace /Users/me/projects/agent-fabric and project /tmp/workspace/app");
+    daemon.close();
+  });
+
   it("adds dependency-aware tasks and returns only ready work", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload());
@@ -1704,12 +1726,12 @@ function addRiskTasks(daemon: FabricDaemon, session: { sessionId: string; sessio
   );
 }
 
-function registerPayload(): BridgeRegister {
+function registerPayload(options: { root?: string; agentId?: string } = {}): BridgeRegister {
   return {
     bridgeVersion: "0.1.0",
-    agent: { id: "project-queue-test", displayName: "Project Queue Test", vendor: "test" },
+    agent: { id: options.agentId ?? "project-queue-test", displayName: "Project Queue Test", vendor: "test" },
     host: { name: "Project Queue Test Host", transport: "simulator" },
-    workspace: { root: "/tmp/workspace", source: "explicit" },
+    workspace: { root: options.root ?? "/tmp/workspace", source: "explicit" },
     capabilities: {
       roots: true,
       notifications: true,

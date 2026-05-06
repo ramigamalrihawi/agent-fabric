@@ -4,10 +4,12 @@
   "type": "module",
   "description": "Local-first coordination substrate for multi-agent software work",
   "bin": {
+    "agent-fabric": "dist/bin/agent-fabric.js",
     "agent-fabric-daemon": "dist/bin/daemon.js",
     "agent-fabric-bridge": "dist/bin/bridge.js",
     "agent-fabric-approve": "dist/bin/approve.js",
     "agent-fabric-deepseek-worker": "dist/bin/deepseek-worker.js",
+    "agent-fabric-jcode-deepseek-worker": "dist/bin/jcode-deepseek-worker.js",
     "agent-fabric-project": "dist/bin/project.js",
     "agent-fabric-desktop": "dist/bin/desktop.js",
     "agent-fabric-cost-poll": "dist/bin/cost-poll.js",

@@ -9,10 +9,12 @@ import type { BridgeRegister, BridgeSession } from "../src/types.js";
 describe("project CLI runner", () => {
   const originalSeniorMode = process.env.AGENT_FABRIC_SENIOR_MODE;
   const originalSeniorNonDeepSeek = process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
+  const originalSeniorDefaultWorker = process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER;
 
   beforeEach(() => {
     delete process.env.AGENT_FABRIC_SENIOR_MODE;
     delete process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
+    delete process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER;
   });
 
   afterEach(() => {
@@ -20,6 +22,8 @@ describe("project CLI runner", () => {
     else process.env.AGENT_FABRIC_SENIOR_MODE = originalSeniorMode;
     if (originalSeniorNonDeepSeek === undefined) delete process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
     else process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS = originalSeniorNonDeepSeek;
+    if (originalSeniorDefaultWorker === undefined) delete process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER;
+    else process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER = originalSeniorDefaultWorker;
   });
 
   it("parses create and launch commands", () => {
@@ -50,6 +54,12 @@ describe("project CLI runner", () => {
       projectPath: "/tmp/workspace/demo",
       title: "Demo Queue",
       maxParallelAgents: 3,
+      json: true
+    });
+
+    expect(parseProjectCliArgs(["doctor", "local-config", "--project", "/tmp/workspace/app", "--json"])).toMatchObject({
+      command: "local-config-doctor",
+      projectPath: "/tmp/workspace/app",
       json: true
     });
 
@@ -494,6 +504,34 @@ describe("project CLI runner", () => {
       allowSensitiveContext: true,
       sensitiveContextMode: "off"
     });
+  });
+
+  it("allows the local Senior default worker to prefer Jcode DeepSeek lanes", () => {
+    process.env.AGENT_FABRIC_SENIOR_MODE = "permissive";
+    process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER = "jcode-deepseek";
+
+    expect(parseProjectCliArgs(["claim-next", "--queue", "pqueue_1"])).toMatchObject({
+      command: "claim-next",
+      worker: "jcode-deepseek",
+      workspaceMode: "git_worktree",
+      modelProfile: "deepseek-v4-pro:max"
+    });
+
+    expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1"])).toMatchObject({
+      command: "run-ready",
+      worker: "jcode-deepseek",
+      workspaceMode: "git_worktree"
+    });
+
+    expect(parseProjectCliArgs(["senior-run", "--project", "/tmp/workspace/app"])).toMatchObject({
+      command: "senior-run",
+      worker: "jcode-deepseek"
+    });
+
+    expect(() => {
+      process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER = "claude";
+      parseProjectCliArgs(["run-ready", "--queue", "pqueue_1"]);
+    }).toThrow("AGENT_FABRIC_SENIOR_DEFAULT_WORKER must be deepseek-direct or jcode-deepseek");
   });
 
   it("rejects non-DeepSeek execution workers in Senior mode unless explicitly allowed", async () => {
@@ -1177,6 +1215,62 @@ describe("project CLI runner", () => {
     expect(readFileSync(resumeFile, "utf8")).toContain("# Resume Run command");
     expect(readFileSync(resumeFile, "utf8")).toContain("## Resume Prompt");
     daemon.close();
+  });
+
+  it("runs worker shell commands without inheriting hostile shell aliases", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-project-cli-alias-"));
+    const aliasFile = join(projectPath, "bash-env");
+    writeFileSync(join(projectPath, "source.txt"), "copied\n", "utf8");
+    writeFileSync(aliasFile, "shopt -s expand_aliases\nalias cp='false'\n", "utf8");
+    const oldBashEnv = process.env.BASH_ENV;
+    process.env.BASH_ENV = aliasFile;
+
+    try {
+      const created = await runProjectCommand(
+        {
+          command: "create",
+          json: false,
+          projectPath,
+          promptSummary: "Alias hardening test.",
+          pipelineProfile: "balanced",
+          maxParallelAgents: 4
+        },
+        call
+      );
+      const queueId = created.data.queueId as string;
+      const imported = await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile: writeTasksFile(projectPath), approveQueue: true }, call);
+      const task = (imported.data.created as Array<{ queueTaskId: string }>)[0];
+      await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+      const ran = await runProjectCommand(
+        {
+          command: "run-task",
+          json: false,
+          queueId,
+          queueTaskId: task.queueTaskId,
+          commandLine: "cp source.txt copied.txt",
+          cwd: projectPath,
+          worker: "manual",
+          workspaceMode: "in_place",
+          modelProfile: "execute.cheap",
+          successStatus: "patch_ready",
+          maxOutputChars: 4_000,
+          approveToolContext: true,
+          rememberToolContext: false
+        },
+        call
+      );
+
+      expect(ran.action).toBe("task_run_completed");
+      expect(readFileSync(join(projectPath, "copied.txt"), "utf8")).toBe("copied\n");
+    } finally {
+      if (oldBashEnv === undefined) delete process.env.BASH_ENV;
+      else process.env.BASH_ENV = oldBashEnv;
+      daemon.close();
+    }
   });
 
   it("blocks parallel ready task runs that share a cwd unless explicitly allowed", async () => {

@@ -74,9 +74,23 @@ export type FabricStatus = {
     dbPath: string;
     schemaVersion: number;
     originPeerId: string;
+    runtime?: {
+      pid: number;
+      cwd: string;
+      entrypoint?: string;
+      node: string;
+      packageRoot?: string;
+    };
+    tools?: {
+      seniorRequired: string[];
+      missingSeniorRequired: string[];
+    };
   };
   bridgeSessions: {
     active: number;
+    returned?: number;
+    offset?: number;
+    limit?: number;
     sessions: FabricSessionSummary[];
   };
   coverage: {

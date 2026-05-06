@@ -8,7 +8,15 @@ All tools return the standard result envelope used by the pillar APIs.
 
 Fast status for agents and humans. Should be safe to call at session start and after reconnect.
 
-**Input:** `{}`
+**Input:**
+```ts
+{
+  includeSessions?: boolean; // default true
+  sessionLimit?: number;     // default 50, max 500
+  sessionOffset?: number;    // default 0
+  dedupeWarnings?: boolean;  // default true
+}
+```
 
 **Output:**
 ```ts
@@ -20,9 +28,23 @@ Fast status for agents and humans. Should be safe to call at session start and a
     dbPath: string;
     schemaVersion: number;
     originPeerId: string;
+    runtime?: {
+      pid: number;
+      cwd: string;
+      entrypoint?: string;
+      node: string;
+      packageRoot?: string;
+    };
+    tools?: {
+      seniorRequired: string[];
+      missingSeniorRequired: string[];
+    };
   };
   bridgeSessions: {
     active: number;
+    returned?: number;
+    offset?: number;
+    limit?: number;
     sessions: {
       sessionId: string;
       agentId: string;

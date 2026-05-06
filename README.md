@@ -66,7 +66,7 @@ Claude Code can therefore talk back and forth with DeepSeek workers instead of o
 
 This gives a single senior session leverage over a larger review-and-implementation factory without turning the workflow into an untracked swarm.
 
-Senior mode is also an enforcement mode for local project work. When `AGENT_FABRIC_SENIOR_MODE=permissive` is set, `agent-fabric-project claim-next`, `launch`, `run-ready`, `factory-run`, and `senior-run` default to queue-backed `deepseek-direct` worker lanes with git worktree working directories, `deepseek-v4-pro:max`, and 10-way parallelism for broad ready/factory runs. Explicit non-DeepSeek execution workers, or command templates that record a DeepSeek worker while launching Codex/Claude/local CLIs, are rejected unless a human deliberately sets `AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS=1` for a local fallback.
+Senior mode is also an enforcement mode for local project work. When `AGENT_FABRIC_SENIOR_MODE=permissive` is set, `agent-fabric-project claim-next`, `launch`, `run-ready`, `factory-run`, and `senior-run` default to queue-backed `deepseek-direct` worker lanes with git worktree working directories, `deepseek-v4-pro:max`, and 10-way parallelism for broad ready/factory runs. Set `AGENT_FABRIC_SENIOR_DEFAULT_WORKER=jcode-deepseek` in local ignored config when large implementation lanes should use the Jcode runtime by default. Explicit non-DeepSeek execution workers, or command templates that record a DeepSeek worker while launching Codex/Claude/local CLIs, are rejected unless a human deliberately sets `AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS=1` for a local fallback.
 
 The cheap happy path for Codex and Claude Code is:
 
@@ -86,7 +86,11 @@ agent-fabric-project senior-run \
 
 `senior-run --dry-run` previews the queue/task/card shape without creating workers. If only an MD plan exists, `senior-run` creates a small local queue scaffold by default rather than spending a senior/project-model call on task expansion. Lower-level `factory-run` remains available for explicit queue runs and now supports `--approve-model-calls` for one audited queue-scoped DeepSeek approval token. This is the required path for "Senior mode with 10 DeepSeek lanes" style requests. Built-in worker pools or ad hoc side agents do not count as Agent Fabric worker lanes unless they are registered through the queue and visible in `lanes` or the desktop dashboard.
 
+`senior-doctor` checks the target project, DeepSeek auth, daemon/source parity, and Senior bridge tool availability before launch. If Codex creates a queue for `--project <path>`, Claude Code and `agent-fabric-project --project <path> --queue <id>` can resume it even when their host workspace roots differ. For non-git folders, report-only planner/reviewer lanes should use `sandbox`; mutating lanes still require `git_worktree`.
+
 Codex and Claude Code should use the compact bridge facade when they want native-feeling background workers: `fabric_senior_start`, `fabric_senior_status`, `fabric_senior_resume`, `fabric_spawn_agents`, `fabric_list_agents`, `fabric_open_agent`, `fabric_message_agent`, `fabric_wait_agents`, and `fabric_accept_patch`. These return Codex-style `@af/<name>` worker cards while Agent Fabric remains the durable source of truth. Patch acceptance requires senior review metadata.
+
+`fabric_status` is bounded by default and accepts `includeSessions`, `sessionLimit`, `sessionOffset`, and `dedupeWarnings` when a harness needs deeper diagnostics without flooding the context window.
 
 ## Current Capabilities
 
@@ -165,6 +169,12 @@ Start the daemon:
 
 ```bash
 AGENT_FABRIC_COST_INGEST_TOKEN="$(openssl rand -base64 32)" npm run dev:daemon
+```
+
+Check local Codex/Claude/Agent Fabric wiring without starting the daemon:
+
+```bash
+agent-fabric doctor local-config --project /path/to/agent-fabric
 ```
 
 If you do not need the HTTP cost-ingest and SSE endpoints, disable HTTP:
@@ -252,7 +262,7 @@ npm run dev:project -- run-ready \
 
 The DeepSeek worker rejects task packets that appear to include secrets in normal mode unless explicitly overridden. In Senior mode, set `AGENT_FABRIC_SENIOR_MODE=permissive` so task-relevant sensitive context is allowed for DeepSeek-direct workers by default.
 
-Use `--worker jcode-deepseek` when a queue task should run through a Jcode DeepSeek runtime instead of the direct API adapter. Configure the dispatcher with `AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER`; see [workers/jcode-deepseek](workers/jcode-deepseek/README.md).
+Use `--worker jcode-deepseek` when a queue task should run through a Jcode DeepSeek runtime instead of the direct API adapter. The default path uses the bundled `agent-fabric-jcode-deepseek-worker` adapter and `JCODE_BIN` (default `jcode`). Agent Fabric wraps the lane with queue-visible heartbeats, structured timeout failure handling, and patch artifact capture. `AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER` remains only as a legacy/private override; see [workers/jcode-deepseek](workers/jcode-deepseek/README.md). Do not use manual `nohup jcode ...` for Senior lanes; it bypasses queue lifecycle and review gates.
 
 See [docs/examples/worker-result.json](docs/examples/worker-result.json) for the structured result shape Agent Fabric expects from sidecar workers.
 

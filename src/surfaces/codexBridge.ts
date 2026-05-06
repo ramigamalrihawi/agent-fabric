@@ -16,6 +16,7 @@ import {
 import { fabricTaskEvent } from "./worker.js";
 
 const WORKERS = new Set(["deepseek-direct", "jcode-deepseek"]);
+const SENIOR_DEFAULT_WORKER_ENV = "AGENT_FABRIC_SENIOR_DEFAULT_WORKER";
 const WORKSPACE_MODES = new Set(["git_worktree", "sandbox"]);
 const DEFAULT_AGENT_NAMES = [
   "Rami",
@@ -37,7 +38,7 @@ type AgentCard = Record<string, unknown> & {
 export function fabricSpawnAgents(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const queueId = getString(input, "queueId");
   const count = normalizeCount(getOptionalNumber(input, "count") ?? 10);
-  const worker = normalizeValue(getOptionalString(input, "worker") ?? "deepseek-direct", WORKERS, "worker");
+  const worker = normalizeValue(getOptionalString(input, "worker") ?? seniorDefaultWorker(), WORKERS, "worker");
   const workspaceMode = normalizeValue(getOptionalString(input, "workspaceMode") ?? "git_worktree", WORKSPACE_MODES, "workspaceMode");
   const modelProfile = getOptionalString(input, "modelProfile") ?? "deepseek-v4-pro:max";
   const maxRuntimeMinutes = getOptionalNumber(input, "maxRuntimeMinutes");
@@ -61,6 +62,7 @@ export function fabricSpawnAgents(host: SurfaceHost, input: unknown, context: Ca
       readyCount: ready.length,
       executionBlocked: true,
       blockedReason: stringFrom(next.blockedReason) ?? stringFrom(next.workerStartBlockedReason) ?? "queue is not open for worker starts",
+      nextAction: "Approve the queue and issue start_execution, or use senior-run to prepare and start the queue.",
       cards: []
     };
   }
@@ -77,7 +79,8 @@ export function fabricSpawnAgents(host: SurfaceHost, input: unknown, context: Ca
       availableSlots,
       readyCount: ready.length,
       executionBlocked: Boolean(next.executionBlocked || next.workerStartBlocked),
-      blockedReason: stringFrom(next.blockedReason) ?? stringFrom(next.workerStartBlockedReason) ?? "not enough ready worker slots",
+      blockedReason: stringFrom(next.blockedReason) ?? stringFrom(next.workerStartBlockedReason) ?? (ready.length === 0 ? "no ready tasks are available" : "not enough ready worker slots"),
+      nextAction: ready.length === 0 ? "Add/import queue tasks, approve the queue, and start execution before spawning Senior workers." : "Reduce count, enable allowPartial, or wait for worker slots.",
       cards: []
     };
   }
@@ -173,7 +176,7 @@ export function fabricSeniorStart(host: SurfaceHost, input: unknown, context: Ca
     {
       queueId,
       count: getOptionalNumber(input, "count") ?? 10,
-      worker: getOptionalString(input, "worker") ?? "deepseek-direct",
+      worker: getOptionalString(input, "worker") ?? seniorDefaultWorker(),
       workspaceMode: "git_worktree",
       modelProfile: getOptionalString(input, "modelProfile") ?? "deepseek-v4-pro:max",
       allowPartial: getOptionalBoolean(input, "allowPartial") ?? false
@@ -189,6 +192,13 @@ export function fabricSeniorStart(host: SurfaceHost, input: unknown, context: Ca
     spawn,
     progress
   };
+}
+
+function seniorDefaultWorker(): "deepseek-direct" | "jcode-deepseek" {
+  const configured = process.env[SENIOR_DEFAULT_WORKER_ENV]?.trim();
+  if (!configured) return "deepseek-direct";
+  if (configured === "deepseek-direct" || configured === "jcode-deepseek") return configured;
+  throw new FabricError("INVALID_INPUT", `${SENIOR_DEFAULT_WORKER_ENV} must be deepseek-direct or jcode-deepseek`, false);
 }
 
 export function fabricSeniorStatus(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {

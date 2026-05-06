@@ -2,7 +2,9 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wri
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { FabricError } from "./errors.js";
+import { formatLocalConfigDoctor, runLocalConfigDoctor } from "./local-config-doctor.js";
 import { applyPatchWithSystemPatch, checkPatchWithSystemPatch, validateGitStylePatch } from "./patches.js";
 
 type WorkerKind = "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "jcode-deepseek" | "manual";
@@ -11,14 +13,21 @@ type DeepSeekRole = "auto" | "implementer" | "reviewer" | "risk-reviewer" | "adj
 type SensitiveContextMode = "basic" | "strict" | "off";
 const SENIOR_MODE_ENV = "AGENT_FABRIC_SENIOR_MODE";
 const SENIOR_ALLOW_NON_DEEPSEEK_WORKERS_ENV = "AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS";
-const SENIOR_DEFAULT_WORKER: WorkerKind = "deepseek-direct";
+const SENIOR_DEFAULT_WORKER_ENV = "AGENT_FABRIC_SENIOR_DEFAULT_WORKER";
+const SENIOR_DEFAULT_WORKER = "deepseek-direct" as const;
 const SENIOR_DEFAULT_WORKSPACE_MODE: "git_worktree" = "git_worktree";
 const SENIOR_DEFAULT_MODEL_PROFILE = "deepseek-v4-pro:max";
 const SENIOR_DEFAULT_LANE_COUNT = 10;
 const SENIOR_DEEPSEEK_WORKERS = new Set<WorkerKind>(["deepseek-direct", "jcode-deepseek"]);
+const JCODE_HEARTBEAT_MS = Number(process.env.AGENT_FABRIC_JCODE_HEARTBEAT_MS ?? 30_000);
 
 export type ProjectCliCommand =
   | { command: "version"; json: boolean }
+  | {
+      command: "local-config-doctor";
+      json: boolean;
+      projectPath?: string;
+    }
   | {
       command: "create";
       json: boolean;
@@ -960,7 +969,23 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
   if (command === "help" || command === "--help" || command === "-h") return { command: "help", json: false };
   if (command === "version" || command === "--version" || command === "-v") return { command: "version", json: false };
   if (args.includes("--help") || args.includes("-h")) return { command: "help", json: args.includes("--json") };
-
+  if (command === "doctor" && args[0] === "local-config") {
+    args.shift();
+    const flags = parseFlags(args);
+    return {
+      command: "local-config-doctor",
+      json: flags.json,
+      projectPath: flags.projectPath
+    };
+  }
+  if (command === "local-config-doctor") {
+    const flags = parseFlags(args);
+    return {
+      command: "local-config-doctor",
+      json: flags.json,
+      projectPath: flags.projectPath
+    };
+  }
   if (command === "create") {
     const flags = parseFlags(args);
     return {
@@ -1282,7 +1307,7 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       planFile: flags.planFile,
       tasksFile: flags.tasksFile,
       count: flags.count ?? SENIOR_DEFAULT_LANE_COUNT,
-      worker: parseCodexBridgeWorker(flags.worker ?? "deepseek-direct"),
+      worker: parseCodexBridgeWorker(flags.worker ?? seniorDefaultWorker(process.env)),
       approveModelCalls: flags.approveModelCalls,
       dryRun: flags.dryRun,
       progressFile: flags.progressFile,
@@ -1397,7 +1422,7 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       json: flags.json,
       queueId: required(flags.queueId, "fabric-spawn-agents requires --queue <id>"),
       count: flags.count ?? 10,
-      worker: parseCodexBridgeWorker(flags.worker ?? "deepseek-direct"),
+      worker: parseCodexBridgeWorker(flags.worker ?? seniorDefaultWorker(process.env)),
       workspaceMode: parseCodexBridgeWorkspaceMode(flags.workspaceMode ?? "git_worktree"),
       modelProfile: flags.modelProfile ?? SENIOR_DEFAULT_MODEL_PROFILE,
       maxRuntimeMinutes: flags.maxRuntimeMinutes,
@@ -1587,6 +1612,14 @@ export async function runProjectCommand(
   }
   if (command.command === "version") {
     return { action: "version", message: "agent-fabric-project 0.1.0", data: { version: "0.1.0" } };
+  }
+  if (command.command === "local-config-doctor") {
+    const report = runLocalConfigDoctor({ projectPath: command.projectPath });
+    return {
+      action: "local_config_doctor",
+      message: formatLocalConfigDoctor(report),
+      data: report as unknown as Record<string, unknown>
+    };
   }
   if (command.command === "create") {
     return createQueue(command, call);
@@ -1896,6 +1929,7 @@ export function projectHelp(): string {
   return [
     "Usage:",
     "  agent-fabric-project --version",
+    "  agent-fabric-project doctor local-config [--project <path>] [--json]",
     "  agent-fabric-project senior-doctor --project <path> [--queue <id>] [--json]",
     "  agent-fabric-project senior-run [--project <path>] [--queue <id>] [--plan-file <md>|--tasks-file <json>] [--count 10] [--worker deepseek-direct|jcode-deepseek] [--approve-model-calls] [--dry-run] [--progress-file <path>] [--json]",
     "  agent-fabric-project progress-report --queue <id> [--progress-file <path>] [--json]",
@@ -1942,7 +1976,7 @@ export function projectHelp(): string {
     "  agent-fabric-project decide-tool <proposalId> --decision approve|reject|revise [--remember] [--note <text>] [--json]",
     "  agent-fabric-project set-tool-policy --project <path> --kind mcp_server|tool|memory|context --value <value> --status approved|rejected [--json]",
     "",
-    `Environment: set ${SENIOR_MODE_ENV}=permissive to default worker execution to queue-backed ${SENIOR_DEFAULT_WORKER} lanes (${SENIOR_DEFAULT_WORKSPACE_MODE}, ${SENIOR_DEFAULT_MODEL_PROFILE}, ${SENIOR_DEFAULT_LANE_COUNT} parallel lanes) and allow task-relevant sensitive context for DeepSeek workers by default.`,
+    `Environment: set ${SENIOR_MODE_ENV}=permissive to default worker execution to queue-backed ${SENIOR_DEFAULT_WORKER} lanes (${SENIOR_DEFAULT_WORKSPACE_MODE}, ${SENIOR_DEFAULT_MODEL_PROFILE}, ${SENIOR_DEFAULT_LANE_COUNT} parallel lanes) and allow task-relevant sensitive context for DeepSeek workers by default. Set ${SENIOR_DEFAULT_WORKER_ENV}=jcode-deepseek locally when large implementation lanes should use Jcode by default.`,
     `Escape hatch: set ${SENIOR_ALLOW_NON_DEEPSEEK_WORKERS_ENV}=1 only when a human explicitly wants non-DeepSeek worker execution in Senior mode.`
   ].join("\n");
 }
@@ -2953,7 +2987,8 @@ async function runTask(
     metadata: { cwd, queueId: command.queueId, queueTaskId: task.queueTaskId, ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat) }
   });
   const startedAt = Date.now();
-  const result = await runShellCommand(command.commandLine, cwd, command.maxOutputChars);
+  const stopHeartbeat = startJcodeHeartbeat(command, task, workerRunId, cwd, call);
+  const result = await runShellCommand(command.commandLine, cwd, command.maxOutputChars, command.maxRuntimeMinutes).finally(stopHeartbeat);
   const durationMs = Date.now() - startedAt;
   await call("fabric_task_event", {
     taskId: task.fabricTaskId,
@@ -3373,7 +3408,9 @@ async function seniorDoctor(
   const deepseekKeyPresent = Boolean(process.env.DEEPSEEK_API_KEY || process.env.DEEPSEEK_TOKEN);
   checks.push(checkResult("deepseek_auth", deepseekKeyPresent, deepseekKeyPresent ? "present" : "missing", "Export DEEPSEEK_API_KEY or DEEPSEEK_TOKEN before launching workers."));
   const git = spawnSync("git", ["-C", projectPath, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" });
-  checks.push(checkResult("git_worktree_root", git.status === 0 && git.stdout.trim() === "true", git.stderr.trim() || git.stdout.trim() || String(git.status), "Mutating Senior workers require a git checkout so worktrees can be prepared."));
+  const gitReady = git.status === 0 && git.stdout.trim() === "true";
+  checks.push(checkResult("git_worktree_mutating_lanes", gitReady, git.stderr.trim() || git.stdout.trim() || String(git.status), "Mutating Senior workers require a git checkout so worktrees can be prepared."));
+  checks.push(checkResult("sandbox_report_only_lanes", true, gitReady ? "sandbox available; git worktrees also available" : "sandbox available for report-only planner/reviewer lanes; mutating lanes remain blocked"));
   const binary = spawnSync("agent-fabric-project", ["--version"], { encoding: "utf8" });
   checks.push(checkResult("global_project_cli", binary.status === 0, binary.stdout.trim() || binary.stderr.trim() || String(binary.status), "Install or relink the global agent-fabric-project binary."));
   const deepseekDoctor = spawnSync("agent-fabric-deepseek-worker", ["doctor", "--json"], { encoding: "utf8" });
@@ -3381,8 +3418,38 @@ async function seniorDoctor(
 
   let daemonStatus: Record<string, unknown> | undefined;
   try {
-    daemonStatus = await call<Record<string, unknown>>("fabric_status", {});
+    daemonStatus = await call<Record<string, unknown>>("fabric_status", { includeSessions: false });
     checks.push(checkResult("daemon", true, "reachable"));
+    const daemon = objectFrom(daemonStatus.daemon);
+    const runtime = objectFrom(daemon.runtime);
+    const tools = objectFrom(daemon.tools);
+    const missingSeniorTools = stringArray(tools.missingSeniorRequired);
+    const seniorToolsReported = Array.isArray(tools.seniorRequired);
+    checks.push(
+      checkResult(
+        "daemon_senior_tools",
+        seniorToolsReported && missingSeniorTools.length === 0,
+        !seniorToolsReported
+          ? "running daemon does not report Senior tool parity; it is likely stale"
+          : missingSeniorTools.length === 0 ? "all required Senior bridge tools are exposed" : `missing: ${missingSeniorTools.join(", ")}`,
+        "Rebuild/relink Agent Fabric and restart the daemon."
+      )
+    );
+    const localRoot = localPackageRoot();
+    const daemonPackageRoot = stringFrom(runtime.packageRoot);
+    const daemonCwd = stringFrom(runtime.cwd);
+    const daemonRuntimeReported = Boolean(daemonPackageRoot || daemonCwd || stringFrom(runtime.entrypoint));
+    const sourceMatches =
+      !localRoot ||
+      (daemonPackageRoot ? sameOrUnder(daemonPackageRoot, localRoot) : daemonCwd ? sameOrUnder(daemonCwd, localRoot) : true);
+    checks.push(
+      checkResult(
+        "daemon_source",
+        daemonRuntimeReported && sourceMatches,
+        `daemon cwd=${daemonCwd ?? "unknown"} entrypoint=${stringFrom(runtime.entrypoint) ?? "unknown"} packageRoot=${daemonPackageRoot ?? "unknown"} cliRoot=${localRoot ?? "unknown"}`,
+        "Restart the Agent Fabric daemon from the same checkout as agent-fabric-project."
+      )
+    );
   } catch (error) {
     checks.push(checkResult("daemon", false, error instanceof Error ? error.message : String(error), "Start the Agent Fabric daemon before queue-backed Senior work."));
   }
@@ -3426,6 +3493,8 @@ async function seniorRun(
   if (command.dryRun) {
     const previewTasks = command.tasksFile ? parseTasksFile(command.tasksFile).tasks : command.planFile ? scaffoldSeniorTasks(command.planFile, count) : [];
     const progress = command.queueId ? await call<Record<string, unknown>>("project_queue_progress_report", { queueId: command.queueId }) : undefined;
+    const git = spawnSync("git", ["-C", projectPath, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" });
+    const mutatingWorktreeReady = git.status === 0 && git.stdout.trim() === "true";
     return {
       action: "senior_run_preview",
       message: [
@@ -3433,6 +3502,8 @@ async function seniorRun(
         `Project: ${projectPath}`,
         `Queue: ${command.queueId ?? "will create"}`,
         `Worker: ${command.worker}; requested lanes=${count}; workspaceMode=git_worktree`,
+        `Mutating git-worktree lanes: ${mutatingWorktreeReady ? "ready" : "blocked - project is not a git checkout"}`,
+        `Report-only planner/reviewer lanes: ${mutatingWorktreeReady ? "git_worktree or sandbox" : "sandbox only"}`,
         `Task source: ${command.tasksFile ? command.tasksFile : command.planFile ? `${command.planFile} (local scaffold)` : "existing queue"}`,
         `Task preview count: ${previewTasks.length}`,
         `Task packets: ${taskPacketDir}`,
@@ -3446,6 +3517,8 @@ async function seniorRun(
         requested: count,
         worker: command.worker,
         workspaceMode: "git_worktree",
+        mutatingWorktreeReady,
+        reportOnlyWorkspaceMode: mutatingWorktreeReady ? "git_worktree_or_sandbox" : "sandbox",
         tasks: previewTasks,
         taskPacketDir,
         cwdTemplate,
@@ -4567,7 +4640,9 @@ function commandLineForReadyTask(
     if (!taskPacketPath) {
       throw new FabricError("INVALID_INPUT", "jcode-deepseek run-ready requires --task-packet-dir or an explicit --command-template", false);
     }
-    return [jcodeDeepSeekDispatcherPath(), taskPacketPath].map(shellQuote).join(" ");
+    const args = [jcodeDeepSeekDispatcherPath(), taskPacketPath];
+    if (command.maxRuntimeMinutes) args.push("--max-runtime-minutes", String(command.maxRuntimeMinutes));
+    return args.map(shellQuote).join(" ");
   }
   const template = command.commandTemplate ?? defaultWorkerCommand(command.worker, task.fabricTaskId ?? "").map(shellQuote).join(" ");
   if (!template) {
@@ -4764,7 +4839,7 @@ function shellQuote(value: string): string {
 
 function jcodeDeepSeekDispatcherPath(): string {
   const configured = process.env.AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER?.trim();
-  return configured || "dispatch-deepseek-with-collab.sh";
+  return configured || "agent-fabric-jcode-deepseek-worker";
 }
 
 function safePathPart(value: string): string {
@@ -4968,11 +5043,34 @@ type StructuredWorkerResult = {
   raw: Record<string, unknown>;
 };
 
-async function runShellCommand(command: string, cwd: string, maxOutputChars: number): Promise<ShellResult> {
+async function runShellCommand(command: string, cwd: string, maxOutputChars: number, maxRuntimeMinutes?: number): Promise<ShellResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, { cwd, shell: true, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, {
+      cwd,
+      shell: "/bin/bash",
+      env: {
+        ...process.env,
+        BASH_ENV: "",
+        ENV: "",
+        ZDOTDIR: "/var/empty"
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    const timeoutMs = maxRuntimeMinutes ? maxRuntimeMinutes * 60_000 : undefined;
+    const timeout = timeoutMs
+      ? setTimeout(() => {
+          timedOut = true;
+          stderr = tailText(`${stderr}\nCommand timed out after ${maxRuntimeMinutes} minute(s).`, maxOutputChars);
+          child.kill("SIGTERM");
+          setTimeout(() => {
+            if (!child.killed) child.kill("SIGKILL");
+          }, 5_000).unref();
+        }, timeoutMs)
+      : undefined;
+    timeout?.unref();
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
@@ -4983,7 +5081,8 @@ async function runShellCommand(command: string, cwd: string, maxOutputChars: num
     });
     child.on("error", reject);
     child.on("close", (code, signal) => {
-      resolve({ exitCode: code ?? 1, signal, stdout, stderr });
+      if (timeout) clearTimeout(timeout);
+      resolve({ exitCode: timedOut ? 124 : (code ?? 1), signal, stdout, stderr });
     });
   });
 }
@@ -5331,6 +5430,76 @@ function summarizeText(value: string): string {
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function startJcodeHeartbeat(
+  command: Extract<ProjectCliCommand, { command: "run-task" }>,
+  task: QueueTask,
+  workerRunId: string,
+  cwd: string,
+  call: ProjectToolCaller
+): () => void {
+  if (command.worker !== "jcode-deepseek" || !task.fabricTaskId || !Number.isFinite(JCODE_HEARTBEAT_MS) || JCODE_HEARTBEAT_MS <= 0) {
+    return () => undefined;
+  }
+  let count = 0;
+  const timer = setInterval(() => {
+    count += 1;
+    void call("fabric_task_heartbeat", {
+      taskId: task.fabricTaskId,
+      workerRunId,
+      task: "Jcode DeepSeek worker still running.",
+      metadata: {
+        queueId: command.queueId,
+        queueTaskId: task.queueTaskId,
+        cwd,
+        heartbeatCount: count
+      }
+    }).catch(() => undefined);
+    if (count % 2 === 0) {
+      void call("fabric_task_checkpoint", {
+        taskId: task.fabricTaskId,
+        workerRunId,
+        summary: {
+          currentGoal: task.goal,
+          filesTouched: [],
+          commandsRun: [command.commandLine],
+          testsRun: [],
+          decisions: [],
+          assumptions: [],
+          blockers: [],
+          nextAction: "Jcode DeepSeek worker command is still running.",
+          cwd,
+          heartbeatCount: count
+        }
+      }).catch(() => undefined);
+    }
+  }, JCODE_HEARTBEAT_MS);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+function objectFrom(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function stringFrom(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function sameOrUnder(path: string, root: string): boolean {
+  const resolvedPath = resolve(path);
+  const resolvedRoot = resolve(root);
+  return resolvedPath === resolvedRoot || resolvedPath.startsWith(`${resolvedRoot}/`);
+}
+
+function localPackageRoot(): string | undefined {
+  const runtimeFile = fileURLToPath(import.meta.url);
+  for (const marker of [`${join("dist", "runtime")}${runtimeFile.includes("/") ? "/" : "\\"}`, `${join("src", "runtime")}${runtimeFile.includes("/") ? "/" : "\\"}`]) {
+    const index = runtimeFile.lastIndexOf(marker);
+    if (index !== -1) return runtimeFile.slice(0, index).replace(/[\\/]$/, "");
+  }
+  return undefined;
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -5727,21 +5896,28 @@ function containsNonDeepSeekHarness(commandLine: string): boolean {
 }
 
 function defaultSeniorWorker(flags: ParsedFlags, commandName: string): WorkerKind {
-  const worker = parseWorker(flags.worker ?? (seniorModePermissive(process.env) ? SENIOR_DEFAULT_WORKER : "ramicode"));
+  const worker = parseWorker(flags.worker ?? (seniorModePermissive(process.env) ? seniorDefaultWorker(process.env) : "ramicode"));
   assertSeniorModeDeepSeekWorker(worker, commandName);
   return worker;
 }
 
 function defaultOptionalSeniorWorker(flags: ParsedFlags, commandName: string): WorkerKind | undefined {
-  const worker = flags.worker ? parseWorker(flags.worker) : seniorModePermissive(process.env) ? SENIOR_DEFAULT_WORKER : undefined;
+  const worker = flags.worker ? parseWorker(flags.worker) : seniorModePermissive(process.env) ? seniorDefaultWorker(process.env) : undefined;
   assertSeniorModeDeepSeekWorker(worker, commandName);
   return worker;
 }
 
 function resolveOptionalSeniorWorker(worker: WorkerKind | undefined, commandName: string): WorkerKind | undefined {
-  const resolved = worker ?? (seniorModePermissive(process.env) ? SENIOR_DEFAULT_WORKER : undefined);
+  const resolved = worker ?? (seniorModePermissive(process.env) ? seniorDefaultWorker(process.env) : undefined);
   assertSeniorModeDeepSeekWorker(resolved, commandName);
   return resolved;
+}
+
+function seniorDefaultWorker(env: NodeJS.ProcessEnv): "deepseek-direct" | "jcode-deepseek" {
+  const configured = env[SENIOR_DEFAULT_WORKER_ENV]?.trim();
+  if (!configured) return SENIOR_DEFAULT_WORKER;
+  if (configured === "deepseek-direct" || configured === "jcode-deepseek") return configured;
+  throw new FabricError("INVALID_INPUT", `${SENIOR_DEFAULT_WORKER_ENV} must be deepseek-direct or jcode-deepseek`, false);
 }
 
 function defaultSeniorWorkspaceMode(flags: ParsedFlags, fallback: "in_place" | "git_worktree" | "clone" | "sandbox"): "in_place" | "git_worktree" | "clone" | "sandbox" {

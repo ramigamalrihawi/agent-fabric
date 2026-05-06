@@ -35,6 +35,31 @@ describe("FabricDaemon Phase 0A.1", () => {
     daemon.close();
   });
 
+  it("bounds fabric_status sessions and deduplicates repeated warnings", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload({ agentId: "codex" }));
+    for (let index = 1; index < 8; index += 1) {
+      daemon.registerBridge(registerPayload({ agentId: "codex" }));
+    }
+
+    const bounded = daemon.callTool("fabric_status", { sessionLimit: 3 }, contextFor(session));
+    expect(bounded.ok).toBe(true);
+    if (!bounded.ok) throw new Error("fabric_status failed");
+    expect(bounded.data.bridgeSessions).toMatchObject({ active: 8, returned: 3, limit: 3 });
+    expect(bounded.data.bridgeSessions.sessions).toHaveLength(3);
+    const repeatedNotificationWarnings = (bounded.data.warnings as string[]).filter((warning) =>
+      warning.includes("notifications declared yes but observed unknown")
+    );
+    expect(repeatedNotificationWarnings).toHaveLength(1);
+
+    const noSessions = daemon.callTool("fabric_status", { includeSessions: false }, contextFor(session));
+    expect(noSessions.ok).toBe(true);
+    if (!noSessions.ok) throw new Error("fabric_status includeSessions=false failed");
+    expect(noSessions.data.bridgeSessions).toMatchObject({ active: 8, returned: 0 });
+    expect(noSessions.data.bridgeSessions.sessions).toEqual([]);
+    daemon.close();
+  });
+
   it("surfaces doctor diagnostics for unobserved notifications and missing billing", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     daemon.registerBridge(registerPayload());
@@ -60,6 +85,17 @@ describe("FabricDaemon Phase 0A.1", () => {
     expect(expired.ok).toBe(false);
     if (expired.ok) throw new Error("expired token unexpectedly accepted");
     expect(expired.code).toBe("SESSION_EXPIRED");
+    daemon.close();
+  });
+
+  it("closes short-lived bridge sessions explicitly", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload({ observed: "yes", agentId: "project-cli" }));
+
+    const closed = daemon.callTool("fabric_session_close", {}, contextFor(session, "close-session"));
+    expect(closed.ok).toBe(true);
+    const status = daemon.fabricStatus();
+    expect(status.bridgeSessions.active).toBe(0);
     daemon.close();
   });
 

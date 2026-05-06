@@ -607,7 +607,7 @@ describe("ADR-0017 cost-aware routing preflight", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload({ agentId: "worker", litellmRouteable: true }));
 
-    const aliases = ["prompt.improve.strong", "phase.splitter", "task.writer", "tool.context.manager"];
+    const aliases = ["prompt.improve.strong", "phase.splitter", "task.writer", "research-planner", "tool.context.manager"];
     for (const alias of aliases) {
       const result = daemon.callTool("policy_resolve_alias", { alias, taskType: "project_queue", risk: "medium" }, contextFor(session));
       expect(result.ok).toBe(true);

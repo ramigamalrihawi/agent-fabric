@@ -16,7 +16,9 @@ material.
 - Spawn execution workers through Agent Fabric tools or `agent-fabric-project`, not through untracked native Codex subagents.
 - A worker counts toward "DeepSeek workers" only after it is visible in Agent Fabric queue state with a worker run, workspace mode, lifecycle events, and artifacts.
 - Use `deepseek-direct` or `jcode-deepseek` for Senior-mode execution lanes. Do not record a DeepSeek worker while launching `codex`, `claude`, or another local CLI.
+- In this local checkout, source `agent-fabric.local.env` to prefer `jcode-deepseek` for large Senior implementation lanes. Use `deepseek-direct` explicitly for cheap planner/reviewer lanes.
 - Use `git_worktree` for mutating worker lanes. Use `sandbox` only for report-only planner/reviewer lanes that will not edit project files.
+- Use `research-planner` for report-only DeepSeek planner/reviewer routing; pair it with `sandbox` for non-git projects.
 - Keep Codex native subagents for supervisor-side exploration, review, and adjudication. They do not satisfy a requested DeepSeek lane count unless explicitly registered as Agent Fabric workers.
 
 ## Codex Worker Controls
@@ -30,10 +32,12 @@ agent-fabric-project senior-run --project <path> --tasks-file .agent-fabric/task
 
 Use `senior-run --dry-run` first when task JSON is not already prepared. If only an MD plan is supplied, `senior-run` uses a local scaffold by default and avoids a project-model task-generation charge.
 
+If `senior-doctor` reports daemon/source drift, stale Senior tools, or a queue namespace mismatch, fix that before launching workers. Queue IDs are resumable across Codex, Claude Code, and `agent-fabric-project --project <path>` when the project path matches the queue.
+
 Prefer these compact Agent Fabric tools from Codex:
 
 - `fabric_senior_start`, `fabric_senior_status`, `fabric_senior_resume`: start or resume a Senior queue and return worker cards/progress.
-- `fabric_spawn_agents`: request queue-visible background workers, usually `count=10`, `worker=deepseek-direct`, `workspaceMode=git_worktree`.
+- `fabric_spawn_agents`: request queue-visible background workers, usually `count=10`, `workspaceMode=git_worktree`; local config may default the worker to `jcode-deepseek`.
 - `fabric_list_agents`: show Codex-style worker cards with `@af/<name>` handles.
 - `fabric_open_agent`: open one worker's task, transcript, checkpoints, and artifacts.
 - `fabric_message_agent`: send a durable revision, note, or ask to an `@af/<name>` worker.
@@ -49,3 +53,4 @@ If the user tags `@af/<name>`, resolve it with `fabric_open_agent` or `fabric_me
 - Patch-ready means a patch artifact exists and is linked to the queue task; report-only output should remain completed/report state.
 - Never apply a worker patch without a senior review step.
 - Mutating factory examples should use `.agent-fabric/worktrees/<queueTaskId>` or another git worktree root, not a generic sandbox directory.
+- Do not bypass Agent Fabric with manual `nohup jcode ...` Senior launches. Use `senior-run` or `run-ready --worker jcode-deepseek` so the queue records lifecycle events, heartbeats, timeout failures, and patch artifacts.

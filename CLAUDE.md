@@ -15,7 +15,9 @@ material.
 
 - Do not satisfy "10 DeepSeek workers" with Claude Code background tasks or ad hoc shells.
 - Use Agent Fabric queue-visible workers: `deepseek-direct` or `jcode-deepseek`.
+- Source `agent-fabric.local.env` in this checkout when local defaults are needed; it may prefer `jcode-deepseek` for large implementation lanes.
 - Mutating workers use `git_worktree`; report-only planner/reviewer workers may use `sandbox`.
+- Use the `research-planner` alias for report-only DeepSeek planner/reviewer lanes, especially when the target folder is not a Git checkout.
 - Worker identity must be truthful. A lane recorded as DeepSeek must launch the Agent Fabric DeepSeek worker or Jcode DeepSeek dispatcher.
 - Native Claude helpers may assist the senior review, but they do not count as Agent Fabric DeepSeek workers unless registered with worker runs, events, checkpoints, and artifacts.
 
@@ -30,6 +32,8 @@ agent-fabric-project senior-run --project <path> --tasks-file .agent-fabric/task
 ```
 
 This avoids manual task JSON discovery, repeated DeepSeek approval loops, and ambiguous sandbox paths. Use `--approve-model-calls` only with `AGENT_FABRIC_SENIOR_MODE=permissive` or an explicit queue approval.
+
+Do not launch Senior Jcode work with manual `nohup jcode ...` commands. Use `senior-run` or `run-ready --worker jcode-deepseek` so Agent Fabric captures heartbeats, timeout failures, patch artifacts, and review state.
 
 - Spawn or resume lanes with `fabric_senior_start` / `fabric_senior_status` / `fabric_senior_resume`, or with `agent-fabric-project senior-run`.
 - Use lower-level `fabric_spawn_agents` or `agent-fabric-project fabric-spawn-agents` only when a queue is already shaped and approved.

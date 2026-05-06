@@ -28,7 +28,11 @@ Keep personal defaults in `agent-fabric.local.env`:
 export AGENT_FABRIC_HOME="$HOME/.agent-fabric"
 export AGENT_FABRIC_WORKSPACE_ROOT="/path/to/agent-fabric"
 export AGENT_FABRIC_PROJECT_MODEL_COMMAND="agent-fabric-deepseek-worker model-command --model deepseek-v4-pro --reasoning-effort max"
-export AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER="/path/to/dispatch-deepseek-with-collab.sh"
+export AGENT_FABRIC_SENIOR_MODE="permissive"
+export AGENT_FABRIC_SENIOR_DEFAULT_WORKER="jcode-deepseek"
+export JCODE_BIN="$HOME/.local/bin/jcode"
+# Optional legacy/private dispatcher override only:
+# export AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER="/path/to/dispatch-deepseek-with-collab.sh"
 ```
 
 Do not put real tokens, provider keys, billing settings, or private task packets

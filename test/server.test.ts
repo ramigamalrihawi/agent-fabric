@@ -18,6 +18,11 @@ describe("UDS daemon transport", () => {
       });
 
       expect(status.daemon.status).toBe("ok");
+      expect(status.daemon.tools?.missingSeniorRequired).toEqual([]);
+      expect(status.daemon.tools?.seniorRequired).toEqual(
+        expect.arrayContaining(["fabric_senior_start", "fabric_spawn_agents", "project_queue_approve_model_calls"])
+      );
+      expect(status.daemon.runtime?.cwd).toBeTruthy();
       expect(status.bridgeSessions.active).toBe(1);
       expect(status.bridgeSessions.sessions[0].agentId).toBe("simulator");
     });

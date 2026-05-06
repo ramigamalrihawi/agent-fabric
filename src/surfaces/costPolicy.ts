@@ -297,6 +297,17 @@ const POLICY_ALIAS_SEEDS: PolicyAliasSeed[] = [
     metadata: { purpose: "Write concrete coding tasks with acceptance criteria" }
   },
   {
+    alias: "research-planner",
+    provider: "deepseek",
+    model: "deepseek-v4-pro",
+    reasoning: "max",
+    billingMode: "metered",
+    source: "runtime_seed",
+    priority: 100,
+    riskCeiling: "medium",
+    metadata: { purpose: "Report-only Senior planner and reviewer lanes; prefer sandbox workspace mode" }
+  },
+  {
     alias: "tool.context.manager",
     provider: "deepseek",
     model: "deepseek-v4-pro",

@@ -31,6 +31,10 @@ The Codex/Claude-friendly shortcut is `senior-run`. It runs doctor-friendly defa
 npm run dev:project -- senior-run --project <path> --tasks-file .agent-fabric/tasks/tasks.json --count 10 --approve-model-calls --progress-file .agent-fabric/progress.md
 ```
 
+Run `senior-doctor --project <path> [--queue <id>]` before launch. It checks daemon/source parity, required Senior bridge tools, DeepSeek auth, queue visibility, and whether the project can support mutating `git_worktree` lanes. A queue created from another harness workspace remains accessible when the caller's workspace root is the queue `projectPath`; use `agent-fabric-project --project <path> --queue <id>` for cross-harness resumes.
+
+For non-git folders, report-only planner/reviewer work should use `sandbox` and the `research-planner` alias. Mutating implementation work still requires `git_worktree`.
+
 The lower-level terminal shortcut for this control-plane flow is `factory-run`. It performs the queue preview reads (`review-matrix`, `prepare-ready`, `launch-plan`), optionally records `start_execution`, writes task packets, runs ready DeepSeek lanes in git worktrees, and defaults to adaptive rate-limit backoff:
 
 ```bash
@@ -48,6 +52,7 @@ When `AGENT_FABRIC_SENIOR_MODE=permissive` is set, queue-backed DeepSeek executi
 - Explicit `ramicode`, `local-cli`, `openhands`, `aider`, `smolagents`, or `manual` execution workers are rejected before tool calls or shell execution.
 - Explicit Senior-mode command templates that record `deepseek-direct` or `jcode-deepseek` while launching Codex, Claude, or another local harness are rejected before shell execution.
 - Use `AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS=1` only for an explicit human-approved fallback.
+- Do not launch Senior Jcode lanes with manual `nohup jcode ...`; use `run-ready --worker jcode-deepseek` or `senior-run` so Agent Fabric records heartbeats, timeout failures, patch artifacts, and review state.
 
 The practical invariant is simple: a "Senior mode 10 DeepSeek lanes" request must create queue-backed worker runs that are visible through `lanes`, `dashboard`, worker checkpoints, and queue task state. Built-in side pools, unregistered background workers, or reports that never call the Agent Fabric queue are not valid substitutes.
 

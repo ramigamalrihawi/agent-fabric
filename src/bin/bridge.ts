@@ -16,7 +16,13 @@ const server = new McpServer({
   version: "0.1.0"
 });
 
-proxyTool("fabric_status", "Report agent-fabric daemon health, bridge sessions, coverage, and billing/storage status.", {});
+proxyTool("fabric_status", "Report bounded agent-fabric daemon health, bridge sessions, coverage, and billing/storage status.", {
+  includeSessions: z.boolean().optional(),
+  sessionLimit: z.number().int().nonnegative().optional(),
+  sessionOffset: z.number().int().nonnegative().optional(),
+  dedupeWarnings: z.boolean().optional()
+});
+proxyTool("fabric_session_close", "Close this Agent Fabric bridge session so status output does not accumulate stale short-lived clients.", {});
 proxyTool("fabric_doctor", "Report agent-fabric diagnostics and actionable safe next steps.", {
   includeActions: z.boolean().optional()
 });

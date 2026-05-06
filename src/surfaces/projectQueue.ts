@@ -322,8 +322,8 @@ export function projectQueueList(host: SurfaceHost, input: unknown, context: Cal
   const statuses = getStringArray(input, "statuses").map((status) => normalizeValue(status, QUEUE_STATUSES, "statuses"));
   const includeClosed = getOptionalBoolean(input, "includeClosed") ?? false;
   const limit = normalizeListLimit(getOptionalNumber(input, "limit") ?? 50);
-  const params: Array<string | number> = [session.workspace_root];
-  const where = ["workspace_root = ?"];
+  const params: Array<string | number> = [session.workspace_root, session.workspace_root];
+  const where = ["(workspace_root = ? OR project_path = ?)"];
 
   if (projectPath) {
     where.push("project_path = ?");
@@ -2510,10 +2510,23 @@ function proposalStatusForDecision(decision: string): string {
 
 function requireQueue(host: SurfaceHost, queueId: string, workspaceRoot: string): ProjectQueueRow {
   const row = host.db.db.prepare("SELECT * FROM project_queues WHERE id = ?").get(queueId) as ProjectQueueRow | undefined;
-  if (!row || row.workspace_root !== workspaceRoot) {
+  if (!row) {
     throw new FabricError("PROJECT_QUEUE_NOT_FOUND", `Project queue not found: ${queueId}`, false);
   }
-  return row;
+  if (queueVisibleToWorkspace(row, workspaceRoot)) return row;
+  throw new FabricError(
+    "PROJECT_QUEUE_NOT_FOUND",
+    [
+      `Project queue not found from workspace ${workspaceRoot}: ${queueId}.`,
+      `The queue exists for workspace ${row.workspace_root} and project ${row.project_path}.`,
+      `Re-run from that project or pass --project ${row.project_path}.`
+    ].join(" "),
+    false
+  );
+}
+
+function queueVisibleToWorkspace(queue: ProjectQueueRow, workspaceRoot: string): boolean {
+  return queue.workspace_root === workspaceRoot || queue.project_path === workspaceRoot;
 }
 
 function requireQueueTask(host: SurfaceHost, queueId: string, queueTaskId: string): ProjectQueueTaskRow {
@@ -2781,7 +2794,7 @@ function defaultWorkerCommand(worker: string, fabricTaskId: string): string[] {
 
 function jcodeDeepSeekDispatcherPath(): string {
   const configured = process.env.AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER?.trim();
-  return configured || "dispatch-deepseek-with-collab.sh";
+  return configured || "agent-fabric-jcode-deepseek-worker";
 }
 
 function queueBlockedEntries(tasks: ProjectQueueTaskRow[], reason: string): Array<{ task: ProjectQueueTaskRow; reasons: string[] }> {

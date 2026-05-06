@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { FabricDb, SCHEMA_VERSION } from "./db.js";
 import {
   ingestAzureCostQueryResponse,
@@ -166,12 +166,125 @@ import {
 export { FabricError } from "./runtime/errors.js";
 
 const VERSION = "0.1.0";
+const SENIOR_REQUIRED_TOOLS = [
+  "fabric_senior_start",
+  "fabric_senior_status",
+  "fabric_senior_resume",
+  "fabric_spawn_agents",
+  "fabric_list_agents",
+  "fabric_open_agent",
+  "fabric_message_agent",
+  "fabric_wait_agents",
+  "fabric_accept_patch",
+  "project_queue_approve_model_calls"
+];
+const SUPPORTED_TOOLS = new Set([
+  "fabric_status",
+  "fabric_session_close",
+  "fabric_doctor",
+  "fabric_explain_session",
+  "fabric_explain_memory",
+  "fabric_trace",
+  "fabric_inspect_context_package",
+  "fabric_spawn_agents",
+  "fabric_list_agents",
+  "fabric_open_agent",
+  "fabric_message_agent",
+  "fabric_wait_agents",
+  "fabric_accept_patch",
+  "fabric_senior_start",
+  "fabric_senior_status",
+  "fabric_senior_resume",
+  "fabric_notification_self_test_start",
+  "fabric_notification_self_test_complete",
+  "collab_send",
+  "collab_inbox",
+  "collab_ask",
+  "collab_reply",
+  "claim_path",
+  "release_path",
+  "collab_status",
+  "collab_decision",
+  "collab_heartbeat",
+  "memory_write",
+  "memory_check",
+  "memory_outcome",
+  "memory_list",
+  "memory_audit_lift",
+  "memory_invalidate",
+  "memory_confirm",
+  "memory_review",
+  "memory_eval_report",
+  "pp_cost_month",
+  "pp_cost_by_feature",
+  "pp_cost_idle_audit",
+  "pp_cost_anomaly",
+  "pp_cost_quota_status",
+  "llm_preflight",
+  "llm_approve",
+  "llm_hard_gate",
+  "model_brain_route",
+  "policy_resolve_alias",
+  "tool_context_propose",
+  "tool_context_decide",
+  "tool_context_status",
+  "project_queue_create",
+  "project_queue_list",
+  "project_queue_status",
+  "project_queue_update_settings",
+  "project_queue_dashboard",
+  "project_queue_review_matrix",
+  "project_queue_task_detail",
+  "project_queue_resume_task",
+  "project_queue_task_packet",
+  "project_queue_record_stage",
+  "project_queue_add_tasks",
+  "project_queue_next_ready",
+  "project_queue_write_ready_packets",
+  "project_queue_improve_prompt",
+  "project_queue_start_plan",
+  "project_queue_generate_tasks",
+  "project_queue_review_queue",
+  "project_queue_decide",
+  "project_queue_prepare_ready",
+  "project_queue_launch_plan",
+  "project_queue_claim_next",
+  "project_queue_recover_stale",
+  "project_queue_retry_task",
+  "project_queue_agent_lanes",
+  "project_queue_approve_model_calls",
+  "project_queue_progress_report",
+  "project_queue_approval_inbox",
+  "project_queue_assign_worker",
+  "project_queue_update_task",
+  "project_queue_update_task_metadata",
+  "project_queue_edit_task_metadata",
+  "project_queue_review_patches",
+  "project_queue_accept_patch",
+  "project_queue_approvals",
+  "project_queue_timeline",
+  "fabric_task_create",
+  "fabric_task_start_worker",
+  "fabric_task_event",
+  "fabric_task_checkpoint",
+  "fabric_task_heartbeat",
+  "fabric_task_status",
+  "fabric_task_resume",
+  "fabric_task_finish"
+]);
 
 export type DaemonOptions = {
   dbPath?: string;
   originPeerId?: string;
   now?: () => Date;
   fanout?: CollabFanout;
+};
+
+type FabricStatusOptions = {
+  includeSessions?: boolean;
+  sessionLimit?: number;
+  sessionOffset?: number;
+  dedupeWarnings?: boolean;
 };
 
 export class FabricDaemon {
@@ -308,7 +421,10 @@ export class FabricDaemon {
     try {
       const session = this.requireSession(context);
       if (tool === "fabric_status") {
-        return { ok: true, tool, data: this.fabricStatus() as T };
+        return { ok: true, tool, data: this.fabricStatus(fabricStatusOptions(input)) as T };
+      }
+      if (tool === "fabric_session_close") {
+        return { ok: true, tool, data: this.closeBridgeSession(session, context) as T };
       }
       if (tool === "fabric_doctor") {
         return { ok: true, tool, data: this.fabricDoctor() as T };
@@ -599,7 +715,7 @@ export class FabricDaemon {
         ok: false,
         tool,
         code: "TOOL_NOT_IMPLEMENTED",
-        message: `${tool} is not implemented in Phase 0A.1`,
+        message: `${tool} is not implemented by the running Agent Fabric daemon. If this tool exists in the current checkout, rebuild/relink and restart the daemon so Codex, Claude Code, and agent-fabric-project talk to the same source tree.`,
         retryable: false
       };
     } catch (error) {
@@ -650,27 +766,34 @@ export class FabricDaemon {
     });
   }
 
-  fabricStatus(): FabricStatus {
+  fabricStatus(options: FabricStatusOptions = {}): FabricStatus {
     this.expireNotificationSelfTests();
     const rows = (this.db.db
       .prepare("SELECT * FROM bridge_sessions WHERE ended_at IS NULL ORDER BY started_at DESC")
       .all() as SessionRow[]).filter((row) => !row.expires_at || Date.parse(row.expires_at) > this.now().getTime());
-    const sessions = rows.map(rowToSessionSummary);
+    const sessionOffset = normalizeStatusOffset(options.sessionOffset);
+    const sessionLimit = normalizeStatusLimit(options.sessionLimit);
+    const includeSessions = options.includeSessions ?? true;
+    const sessions = includeSessions ? rows.slice(sessionOffset, sessionOffset + sessionLimit).map(rowToSessionSummary) : [];
+    const allSessions = rows.map(rowToSessionSummary);
     const recentCostRows = this.db.db
       .prepare("SELECT DISTINCT agent_id FROM cost_events WHERE agent_id IS NOT NULL AND ts >= ?")
       .all(new Date(this.now().getTime() - 60 * 60 * 1000).toISOString()) as { agent_id: string }[];
     const observedRouteableAgents = uniqueStrings(recentCostRows.map((row) => row.agent_id));
     const byAgent = Object.fromEntries(
-      sessions.map((session) => [session.agentId, observedRouteableAgents.includes(session.agentId) ? 100 : 0])
+      allSessions.map((session) => [session.agentId, observedRouteableAgents.includes(session.agentId) ? 100 : 0])
     );
-    const coveragePct = sessions.length === 0 ? 0 : Math.round((observedRouteableAgents.length / sessions.length) * 100);
+    const coveragePct = allSessions.length === 0 ? 0 : Math.round((observedRouteableAgents.length / allSessions.length) * 100);
     const auditBacklog = count(this.db, "audit");
     const outboxEventsLast24h = this.db.db
       .prepare("SELECT COUNT(*) AS count FROM events WHERE ts >= datetime('now', '-1 day')")
       .get() as { count: number };
     const oldest = this.db.db.prepare("SELECT MIN(ts) AS ts FROM events").get() as { ts: string | null };
     const lastBilling = this.db.db.prepare("SELECT MAX(ts_polled) AS ts FROM cost_billing").get() as { ts: string | null };
-    const warnings = this.statusWarnings(sessions, lastBilling.ts, observedRouteableAgents);
+    const warnings = options.dedupeWarnings === false
+      ? this.statusWarnings(allSessions, lastBilling.ts, observedRouteableAgents)
+      : uniqueStrings(this.statusWarnings(allSessions, lastBilling.ts, observedRouteableAgents));
+    const missingSeniorRequired = SENIOR_REQUIRED_TOOLS.filter((tool) => !SUPPORTED_TOOLS.has(tool));
 
     return {
       daemon: {
@@ -679,17 +802,25 @@ export class FabricDaemon {
         uptimeSeconds: Math.max(0, Math.floor((this.now().getTime() - this.startedAt.getTime()) / 1000)),
         dbPath: this.db.path,
         schemaVersion: this.db.schemaVersion(),
-        originPeerId: this.originPeerId
+        originPeerId: this.originPeerId,
+        runtime: daemonRuntimeInfo(),
+        tools: {
+          seniorRequired: SENIOR_REQUIRED_TOOLS,
+          missingSeniorRequired
+        }
       },
       bridgeSessions: {
-        active: sessions.length,
+        active: rows.length,
+        returned: sessions.length,
+        offset: includeSessions ? sessionOffset : undefined,
+        limit: includeSessions ? sessionLimit : undefined,
         sessions
       },
       coverage: {
         litellmCoveragePct: coveragePct,
         byAgent,
         observedRouteableAgents,
-        uncoveredAgents: uniqueStrings(sessions.filter((session) => byAgent[session.agentId] !== 100).map((session) => session.agentId)),
+        uncoveredAgents: uniqueStrings(allSessions.filter((session) => byAgent[session.agentId] !== 100).map((session) => session.agentId)),
         outcomeCoveragePct: this.outcomeCoveragePct()
       },
       storage: {
@@ -706,7 +837,7 @@ export class FabricDaemon {
   }
 
   fabricDoctor(): FabricDoctor {
-    const status = this.fabricStatus();
+    const status = this.fabricStatus({ includeSessions: true, sessionLimit: 500, dedupeWarnings: true });
     const diagnostics: FabricDiagnostic[] = [];
     for (const session of status.bridgeSessions.sessions) {
       if (session.notificationsVisibleToAgent.declared === "yes" && session.notificationsVisibleToAgent.observed !== "yes") {
@@ -1073,6 +1204,24 @@ export class FabricDaemon {
     return row;
   }
 
+  closeBridgeSession(session: SessionRow, context?: CallContext): Record<string, unknown> {
+    this.db.db.prepare("UPDATE bridge_sessions SET ended_at = CURRENT_TIMESTAMP WHERE id = ? AND ended_at IS NULL").run(session.id);
+    this.writeAuditAndEvent({
+      sessionId: session.id,
+      agentId: session.agent_id,
+      hostName: session.host_name,
+      workspaceRoot: session.workspace_root,
+      action: "bridge.session.ended",
+      sourceTable: "bridge_sessions",
+      sourceId: session.id,
+      eventType: "bridge.session.ended",
+      payload: { sessionId: session.id, agentId: session.agent_id },
+      testMode: session.test_mode === 1,
+      context
+    });
+    return { sessionId: session.id, status: "ended" };
+  }
+
   private registrationWarnings(input: BridgeRegister, observed: "yes" | "no" | "unknown"): string[] {
     const warnings: string[] = [];
     if (input.workspace.source === "cwd") {
@@ -1206,6 +1355,44 @@ export class FabricDaemon {
     ];
     writeFileSync(join(viewDir, "channel.md"), `${lines.join("\n")}\n`, { mode: 0o600 });
   }
+}
+
+function fabricStatusOptions(input: unknown): FabricStatusOptions {
+  return {
+    includeSessions: getOptionalBoolean(input, "includeSessions"),
+    sessionLimit: getOptionalNumber(input, "sessionLimit"),
+    sessionOffset: getOptionalNumber(input, "sessionOffset"),
+    dedupeWarnings: getOptionalBoolean(input, "dedupeWarnings")
+  };
+}
+
+function normalizeStatusLimit(value: number | undefined): number {
+  if (value === undefined) return 50;
+  if (!Number.isFinite(value)) return 50;
+  return Math.min(Math.max(Math.floor(value), 0), 500);
+}
+
+function normalizeStatusOffset(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0;
+  return Math.max(Math.floor(value), 0);
+}
+
+function daemonRuntimeInfo(): NonNullable<FabricStatus["daemon"]["runtime"]> {
+  const entrypoint = process.argv[1] ? resolve(process.argv[1]) : undefined;
+  return {
+    pid: process.pid,
+    cwd: process.cwd(),
+    entrypoint,
+    node: process.execPath,
+    packageRoot: entrypoint ? inferPackageRoot(entrypoint) : undefined
+  };
+}
+
+function inferPackageRoot(entrypoint: string): string | undefined {
+  const marker = `${join("dist", "bin")}${entrypoint.includes("/") ? "/" : "\\"}`;
+  const index = entrypoint.lastIndexOf(marker);
+  if (index === -1) return undefined;
+  return entrypoint.slice(0, index).replace(/[\\/]$/, "");
 }
 
 function assertReplayMatch(
