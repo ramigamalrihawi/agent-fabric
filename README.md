@@ -68,6 +68,8 @@ This gives a single senior session leverage over a larger review-and-implementat
 
 Senior mode is also an enforcement mode for local project work. When `AGENT_FABRIC_SENIOR_MODE=permissive` is set, `agent-fabric-project claim-next`, `launch`, `run-ready`, `factory-run`, and `senior-run` default to queue-backed `deepseek-direct` worker lanes with git worktree working directories, `deepseek-v4-pro:max`, and 10-way parallelism for broad ready/factory runs. Set `AGENT_FABRIC_SENIOR_DEFAULT_WORKER=jcode-deepseek` in local ignored config when large implementation lanes should use the Jcode runtime by default. Explicit non-DeepSeek execution workers, or command templates that record a DeepSeek worker while launching Codex/Claude/local CLIs, are rejected unless a human deliberately sets `AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS=1` for a local fallback.
 
+Senior DeepSeek direct runs also fail closed when they are not queue-visible. `run-ready`, `factory-run`, and `senior-run` inject `AGENT_FABRIC_WORKER_QUEUE_VISIBLE=1` plus queue/task/run ids into the worker shell; manual `agent-fabric-deepseek-worker run-task` calls in Senior mode are rejected unless `TASK_DIR` auto-queue registration is active or a human sets `AGENT_FABRIC_DEEPSEEK_ALLOW_UNTRACKED=1`. Generated DeepSeek task packets now include a bounded `.context.md` sidecar from `expectedFiles` and `requiredContextRefs`, so file-only DeepSeek lanes receive concrete source context instead of only filenames.
+
 The cheap happy path for Codex and Claude Code is:
 
 ```bash
@@ -91,6 +93,8 @@ agent-fabric-project senior-run \
 Codex and Claude Code should use the compact bridge facade when they want native-feeling background workers: `fabric_senior_start`, `fabric_senior_status`, `fabric_senior_resume`, `fabric_spawn_agents`, `fabric_list_agents`, `fabric_open_agent`, `fabric_message_agent`, `fabric_wait_agents`, and `fabric_accept_patch`. These return Codex-style `@af/<name>` worker cards while Agent Fabric remains the durable source of truth. Patch acceptance requires senior review metadata.
 
 `fabric_status` is bounded by default and accepts `includeSessions`, `sessionLimit`, `sessionOffset`, and `dedupeWarnings` when a harness needs deeper diagnostics without flooding the context window.
+
+Project CLI JSON output redacts approval/session token fields before printing. Use the in-process approval object only inside the current command invocation; do not copy tokens from logs or transcripts.
 
 ## Current Capabilities
 

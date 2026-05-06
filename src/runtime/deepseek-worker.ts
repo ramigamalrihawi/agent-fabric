@@ -117,6 +117,10 @@ const DEFAULT_MODEL = "deepseek-v4-pro";
 const DEFAULT_MAX_TOKENS = 32_000;
 const DEFAULT_TIMEOUT_MS = 900_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
+const SENIOR_MODE_ENV = "AGENT_FABRIC_SENIOR_MODE";
+const DEEPSEEK_AUTO_QUEUE_ENV = "AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE";
+const QUEUE_VISIBLE_ENV = "AGENT_FABRIC_WORKER_QUEUE_VISIBLE";
+const DIRECT_OVERRIDE_ENV = "AGENT_FABRIC_DEEPSEEK_ALLOW_UNTRACKED";
 
 export function parseDeepSeekWorkerArgs(argv: string[]): DeepSeekWorkerCommand {
   const args = [...argv];
@@ -296,12 +300,14 @@ async function runProjectModelCommand(
 }
 
 async function runTaskPacket(command: Extract<DeepSeekWorkerCommand, { command: "run-task" }>, options: RunOptions): Promise<Record<string, unknown>> {
-  const apiKey = deepSeekApiKey(options.env ?? process.env);
+  const env = options.env ?? process.env;
+  assertSeniorDirectRunTracked(env);
+  const apiKey = deepSeekApiKey(env);
   if (!apiKey) throw new FabricError("DEEPSEEK_API_KEY_MISSING", "DEEPSEEK_API_KEY or DEEPSEEK_TOKEN must be set", false);
   const packetText = readFileSync(command.taskPacketPath, "utf8");
   const packet = parseTaskPacket(packetText, command.taskPacketPath);
   const contextText = command.contextFile ? readFileSync(command.contextFile, "utf8") : undefined;
-	  const sensitiveContextMode = effectiveSensitiveContextMode(command, options.env ?? process.env);
+	  const sensitiveContextMode = effectiveSensitiveContextMode(command, env);
 	  assertNoSensitiveContext(command.taskPacketPath, packetText, sensitiveContextMode);
 	  if (contextText !== undefined) assertNoSensitiveContext(command.contextFile ?? "context file", contextText, sensitiveContextMode);
   const queueRun = await maybeStartQueueBackedDirectRun(command, packet, options);
@@ -317,7 +323,7 @@ async function runTaskPacket(command: Extract<DeepSeekWorkerCommand, { command: 
       timeoutMs: command.timeoutMs,
 	      messages,
 	      fetchImpl: options.fetchImpl,
-	      env: options.env ?? process.env
+	      env
 	    });
     const parsed = normalizeTaskReport(parseJsonObject(call.content, "DeepSeek run-task response"));
     const outputFile = command.outputFile ?? defaultOutputFile(command, packet, options.cwd ?? process.cwd());
@@ -362,12 +368,39 @@ async function runTaskPacket(command: Extract<DeepSeekWorkerCommand, { command: 
       queueBacked: queueRun
         ? { queueId: queueRun.queueId, queueTaskId: queueRun.queueTaskId, fabricTaskId: queueRun.fabricTaskId, workerRunId: queueRun.workerRunId }
         : undefined,
+      untrackedSeniorDirect: queueRun ? undefined : seniorUntrackedOverride(env) || undefined,
       summary: parsed.summary
     };
   } catch (error) {
     await failQueueBackedDirectRun(queueRun, error);
     throw error;
   }
+}
+
+function assertSeniorDirectRunTracked(env: NodeJS.ProcessEnv): void {
+  if (env[SENIOR_MODE_ENV] !== "permissive") return;
+  if (truthyEnv(env[QUEUE_VISIBLE_ENV]) || truthyEnv(env.AGENT_FABRIC_QUEUE_VISIBLE)) return;
+  if (seniorUntrackedOverride(env)) return;
+  const autoQueueMode = String(env[DEEPSEEK_AUTO_QUEUE_ENV] ?? "auto").toLowerCase();
+  const autoQueueDisabled = ["0", "false", "off", "no", "disabled"].includes(autoQueueMode);
+  if (!autoQueueDisabled && env.TASK_DIR) return;
+  throw new FabricError(
+    "DEEPSEEK_UNTRACKED_SENIOR_RUN",
+    [
+      "Senior-mode DeepSeek direct run is not queue-visible.",
+      "Launch it through agent-fabric-project run-ready/senior-run, keep auto queueing enabled with TASK_DIR, or set AGENT_FABRIC_DEEPSEEK_ALLOW_UNTRACKED=1 for an explicit local escape hatch.",
+      "Untracked direct runs do not count as Senior DeepSeek lanes."
+    ].join(" "),
+    false
+  );
+}
+
+function seniorUntrackedOverride(env: NodeJS.ProcessEnv): boolean {
+  return truthyEnv(env[DIRECT_OVERRIDE_ENV]) || truthyEnv(env.AGENT_FABRIC_WORKER_DIRECT_OVERRIDE);
+}
+
+function truthyEnv(value: string | undefined): boolean {
+  return ["1", "true", "yes", "on"].includes(String(value ?? "").toLowerCase());
 }
 
 async function maybeStartQueueBackedDirectRun(

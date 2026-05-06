@@ -43,6 +43,8 @@ npm run dev:project -- factory-run --queue <queueId> --start-execution --paralle
 
 Use `--dry-run` to inspect the factory plan without launching workers, `--no-adaptive-rate-limit` to keep fixed parallelism, `--sensitive-context-mode strict` for high-entropy packet scanning, `--allow-sensitive-context` to explicitly pass the DeepSeek worker's sensitive-context override, `--deepseek-role <role>` to force a homogeneous lane role, and `--deepseek-worker-command "<cmd>"` when the global worker binary is not installed.
 
+CLI JSON output redacts approval/session token fields before printing. Approval tokens remain process-local plumbing between `--approve-model-calls` and the worker preflight, not operator-facing handoff material.
+
 Run only one `factory-run` or broad `run-ready` scheduler against a queue at a time. The CLI creates a local per-queue runner lock by default; pass `--allow-concurrent-runner` only when overlapping schedulers are intentional. Queue assignment gates still reject duplicate worker assignment if another host bypasses the local lock.
 
 When `AGENT_FABRIC_SENIOR_MODE=permissive` is set, queue-backed DeepSeek execution is the default and the guardrail:
@@ -200,12 +202,12 @@ High-risk aliases still go through `llm_preflight`. If the command reports `need
 
 Pass `--adaptive-rate-limit` to reduce later batch parallelism when failed DeepSeek lanes include structured or textual 429/rate-limit evidence. Use `--min-parallel <n>` to set the lower bound. This does not retry already-failed queue tasks automatically; use `retry-task` after review when a lane should be requeued.
 
-With `--worker deepseek-direct`, `run-ready` defaults to `agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}} --fabric-task {{fabricTaskId}} --role implementer`, so `--task-packet-dir` is required unless an explicit `--command-template` is supplied. The default DeepSeek task mode is report-only: structured worker results can include a proposed patch, but no files are edited unless an explicit command template passes `--patch-mode apply`. Commands that invoke `agent-fabric-deepseek-worker` get an `llm_preflight` gate before the shell command runs; pass `--approval-token <token>` after approving the model-call request when the route is high risk.
+With `--worker deepseek-direct`, `run-ready` defaults to `agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}} --context-file {{contextFile}} --fabric-task {{fabricTaskId}} --role implementer`, so `--task-packet-dir` is required unless an explicit `--command-template` is supplied. For each generated packet, the CLI also writes `<queueTaskId>.context.md` with bounded local contents from `expectedFiles` and file-like `requiredContextRefs`; unsupported, missing, large, binary, outside-project, or secret-looking paths are listed as omitted. The default DeepSeek task mode is report-only: structured worker results can include a proposed patch, but no files are edited unless an explicit command template passes `--patch-mode apply`. Commands that invoke `agent-fabric-deepseek-worker` get an `llm_preflight` gate before the shell command runs; pass `--approval-token <token>` after approving the model-call request when the route is high risk.
 
 To collect proposed patches for human review without editing the worktree, override the command template with `--patch-mode write`:
 
 ```bash
-npm run dev:project -- run-ready --queue <queueId> --worker deepseek-direct --parallel 4 --cwd-template "/path/to/worktrees/{{queueTaskId}}" --task-packet-dir task-packets --command-template "agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}} --fabric-task {{fabricTaskId}} --role implementer --patch-mode write" --approve-tool-context
+npm run dev:project -- run-ready --queue <queueId> --worker deepseek-direct --parallel 4 --cwd-template "/path/to/worktrees/{{queueTaskId}}" --task-packet-dir task-packets --command-template "agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}} --context-file {{contextFile}} --fabric-task {{fabricTaskId}} --role implementer --patch-mode write" --approve-tool-context
 ```
 
 To apply after review, prefer the queue gate:

@@ -20,6 +20,8 @@ const SENIOR_DEFAULT_MODEL_PROFILE = "deepseek-v4-pro:max";
 const SENIOR_DEFAULT_LANE_COUNT = 10;
 const SENIOR_DEEPSEEK_WORKERS = new Set<WorkerKind>(["deepseek-direct", "jcode-deepseek"]);
 const JCODE_HEARTBEAT_MS = Number(process.env.AGENT_FABRIC_JCODE_HEARTBEAT_MS ?? 30_000);
+const TASK_CONTEXT_MAX_FILE_BYTES = 48_000;
+const TASK_CONTEXT_MAX_TOTAL_BYTES = 180_000;
 
 export type ProjectCliCommand =
   | { command: "version"; json: boolean }
@@ -1921,8 +1923,23 @@ export async function runProjectCommand(
 }
 
 export function formatProjectResult(result: ProjectRunResult, json: boolean): string {
-  if (json) return JSON.stringify(result.data, null, 2);
+  if (json) return JSON.stringify(redactProjectJson(result.data), null, 2);
   return result.message;
+}
+
+function redactProjectJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactProjectJson);
+  if (!value || typeof value !== "object") return value;
+  const output: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value)) {
+    output[key] = secretOutputKey(key) ? "[redacted]" : redactProjectJson(nested);
+  }
+  return output;
+}
+
+function secretOutputKey(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return normalized === "token" || normalized === "approvaltoken" || normalized === "sessiontoken" || normalized.endsWith("_token") || normalized.endsWith("token");
 }
 
 export function projectHelp(): string {
@@ -2988,7 +3005,13 @@ async function runTask(
   });
   const startedAt = Date.now();
   const stopHeartbeat = startJcodeHeartbeat(command, task, workerRunId, cwd, call);
-  const result = await runShellCommand(command.commandLine, cwd, command.maxOutputChars, command.maxRuntimeMinutes).finally(stopHeartbeat);
+  const result = await runShellCommand(
+    command.commandLine,
+    cwd,
+    command.maxOutputChars,
+    command.maxRuntimeMinutes,
+    queueVisibleWorkerEnv(command, task, status.queue, workerRunId)
+  ).finally(stopHeartbeat);
   const durationMs = Date.now() - startedAt;
   await call("fabric_task_event", {
     taskId: task.fabricTaskId,
@@ -3148,7 +3171,7 @@ async function runReady(
           return { skipped: { queueTaskId: task.queueTaskId, title: task.title, reason: "missing fabricTaskId" } };
         }
         const taskPacket = command.taskPacketDir ? writeTaskPacket(status, task, command.taskPacketDir, command.taskPacketFormat) : undefined;
-        const commandLine = commandLineForReadyTask(command, task, status.queue.projectPath, taskPacket?.path);
+        const commandLine = commandLineForReadyTask(command, task, status.queue.projectPath, taskPacket?.path, taskPacket?.contextPath);
         const result = await runTask(
           {
             command: "run-task",
@@ -3174,7 +3197,16 @@ async function runReady(
         );
         return {
           result: taskPacket
-            ? { ...result, data: { ...result.data, taskPacketPath: taskPacket.path, taskPacketFormat: taskPacket.format } }
+            ? {
+                ...result,
+                data: {
+                  ...result.data,
+                  taskPacketPath: taskPacket.path,
+                  taskPacketFormat: taskPacket.format,
+                  taskContextPath: taskPacket.contextPath,
+                  taskContextFiles: taskPacket.contextFiles
+                }
+              }
             : result
         };
       })
@@ -3305,6 +3337,8 @@ async function factoryRun(
     "--json",
     "--task-packet",
     "{{taskPacket}}",
+    "--context-file",
+    "{{contextFile}}",
     "--fabric-task",
     "{{fabricTaskId}}",
     "--role",
@@ -4622,18 +4656,21 @@ function commandLineForReadyTask(
   command: Extract<ProjectCliCommand, { command: "run-ready" }>,
   task: QueueTask,
   projectPath: string,
-  taskPacketPath?: string
+  taskPacketPath?: string,
+  contextFilePath?: string
 ): string {
   if (!command.commandTemplate && command.worker === "deepseek-direct") {
     if (!taskPacketPath) {
       throw new FabricError("INVALID_INPUT", "deepseek-direct run-ready requires --task-packet-dir or an explicit --command-template", false);
     }
     const sensitiveFlag = seniorModePermissive(process.env) ? " --allow-sensitive-context" : "";
+    const contextFlag = contextFilePath ? " --context-file {{contextFile}}" : "";
     return expandCommandTemplate(
-      `AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=off agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}} --fabric-task {{fabricTaskId}} --role {{deepseekRole}}${sensitiveFlag}`,
+      `AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=off agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}}${contextFlag} --fabric-task {{fabricTaskId}} --role {{deepseekRole}}${sensitiveFlag}`,
       task,
       projectPath,
-      taskPacketPath
+      taskPacketPath,
+      contextFilePath
     );
   }
   if (!command.commandTemplate && command.worker === "jcode-deepseek") {
@@ -4648,7 +4685,7 @@ function commandLineForReadyTask(
   if (!template) {
     throw new FabricError("INVALID_INPUT", "run-ready requires --command-template when worker has no default command", false);
   }
-  const expanded = expandCommandTemplate(template, task, projectPath, taskPacketPath);
+  const expanded = expandCommandTemplate(template, task, projectPath, taskPacketPath, contextFilePath);
   return command.worker === "deepseek-direct" && expanded.includes("agent-fabric-deepseek-worker")
     ? `AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=off ${expanded}`
     : expanded;
@@ -4791,7 +4828,7 @@ function jsonErrorRateLimitSignal(text: string): boolean {
   return false;
 }
 
-function expandCommandTemplate(template: string, task: QueueTask, projectPath: string, taskPacketPath?: string): string {
+function expandCommandTemplate(template: string, task: QueueTask, projectPath: string, taskPacketPath?: string, contextFilePath?: string): string {
   const values: Record<string, string> = {
     queueTaskId: task.queueTaskId,
     fabricTaskId: task.fabricTaskId ?? "",
@@ -4799,12 +4836,16 @@ function expandCommandTemplate(template: string, task: QueueTask, projectPath: s
     goal: task.goal,
     projectPath,
     taskPacket: taskPacketPath ?? "",
+    contextFile: contextFilePath ?? "",
     deepseekRole: deepSeekRoleForTask(task)
   };
   if (template.includes("{{taskPacket") && !taskPacketPath) {
     throw new FabricError("INVALID_INPUT", "--task-packet-dir is required when command-template uses {{taskPacket}}", false);
   }
-  return template.replace(/\{\{\s*(queueTaskId|fabricTaskId|title|goal|projectPath|taskPacket|deepseekRole)\s*\}\}/g, (_match, key: string) =>
+  if (template.includes("{{contextFile") && !contextFilePath) {
+    throw new FabricError("INVALID_INPUT", "--task-packet-dir is required when command-template uses {{contextFile}}", false);
+  }
+  return template.replace(/\{\{\s*(queueTaskId|fabricTaskId|title|goal|projectPath|taskPacket|contextFile|deepseekRole)\s*\}\}/g, (_match, key: string) =>
     shellQuote(values[key] ?? "")
   );
 }
@@ -4846,19 +4887,30 @@ function safePathPart(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 96) || "queue";
 }
 
+type WrittenTaskPacket = {
+  queueTaskId: string;
+  path: string;
+  format: string;
+  contextPath: string;
+  contextFiles: string[];
+};
+
 function writeTaskPacket(
   status: QueueStatus,
   task: QueueTask,
   outDir: string,
   format: "json" | "markdown"
-): { queueTaskId: string; path: string; format: string } {
+): WrittenTaskPacket {
   mkdirSync(outDir, { recursive: true });
   const extension = format === "markdown" ? "md" : "json";
   const path = join(outDir, `${task.queueTaskId}.${extension}`);
   const packet = taskPacket(status, task);
   const body = format === "markdown" ? formatTaskPacketMarkdown(packet) : `${JSON.stringify(packet, null, 2)}\n`;
   writeFileSync(path, body, "utf8");
-  return { queueTaskId: task.queueTaskId, path, format };
+  const context = taskContextBundle(status.queue.projectPath, task);
+  const contextPath = join(outDir, `${task.queueTaskId}.context.md`);
+  writeFileSync(contextPath, context.body, "utf8");
+  return { queueTaskId: task.queueTaskId, path, format, contextPath, contextFiles: context.included };
 }
 
 function taskPacketMetadata(taskPacketPath?: string, taskPacketFormat?: "json" | "markdown"): Record<string, string> {
@@ -4907,6 +4959,94 @@ function taskPacket(status: QueueStatus, task: QueueTask): Record<string, unknow
       "Return patch-ready output with test evidence or an explicit blocker."
     ]
   };
+}
+
+function taskContextBundle(projectPath: string, task: QueueTask): { body: string; included: string[] } {
+  const refs = uniqueStrings([...stringArray(task.expectedFiles), ...stringArray(task.requiredContextRefs)]);
+  const included: string[] = [];
+  const skipped: string[] = [];
+  const sections: string[] = [
+    "# Agent Fabric Task Context",
+    "",
+    `Project: ${projectPath}`,
+    `Task: ${task.queueTaskId} ${task.title}`,
+    "",
+    "This file is generated from expectedFiles and requiredContextRefs so file-only DeepSeek lanes have concrete source context. It is bounded and may omit large, missing, binary, unsafe, or secret-looking files.",
+    ""
+  ];
+  let totalBytes = 0;
+  for (const ref of refs) {
+    const candidate = resolveTaskContextPath(projectPath, ref);
+    if (!candidate) {
+      skipped.push(`${ref}: unsupported or outside project`);
+      continue;
+    }
+    if (secretLikeContextPath(candidate)) {
+      skipped.push(`${ref}: secret-like path skipped`);
+      continue;
+    }
+    if (!existsSync(candidate)) {
+      skipped.push(`${ref}: missing`);
+      continue;
+    }
+    let stat;
+    try {
+      stat = statSync(candidate);
+    } catch {
+      skipped.push(`${ref}: unreadable`);
+      continue;
+    }
+    if (!stat.isFile()) {
+      skipped.push(`${ref}: not a file`);
+      continue;
+    }
+    if (stat.size > TASK_CONTEXT_MAX_FILE_BYTES) {
+      skipped.push(`${ref}: too large (${stat.size} bytes)`);
+      continue;
+    }
+    if (totalBytes + stat.size > TASK_CONTEXT_MAX_TOTAL_BYTES) {
+      skipped.push(`${ref}: total context cap reached`);
+      continue;
+    }
+    let text: string;
+    try {
+      text = readFileSync(candidate, "utf8");
+    } catch {
+      skipped.push(`${ref}: unreadable`);
+      continue;
+    }
+    if (text.includes("\0")) {
+      skipped.push(`${ref}: binary-looking content`);
+      continue;
+    }
+    totalBytes += Buffer.byteLength(text, "utf8");
+    const rel = relative(projectPath, candidate) || ref;
+    included.push(rel);
+    sections.push(`## ${rel}`, "", "```text", text, "```", "");
+  }
+  if (included.length === 0) {
+    sections.push("## Included Files", "", "- none", "");
+  }
+  if (skipped.length > 0) {
+    sections.push("## Omitted Context", "", ...skipped.map((item) => `- ${item}`), "");
+  }
+  return { body: `${sections.join("\n")}\n`, included };
+}
+
+function resolveTaskContextPath(projectPath: string, ref: string): string | undefined {
+  const trimmed = ref.trim();
+  if (!trimmed || /^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return undefined;
+  if (trimmed.includes("\0")) return undefined;
+  const resolvedProject = resolve(projectPath);
+  const resolved = isAbsolute(trimmed) ? resolve(trimmed) : resolve(resolvedProject, trimmed);
+  return isPathInside(resolved, resolvedProject) ? resolved : undefined;
+}
+
+function secretLikeContextPath(path: string): boolean {
+  const name = basename(path).toLowerCase();
+  if (name === ".env" || name.endsWith(".env") || name === "agent-fabric.local.env" || name === "cost-ingest-token") return true;
+  if (/\.(pem|key|p12|pfx)$/.test(name)) return true;
+  return /(^|[._-])(secret|secrets|credential|credentials|api-key|private-key|access-token|refresh-token|auth-token)([._-]|$)/.test(name);
 }
 
 function formatTaskPacketMarkdown(packet: Record<string, unknown>): string {
@@ -5043,7 +5183,13 @@ type StructuredWorkerResult = {
   raw: Record<string, unknown>;
 };
 
-async function runShellCommand(command: string, cwd: string, maxOutputChars: number, maxRuntimeMinutes?: number): Promise<ShellResult> {
+async function runShellCommand(
+  command: string,
+  cwd: string,
+  maxOutputChars: number,
+  maxRuntimeMinutes?: number,
+  envOverrides: Record<string, string> = {}
+): Promise<ShellResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, {
       cwd,
@@ -5052,7 +5198,8 @@ async function runShellCommand(command: string, cwd: string, maxOutputChars: num
         ...process.env,
         BASH_ENV: "",
         ENV: "",
-        ZDOTDIR: "/var/empty"
+        ZDOTDIR: "/var/empty",
+        ...envOverrides
       },
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -5085,6 +5232,26 @@ async function runShellCommand(command: string, cwd: string, maxOutputChars: num
       resolve({ exitCode: timedOut ? 124 : (code ?? 1), signal, stdout, stderr });
     });
   });
+}
+
+function queueVisibleWorkerEnv(
+  command: Extract<ProjectCliCommand, { command: "run-task" }>,
+  task: QueueTask,
+  queue: QueueStatus["queue"],
+  workerRunId: string
+): Record<string, string> {
+  if (!SENIOR_DEEPSEEK_WORKERS.has(command.worker) && !/\bagent-fabric-deepseek-worker\b/.test(command.commandLine)) {
+    return {};
+  }
+  return {
+    AGENT_FABRIC_WORKER_QUEUE_VISIBLE: "1",
+    AGENT_FABRIC_QUEUE_ID: command.queueId,
+    AGENT_FABRIC_QUEUE_TASK_ID: task.queueTaskId,
+    AGENT_FABRIC_FABRIC_TASK_ID: task.fabricTaskId ?? "",
+    AGENT_FABRIC_WORKER_RUN_ID: workerRunId,
+    AGENT_FABRIC_PROJECT_PATH: queue.projectPath,
+    AGENT_FABRIC_WORKSPACE_ROOT: queue.projectPath
+  };
 }
 
 type SnapshotEntry = {

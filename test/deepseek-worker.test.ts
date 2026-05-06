@@ -434,7 +434,7 @@ describe("DeepSeek direct worker", () => {
 
     const result = await runDeepSeekWorkerCommand(parseDeepSeekWorkerArgs(["run-task", "--task-packet", packetPath, "--output", outputPath]), {
       cwd: dir,
-      env: { DEEPSEEK_API_KEY: "test-key", AGENT_FABRIC_SENIOR_MODE: "permissive" },
+      env: { DEEPSEEK_API_KEY: "test-key", AGENT_FABRIC_SENIOR_MODE: "permissive", AGENT_FABRIC_WORKER_QUEUE_VISIBLE: "1" },
       fetchImpl: async () =>
         fakeJsonResponse({
           id: "resp_senior_mode",
@@ -478,7 +478,7 @@ describe("DeepSeek direct worker", () => {
     await expect(
       runDeepSeekWorkerCommand(parseDeepSeekWorkerArgs(["run-task", "--task-packet", packetPath, "--output", outputPath, "--sensitive-context-mode", "basic"]), {
         cwd: dir,
-        env: { DEEPSEEK_API_KEY: "test-key", AGENT_FABRIC_SENIOR_MODE: "permissive" },
+        env: { DEEPSEEK_API_KEY: "test-key", AGENT_FABRIC_SENIOR_MODE: "permissive", AGENT_FABRIC_WORKER_QUEUE_VISIBLE: "1" },
         fetchImpl: async () => {
           calls += 1;
           return fakeJsonResponse({});
@@ -524,7 +524,43 @@ describe("DeepSeek direct worker", () => {
     expect(calls).toBe(0);
   });
 
-  it("allows explicit file-only Senior TASK_DIR runs when auto queueing is disabled", async () => {
+  it("rejects file-only Senior DeepSeek runs when auto queueing is disabled without an escape hatch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-fabric-deepseek-worker-"));
+    const packetPath = join(dir, "packet.json");
+    const outputPath = join(dir, "result.json");
+    let calls = 0;
+    writeFileSync(
+      packetPath,
+      JSON.stringify({
+        schema: "agent-fabric.task-packet.v1",
+        task: {
+          clientKey: "senior-lane-file-only",
+          title: "File only lane",
+          goal: "Run without queue registration only when explicitly disabled."
+        }
+      }),
+      "utf8"
+    );
+
+    await expect(
+      runDeepSeekWorkerCommand(parseDeepSeekWorkerArgs(["run-task", "--task-packet", packetPath, "--output", outputPath]), {
+        cwd: dir,
+        env: {
+          DEEPSEEK_API_KEY: "test-key",
+          AGENT_FABRIC_SENIOR_MODE: "permissive",
+          TASK_DIR: dir,
+          AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE: "off"
+        },
+        fetchImpl: async () => {
+          calls += 1;
+          return fakeJsonResponse({});
+        }
+      })
+    ).rejects.toThrow("not queue-visible");
+    expect(calls).toBe(0);
+  });
+
+  it("allows an explicit untracked Senior DeepSeek escape hatch", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-fabric-deepseek-worker-"));
     const packetPath = join(dir, "packet.json");
     const outputPath = join(dir, "result.json");
@@ -548,7 +584,8 @@ describe("DeepSeek direct worker", () => {
         DEEPSEEK_API_KEY: "test-key",
         AGENT_FABRIC_SENIOR_MODE: "permissive",
         TASK_DIR: dir,
-        AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE: "off"
+        AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE: "off",
+        AGENT_FABRIC_DEEPSEEK_ALLOW_UNTRACKED: "1"
       },
       fetchImpl: async () => {
         calls += 1;
@@ -573,6 +610,7 @@ describe("DeepSeek direct worker", () => {
     expect(calls).toBe(1);
     expect(result).toMatchObject({ status: "needs_review", outputFile: outputPath });
     expect(result.queueBacked).toBeUndefined();
+    expect(result.untrackedSeniorDirect).toBe(true);
   });
 
   it("writes proposed patches without applying them in patch-mode write", async () => {

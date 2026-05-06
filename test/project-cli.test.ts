@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FabricDaemon } from "../src/daemon.js";
-import { parseProjectCliArgs, runProjectCommand, type ProjectToolCaller } from "../src/runtime/project-cli.js";
+import { formatProjectResult, parseProjectCliArgs, runProjectCommand, type ProjectToolCaller } from "../src/runtime/project-cli.js";
 import type { BridgeRegister, BridgeSession } from "../src/types.js";
 
 describe("project CLI runner", () => {
@@ -15,6 +15,32 @@ describe("project CLI runner", () => {
     delete process.env.AGENT_FABRIC_SENIOR_MODE;
     delete process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
     delete process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER;
+  });
+
+  it("redacts approval tokens from JSON output", () => {
+    const output = formatProjectResult(
+      {
+        action: "senior_run",
+        message: "ok",
+        data: {
+          approvalToken: "queue-secret",
+          modelApproval: {
+            approvalToken: "top-secret",
+            approval: {
+              approvalToken: "nested-secret",
+              tokenExpiresAt: "2026-05-07T00:00:00.000Z"
+            }
+          }
+        }
+      },
+      true
+    );
+
+    expect(output).not.toContain("queue-secret");
+    expect(output).not.toContain("top-secret");
+    expect(output).not.toContain("nested-secret");
+    expect(output).toContain("[redacted]");
+    expect(output).toContain("tokenExpiresAt");
   });
 
   afterEach(() => {
@@ -1711,6 +1737,83 @@ describe("project CLI runner", () => {
       includeWorkerRuns: true
     });
     expect(workerStatus.workerRuns[0].metadata).toMatchObject({ taskPacketPath: packets[0].taskPacketPath, taskPacketFormat: "json" });
+    daemon.close();
+  });
+
+  it("writes bounded task context files for queue-visible DeepSeek style lanes", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-project-cli-context-run-"));
+    mkdirSync(join(projectPath, "src"), { recursive: true });
+    writeFileSync(join(projectPath, "src", "example.ts"), "export function answer() { return 42; }\n", "utf8");
+    writeFileSync(join(projectPath, "README.md"), "# Context readme\n", "utf8");
+    const packetDir = join(projectPath, "packets");
+    const tasksFile = join(projectPath, "tasks.json");
+    writeFileSync(
+      tasksFile,
+      JSON.stringify({
+        tasks: [
+          {
+            clientKey: "context",
+            title: "Use source context",
+            goal: "Use concrete source context.",
+            risk: "low",
+            priority: "normal",
+            expectedFiles: ["src/example.ts"],
+            acceptanceCriteria: ["Context includes source file."],
+            requiredTools: ["shell"],
+            requiredContextRefs: ["README.md"]
+          }
+        ]
+      }),
+      "utf8"
+    );
+    const created = await runProjectCommand(
+      {
+        command: "create",
+        json: false,
+        projectPath,
+        promptSummary: "Context run test.",
+        pipelineProfile: "balanced",
+        maxParallelAgents: 4
+      },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+    const result = await runProjectCommand(
+      {
+        command: "run-ready",
+        json: false,
+        queueId,
+        limit: 1,
+        parallel: 1,
+        taskPacketDir: packetDir,
+        taskPacketFormat: "json",
+        commandTemplate:
+          "node -e \"const fs=require('node:fs');fs.copyFileSync(process.argv[2],'context-copy.md');fs.writeFileSync('packet-title.txt',JSON.parse(fs.readFileSync(process.argv[1],'utf8')).task.title)\" {{taskPacket}} {{contextFile}}",
+        cwd: projectPath,
+        worker: "manual",
+        workspaceMode: "in_place",
+        modelProfile: "execute.cheap",
+        successStatus: "patch_ready",
+        maxOutputChars: 4_000,
+        approveToolContext: true,
+        rememberToolContext: false,
+        continueOnFailure: false,
+        allowSharedCwd: false
+      },
+      call
+    );
+
+    expect(result.action).toBe("ready_tasks_run");
+    expect(readFileSync(join(projectPath, "context-copy.md"), "utf8")).toContain("export function answer");
+    const runs = result.data.runs as Array<{ taskContextPath: string; taskContextFiles: string[] }>;
+    expect(readFileSync(runs[0].taskContextPath, "utf8")).toContain("README.md");
+    expect(runs[0].taskContextFiles).toEqual(expect.arrayContaining(["src/example.ts", "README.md"]));
     daemon.close();
   });
 

@@ -48,3 +48,5 @@ Cards use stable `@af/<name>` handles. Default names are assigned in this order:
 - Patch-ready output must stay pending until a senior review records `reviewedBy` and `reviewSummary`.
 - Queue-scoped model approval is auditable: use `--approve-model-calls` instead of manually approving ten duplicate DeepSeek preflights.
 - Do not launch Senior Jcode lanes with manual `nohup jcode ...` commands. Use `senior-run` or `run-ready --worker jcode-deepseek` so heartbeats, timeout handling, patch artifacts, and review gates stay queue-visible.
+- Do not launch Senior DeepSeek direct lanes with bare `agent-fabric-deepseek-worker run-task`. Queue runners mark the shell as `AGENT_FABRIC_WORKER_QUEUE_VISIBLE=1`, and untracked direct runs require the explicit `AGENT_FABRIC_DEEPSEEK_ALLOW_UNTRACKED=1` escape hatch.
+- DeepSeek direct task packets include a bounded generated context sidecar from `expectedFiles` and file-like `requiredContextRefs`; use `{{contextFile}}` in custom command templates when overriding the default runner.

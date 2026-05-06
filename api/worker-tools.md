@@ -29,6 +29,8 @@ Use the separate `jcode-deepseek` worker value when a queue task should run thro
 
 Senior-mode supervisors should not substitute untracked local worker pools for DeepSeek lanes. With `AGENT_FABRIC_SENIOR_MODE=permissive`, the project CLI validates execution workers before they can start, rejects DeepSeek-labeled command templates that launch Codex/Claude/local harnesses, and defaults broad work to queue-backed `deepseek-direct` lanes in git worktrees. A worker counts only after `fabric_task_start_worker`, `project_queue_assign_worker`, and `fabric_task_*` events/checkpoints make it visible in the queue.
 
+Senior-mode `agent-fabric-deepseek-worker run-task` calls require queue visibility. Queue runners set `AGENT_FABRIC_WORKER_QUEUE_VISIBLE=1` and queue/task/run ids before launching the worker. A manual direct run with `AGENT_FABRIC_SENIOR_MODE=permissive` is rejected unless `TASK_DIR` auto-queue registration is active or `AGENT_FABRIC_DEEPSEEK_ALLOW_UNTRACKED=1` is set as an explicit human escape hatch. DeepSeek task packet generation writes a bounded `{{contextFile}}` sidecar from expected source/context files so direct DeepSeek workers can produce concrete diffs instead of filename-only guesses.
+
 Codex and Claude Code integrations should prefer the compact worker-card tools when they want native-feeling background agents:
 
 - `fabric_spawn_agents`
