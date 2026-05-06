@@ -2,6 +2,15 @@
 
 Claude Code should use Agent Fabric as the durable worker substrate when the user asks for Senior mode or DeepSeek/Jcode worker lanes.
 
+This checkout is the active implementation tree. Do not switch to another
+local clone or private overlay unless the operator explicitly asks for that.
+
+Private preferences and operating notes stay in this checkout as gitignored
+files. Source `agent-fabric.local.env` when local defaults are needed, and read
+the local gitignored `decisions/` directory when present for architecture intent
+and roadmap context. Those decision records are agent memory, not public release
+material.
+
 ## Rules
 
 - Do not satisfy "10 DeepSeek workers" with Claude Code background tasks or ad hoc shells.

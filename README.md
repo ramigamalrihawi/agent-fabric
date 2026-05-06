@@ -12,6 +12,7 @@ It is built for developers who already use tools like Claude Code, Codex, OpenHa
 - **Do not use it for:** a hosted multi-tenant swarm platform, a model gateway replacement, or a coding agent runtime replacement.
 - **Core idea:** keep execution in your existing tools, but put task state, collab, checkpoints, memory review, cost gates, and patch review in one local substrate.
 - **Fastest way to understand it:** read the [2-minute demo script](docs/demo-script.md), inspect the [example task packet](docs/examples/task-packet.md), then run `npm test`.
+- **Local/private setup:** keep private operating notes and preferences in ignored local files; see [Local Private Config And Agent Memory](docs/local-private-config.md).
 
 ## Why It Exists
 
@@ -129,6 +130,26 @@ flowchart TD
 ```
 
 SQLite is canonical. Generated views, SSE pushes, and worker packets are projections over durable state.
+
+## Local Private Config And Agent Memory
+
+Use one checkout as the active Agent Fabric development tree. Keep source,
+tests, API docs, and public examples there. Do not maintain a second active
+private source copy unless you are intentionally testing migration or sync
+logic.
+
+Personal operating material can still live in this checkout, but it is ignored
+by Git:
+
+- `agent-fabric.local.env` for local environment defaults and private harness
+  preferences.
+- `decisions/` for local architecture intent and roadmap notes that agents
+  should read when present.
+- `.agent-fabric-local/` and `artifacts/` for generated local working state.
+
+Runtime state belongs under `~/.agent-fabric`. If a local decision or note
+should become public, import it one file at a time after scrubbing local paths,
+secrets, provider account details, and personal workflow assumptions.
 
 ## Quick Start
 
@@ -258,8 +279,11 @@ Useful feedback right now:
 | `test/` | Vitest coverage for daemon, queues, collab, cost, memory, workers, desktop, and DeepSeek adapter |
 | `api/` | public tool surface notes |
 | `pillars/` | design notes for collaboration, memory, and cost pillars |
-| `decisions/` | ADR-style records for architecture decisions |
 | `workers/` | optional worker adapters |
+
+Local ignored files may include `agent-fabric.local.env`, `decisions/`,
+`.agent-fabric-local/`, and generated `artifacts/`. Agents should read local
+`decisions/` when it exists, but public docs and tests must not require it.
 
 ## Safety Model
 

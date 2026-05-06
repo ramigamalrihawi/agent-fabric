@@ -288,7 +288,9 @@ type CachingCandidate = {
 
 The cost tools depend on:
 
-- LiteLLM proxy running at `127.0.0.1:4000` for coverable clients (configured in [decisions/0003](../decisions/0003-litellm-as-universal-proxy.md)).
+- LiteLLM proxy running at `127.0.0.1:4000` for coverable clients. Local ignored
+  decision notes may contain the historical proxy ADR, but the public API docs
+  do not require those notes.
 - Agent-fabric daemon HTTP ingest on `127.0.0.1:4521` unless disabled with `AGENT_FABRIC_HTTP_PORT=off`. HTTP ingest requires `AGENT_FABRIC_COST_INGEST_TOKEN`; POST callers send `Authorization: Bearer <token>`.
 - `agent-fabric-cost-poll` for cache refreshes from LiteLLM, Azure Cost Management, RunPod, and OpenRouter.
 - Azure Cost Management API access via either `AZURE_SUBSCRIPTION_ID` + service-principal credentials or the active `az` CLI login. Without `AZURE_SUBSCRIPTION_ID`, the poller checks every enabled CLI subscription it can read.

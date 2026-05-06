@@ -2,6 +2,15 @@
 
 When the user asks for Senior mode, use Agent Fabric as the worker substrate and keep Codex as the senior harness.
 
+This checkout is the active source tree. Do not switch to another local clone
+or private overlay unless the operator explicitly asks for that.
+
+Private operating material stays in this checkout as gitignored files. Source
+`agent-fabric.local.env` when local preferences are needed, and read the local
+gitignored `decisions/` directory when present for architecture intent and
+roadmap context. Those decision records are agent memory, not public release
+material.
+
 ## Senior-Mode Defaults
 
 - Spawn execution workers through Agent Fabric tools or `agent-fabric-project`, not through untracked native Codex subagents.

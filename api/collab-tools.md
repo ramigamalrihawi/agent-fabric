@@ -9,7 +9,10 @@ type ResultEnvelope<T> = { ok: true; tool: string; data: T; warnings?: string[] 
                       | { ok: false; tool: string; code: string; message: string; retryable: boolean };
 ```
 
-Caller identity comes from the bridge/session protocol, not from tool input. Every mutation is bound to a server-issued `sessionId` and idempotency key as described in [decisions/0008](../decisions/0008-bridge-session-protocol.md).
+Caller identity comes from the bridge/session protocol, not from tool input.
+Every mutation is bound to a server-issued `sessionId` and idempotency key. The
+original ADR note may exist in the local ignored `decisions/` directory, but
+public API docs must be usable without it.
 
 ## `collab_send`
 

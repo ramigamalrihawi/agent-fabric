@@ -2,7 +2,9 @@
 
 These tools implement the durable control plane for ADR-0014's A -> B -> C -> A-critique workflow. They do **not** call models themselves. A model-calling orchestrator or an agent drives model calls, then records each revision/critique here so the daemon owns state, audit, idempotency, human questions, and accepted-plan memory writes.
 
-All mutating tools require the bridge/session idempotency key described in [decisions/0008](../decisions/0008-bridge-session-protocol.md).
+All mutating tools require the bridge/session idempotency key described by the
+bridge/session protocol. The original ADR note may exist in the local ignored
+`decisions/` directory, but public API docs must be usable without it.
 
 ## `plan_chain_start`
 

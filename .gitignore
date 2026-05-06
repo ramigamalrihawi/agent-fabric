@@ -12,3 +12,16 @@ __pycache__/
 *.sock
 
 .DS_Store
+
+# Local/private operating material. Keep public Git source-only.
+decisions/
+artifacts/
+.agent-fabric/
+.agent-fabric-local/
+agent-fabric.local.env
+*.local.md
+*.local.json
+*.private.md
+*.env
+*.env.*
+!.env.example
