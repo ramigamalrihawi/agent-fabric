@@ -1,6 +1,7 @@
 import { FabricError } from "./errors.js";
 
 export type ApprovalCliDecision = "allow" | "compact" | "downgrade" | "cancel";
+type ApprovalScope = "call" | "chain" | "queue" | "session" | "day";
 
 export type ApprovalCliCommand =
   | {
@@ -14,7 +15,8 @@ export type ApprovalCliCommand =
       command: "prompt";
       json: boolean;
       workspaceRoot?: string;
-      scope: "call" | "chain" | "session" | "day";
+      scope: ApprovalScope;
+      boundResourceId?: string;
       expiresInSeconds?: number;
       note?: string;
     }
@@ -23,7 +25,8 @@ export type ApprovalCliCommand =
       json: boolean;
       requestId: string;
       decision: ApprovalCliDecision;
-      scope: "call" | "chain" | "session" | "day";
+      scope: ApprovalScope;
+      boundResourceId?: string;
       expiresInSeconds?: number;
       note?: string;
     }
@@ -64,6 +67,7 @@ export function parseApprovalCliArgs(argv: string[]): ApprovalCliCommand {
       json: flags.json,
       workspaceRoot: flags.workspaceRoot,
       scope: flags.scope,
+      boundResourceId: flags.boundResourceId,
       expiresInSeconds: flags.expiresInSeconds,
       note: flags.note
     };
@@ -79,6 +83,7 @@ export function parseApprovalCliArgs(argv: string[]): ApprovalCliCommand {
       requestId,
       decision: command === "approve" ? "allow" : (command as ApprovalCliDecision),
       scope: flags.scope,
+      boundResourceId: flags.boundResourceId,
       expiresInSeconds: flags.expiresInSeconds,
       note: flags.note
     };
@@ -115,8 +120,8 @@ export function approvalHelp(): string {
   return [
     "Usage:",
     "  agent-fabric-approve list [--json] [--workspace <path>] [--include-expired] [--max <n>]",
-    "  agent-fabric-approve prompt [--workspace <path>] [--scope call|chain|session|day] [--expires <seconds>] [--note <text>]",
-    "  agent-fabric-approve approve <requestId> [--scope call|chain|session|day] [--expires <seconds>] [--note <text>] [--json]",
+    "  agent-fabric-approve prompt [--workspace <path>] [--scope call|chain|queue|session|day] [--queue <queueId>] [--bound-resource <id>] [--expires <seconds>] [--note <text>]",
+    "  agent-fabric-approve approve <requestId> [--scope call|chain|queue|session|day] [--queue <queueId>] [--bound-resource <id>] [--expires <seconds>] [--note <text>] [--json]",
     "  agent-fabric-approve compact <requestId> [--note <text>] [--json]",
     "  agent-fabric-approve downgrade <requestId> [--note <text>] [--json]",
     "  agent-fabric-approve cancel <requestId> [--note <text>] [--json]"
@@ -128,7 +133,8 @@ type ParsedFlags = {
   workspaceRoot?: string;
   includeExpired: boolean;
   max?: number;
-  scope: "call" | "chain" | "session" | "day";
+  scope: ApprovalScope;
+  boundResourceId?: string;
   expiresInSeconds?: number;
   note?: string;
 };
@@ -152,6 +158,12 @@ function parseFlags(args: string[]): ParsedFlags {
       flags.max = parsePositiveInt(requiredValue(args, ++i, arg), "max");
     } else if (arg === "--scope") {
       flags.scope = parseScope(requiredValue(args, ++i, arg));
+    } else if (arg === "--bound-resource") {
+      flags.boundResourceId = requiredValue(args, ++i, arg);
+    } else if (arg === "--queue") {
+      const queueId = requiredValue(args, ++i, arg);
+      flags.scope = "queue";
+      flags.boundResourceId = `project_queue:${queueId}`;
     } else if (arg === "--expires") {
       flags.expiresInSeconds = parsePositiveInt(requiredValue(args, ++i, arg), "expires");
     } else if (arg === "--note") {
@@ -170,9 +182,9 @@ function requiredValue(args: string[], index: number, flag: string): string {
   return value;
 }
 
-function parseScope(value: string): "call" | "chain" | "session" | "day" {
-  if (["call", "chain", "session", "day"].includes(value)) return value as "call" | "chain" | "session" | "day";
-  throw new FabricError("INVALID_INPUT", "scope must be call, chain, session, or day", false);
+function parseScope(value: string): ApprovalScope {
+  if (["call", "chain", "queue", "session", "day"].includes(value)) return value as ApprovalScope;
+  throw new FabricError("INVALID_INPUT", "scope must be call, chain, queue, session, or day", false);
 }
 
 function parsePositiveInt(value: string, field: string): number {

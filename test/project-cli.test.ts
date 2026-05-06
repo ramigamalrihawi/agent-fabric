@@ -1,12 +1,27 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FabricDaemon } from "../src/daemon.js";
 import { parseProjectCliArgs, runProjectCommand, type ProjectToolCaller } from "../src/runtime/project-cli.js";
 import type { BridgeRegister, BridgeSession } from "../src/types.js";
 
 describe("project CLI runner", () => {
+  const originalSeniorMode = process.env.AGENT_FABRIC_SENIOR_MODE;
+  const originalSeniorNonDeepSeek = process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
+
+  beforeEach(() => {
+    delete process.env.AGENT_FABRIC_SENIOR_MODE;
+    delete process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
+  });
+
+  afterEach(() => {
+    if (originalSeniorMode === undefined) delete process.env.AGENT_FABRIC_SENIOR_MODE;
+    else process.env.AGENT_FABRIC_SENIOR_MODE = originalSeniorMode;
+    if (originalSeniorNonDeepSeek === undefined) delete process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
+    else process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS = originalSeniorNonDeepSeek;
+  });
+
   it("parses create and launch commands", () => {
     expect(
       parseProjectCliArgs([
@@ -198,6 +213,12 @@ describe("project CLI runner", () => {
       worker: "deepseek-direct",
       taskPacketDir: "/tmp/packets"
     });
+    expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1", "--worker", "jcode-deepseek", "--task-packet-dir", "/tmp/packets"])).toMatchObject({
+      command: "run-ready",
+      queueId: "pqueue_1",
+      worker: "jcode-deepseek",
+      taskPacketDir: "/tmp/packets"
+    });
 
     expect(
       parseProjectCliArgs([
@@ -235,6 +256,26 @@ describe("project CLI runner", () => {
       adaptiveRateLimit: false,
       allowConcurrentRunner: true
     });
+
+    const previousSeniorMode = process.env.AGENT_FABRIC_SENIOR_MODE;
+    process.env.AGENT_FABRIC_SENIOR_MODE = "permissive";
+    try {
+      expect(parseProjectCliArgs(["factory-run", "--queue", "pqueue_1"])).toMatchObject({
+        command: "factory-run",
+        queueId: "pqueue_1",
+        allowSensitiveContext: true,
+        sensitiveContextMode: "off"
+      });
+      expect(parseProjectCliArgs(["factory-run", "--queue", "pqueue_1", "--sensitive-context-mode", "strict"])).toMatchObject({
+        command: "factory-run",
+        queueId: "pqueue_1",
+        allowSensitiveContext: false,
+        sensitiveContextMode: "strict"
+      });
+    } finally {
+      if (previousSeniorMode === undefined) delete process.env.AGENT_FABRIC_SENIOR_MODE;
+      else process.env.AGENT_FABRIC_SENIOR_MODE = previousSeniorMode;
+    }
 
     expect(parseProjectCliArgs(["set-tool-policy", "--project", "/tmp/workspace/app", "--kind", "mcp_server", "--value", "github", "--status", "rejected"])).toMatchObject({
       command: "set-tool-policy",
@@ -284,6 +325,23 @@ describe("project CLI runner", () => {
       queueId: "pqueue_1",
       includeCompleted: true,
       maxEventsPerLane: 3
+    });
+
+    expect(parseProjectCliArgs(["fabric-spawn-agents", "--queue", "pqueue_1", "--count", "10"])).toMatchObject({
+      command: "fabric-spawn-agents",
+      queueId: "pqueue_1",
+      count: 10,
+      worker: "deepseek-direct",
+      workspaceMode: "git_worktree",
+      modelProfile: "deepseek-v4-pro:max"
+    });
+
+    expect(parseProjectCliArgs(["fabric-message-agent", "--queue", "pqueue_1", "--agent", "@af/rami-123", "--body", "revise", "--ask"])).toMatchObject({
+      command: "fabric-message-agent",
+      queueId: "pqueue_1",
+      agent: "@af/rami-123",
+      body: "revise",
+      ask: true
     });
 
     expect(parseProjectCliArgs(["dashboard", "--queue", "pqueue_1", "--include-completed", "--max-events", "2"])).toMatchObject({
@@ -343,6 +401,142 @@ describe("project CLI runner", () => {
       decision: "reject",
       remember: true,
       note: "Not needed"
+    });
+  });
+
+  it("parses version, help, Senior doctor, Senior run, and reviewed patch acceptance commands", () => {
+    expect(parseProjectCliArgs(["--version"])).toMatchObject({ command: "version" });
+    expect(parseProjectCliArgs(["factory-run", "--help"])).toMatchObject({ command: "help" });
+    expect(parseProjectCliArgs(["senior-doctor", "--project", "/tmp/workspace/app", "--queue", "pqueue_1"])).toMatchObject({
+      command: "senior-doctor",
+      projectPath: "/tmp/workspace/app",
+      queueId: "pqueue_1"
+    });
+    expect(
+      parseProjectCliArgs([
+        "senior-run",
+        "--project",
+        "/tmp/workspace/app",
+        "--plan-file",
+        "plan.md",
+        "--count",
+        "10",
+        "--worker",
+        "jcode-deepseek",
+        "--approve-model-calls",
+        "--progress-file",
+        ".agent-fabric/progress.md",
+        "--dry-run"
+      ])
+    ).toMatchObject({
+      command: "senior-run",
+      projectPath: "/tmp/workspace/app",
+      planFile: "plan.md",
+      count: 10,
+      worker: "jcode-deepseek",
+      approveModelCalls: true,
+      progressFile: ".agent-fabric/progress.md",
+      dryRun: true
+    });
+    expect(
+      parseProjectCliArgs([
+        "fabric-accept-patch",
+        "--queue",
+        "pqueue_1",
+        "--queue-task",
+        "pqtask_1",
+        "--reviewed-by",
+        "Codex",
+        "--review-summary",
+        "Reviewed patch and tests."
+      ])
+    ).toMatchObject({
+      command: "fabric-accept-patch",
+      reviewedBy: "Codex",
+      reviewSummary: "Reviewed patch and tests."
+    });
+  });
+
+  it("defaults Senior mode worker execution to queue-backed DeepSeek lanes", () => {
+    process.env.AGENT_FABRIC_SENIOR_MODE = "permissive";
+
+    expect(parseProjectCliArgs(["claim-next", "--queue", "pqueue_1"])).toMatchObject({
+      command: "claim-next",
+      queueId: "pqueue_1",
+      worker: "deepseek-direct",
+      workspaceMode: "git_worktree",
+      modelProfile: "deepseek-v4-pro:max"
+    });
+
+    expect(parseProjectCliArgs(["launch", "--queue", "pqueue_1"])).toMatchObject({
+      command: "launch",
+      queueId: "pqueue_1",
+      worker: "deepseek-direct",
+      workspaceMode: "git_worktree",
+      modelProfile: "deepseek-v4-pro:max"
+    });
+
+    expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1"])).toMatchObject({
+      command: "run-ready",
+      queueId: "pqueue_1",
+      worker: "deepseek-direct",
+      workspaceMode: "git_worktree",
+      modelProfile: "deepseek-v4-pro:max",
+      parallel: 10,
+      taskPacketDir: join(tmpdir(), "agent-fabric-factory", "pqueue_1", "task-packets"),
+      cwdTemplate: join(tmpdir(), "agent-fabric-factory", "pqueue_1", "worktrees", "{{queueTaskId}}")
+    });
+
+    expect(parseProjectCliArgs(["factory-run", "--queue", "pqueue_1"])).toMatchObject({
+      command: "factory-run",
+      queueId: "pqueue_1",
+      parallel: 10,
+      allowSensitiveContext: true,
+      sensitiveContextMode: "off"
+    });
+  });
+
+  it("rejects non-DeepSeek execution workers in Senior mode unless explicitly allowed", async () => {
+    process.env.AGENT_FABRIC_SENIOR_MODE = "permissive";
+
+    expect(() => parseProjectCliArgs(["run-ready", "--queue", "pqueue_1", "--worker", "local-cli"])).toThrow(
+      "must use Agent Fabric queue-backed DeepSeek workers"
+    );
+    expect(() =>
+      parseProjectCliArgs(["run-ready", "--queue", "pqueue_1", "--worker", "deepseek-direct", "--command-template", "codex exec {{taskPacket}}"])
+    ).toThrow("cannot record worker=deepseek-direct");
+    expect(() => parseProjectCliArgs(["factory-run", "--queue", "pqueue_1", "--deepseek-worker-command", "claude"])).toThrow(
+      "must launch agent-fabric-deepseek-worker"
+    );
+
+    await expect(
+      runProjectCommand(
+        {
+          command: "run-ready",
+          json: false,
+          queueId: "pqueue_1",
+          worker: "ramicode",
+          workspaceMode: "in_place",
+          modelProfile: "execute.cheap",
+          taskPacketFormat: "json",
+          parallel: 1,
+          allowSharedCwd: false,
+          successStatus: "patch_ready",
+          maxOutputChars: 8_000,
+          approveToolContext: false,
+          rememberToolContext: false,
+          continueOnFailure: false
+        },
+        async () => {
+          throw new Error("run-ready should fail before tool calls");
+        }
+      )
+    ).rejects.toThrow("must use Agent Fabric queue-backed DeepSeek workers");
+
+    process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS = "1";
+    expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1", "--worker", "local-cli"])).toMatchObject({
+      command: "run-ready",
+      worker: "local-cli"
     });
   });
 
@@ -1358,6 +1552,7 @@ describe("project CLI runner", () => {
 
     expect(result.action).toBe("factory_run_preview");
     expect(result.message).toContain("factory-run preview");
+    expect(result.data.commandTemplate).toContain("AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=off");
     expect(result.data.commandTemplate).toContain("--json");
     expect(result.data.commandTemplate).toContain("--role {{deepseekRole}}");
     expect(result.data.commandTemplate).toContain("--sensitive-context-mode strict");
@@ -1423,6 +1618,120 @@ describe("project CLI runner", () => {
     });
     expect(workerStatus.workerRuns[0].metadata).toMatchObject({ taskPacketPath: packets[0].taskPacketPath, taskPacketFormat: "json" });
     daemon.close();
+  });
+
+  it("runs jcode-deepseek ready tasks through the configured dispatcher", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-project-cli-jcode-ready-"));
+    const packetDir = join(projectPath, "packets");
+    const sandboxDir = join(projectPath, "sandboxes");
+    const dispatcher = join(projectPath, "fake-jcode-deepseek.sh");
+    const oldDispatcher = process.env.AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER;
+    writeFileSync(
+      dispatcher,
+      [
+        "#!/bin/sh",
+        "set -eu",
+        "packet=\"$1\"",
+        "result=\"$PWD/jcode-worker-result.json\"",
+        "node -e 'const fs=require(\"node:fs\");const packet=process.argv[1];const result=process.argv[2];fs.writeFileSync(result, JSON.stringify({schema:\"agent-fabric.deepseek-worker-result.v1\", result:{status:\"completed\", summary:\"jcode dispatcher completed.\", changedFilesSuggested:[packet], testsSuggested:[\"dispatcher smoke\"]}}));' \"$packet\" \"$result\"",
+        "echo \"$result\"",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+    chmodSync(dispatcher, 0o755);
+    process.env.AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER = dispatcher;
+
+    try {
+      const created = await runProjectCommand(
+        {
+          command: "create",
+          json: false,
+          projectPath,
+          promptSummary: "jcode DeepSeek run-ready test.",
+          pipelineProfile: "balanced",
+          maxParallelAgents: 4
+        },
+        call
+      );
+      const queueId = created.data.queueId as string;
+      await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile: writeTasksFile(projectPath), approveQueue: true }, call);
+      await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+      const blocked = await runProjectCommand(
+        {
+          command: "run-ready",
+          json: false,
+          queueId,
+          limit: 1,
+          parallel: 1,
+          taskPacketDir: packetDir,
+          taskPacketFormat: "markdown",
+          cwdTemplate: `${sandboxDir}/{{queueTaskId}}`,
+          worker: "jcode-deepseek",
+          workspaceMode: "sandbox",
+          modelProfile: "deepseek-v4-pro:max",
+          successStatus: "patch_ready",
+          maxOutputChars: 4_000,
+          approveToolContext: true,
+          rememberToolContext: false,
+          continueOnFailure: false,
+          allowSharedCwd: false
+        },
+        call
+      );
+      const skipped = blocked.data.skipped as Array<{ requestId?: string; reason?: string }>;
+      expect(skipped[0]).toMatchObject({ reason: "model approval required" });
+      expect(typeof skipped[0].requestId).toBe("string");
+      const approval = await call<{ approvalToken: string }>("llm_approve", {
+        requestId: skipped[0].requestId,
+        decision: "allow",
+        scope: "call",
+        expiresInSeconds: 60
+      });
+
+      const result = await runProjectCommand(
+        {
+          command: "run-ready",
+          json: false,
+          queueId,
+          limit: 1,
+          parallel: 1,
+          taskPacketDir: packetDir,
+          taskPacketFormat: "markdown",
+          cwdTemplate: `${sandboxDir}/{{queueTaskId}}`,
+          worker: "jcode-deepseek",
+          workspaceMode: "sandbox",
+          modelProfile: "deepseek-v4-pro:max",
+          approvalToken: approval.approvalToken,
+          successStatus: "patch_ready",
+          maxOutputChars: 4_000,
+          approveToolContext: true,
+          rememberToolContext: false,
+          continueOnFailure: false,
+          allowSharedCwd: false
+        },
+        call
+      );
+
+      expect(result.action).toBe("ready_tasks_run");
+      expect(result.data.runCount).toBe(1);
+      const runs = result.data.runs as Array<{ queueTaskId: string; taskPacketPath: string; taskPacketFormat: string; structuredResult: Record<string, unknown> }>;
+      expect(runs[0].taskPacketFormat).toBe("markdown");
+      expect(readFileSync(runs[0].taskPacketPath, "utf8")).toContain("# Run command");
+      expect(runs[0].structuredResult).toMatchObject({
+        status: "completed",
+        summary: "jcode dispatcher completed."
+      });
+      expect(String(runs[0].structuredResult.source)).toMatch(new RegExp(`/sandboxes/${runs[0].queueTaskId}/jcode-worker-result\\.json$`));
+    } finally {
+      if (oldDispatcher === undefined) delete process.env.AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER;
+      else process.env.AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER = oldDispatcher;
+      daemon.close();
+    }
   });
 
   it("captures structured DeepSeek worker result artifacts in task checkpoints", async () => {

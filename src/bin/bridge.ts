@@ -33,6 +33,67 @@ proxyTool("fabric_inspect_context_package", "Inspect the sanitized context packa
   requestId: z.string(),
   workspaceRoot: z.string().optional()
 });
+proxyTool("fabric_spawn_agents", "Spawn queue-visible Agent Fabric worker lanes for Codex-style background work.", {
+  queueId: z.string(),
+  count: z.number().int().positive().max(16).optional(),
+  worker: z.enum(["deepseek-direct", "jcode-deepseek"]).optional(),
+  workspaceMode: z.enum(["git_worktree", "sandbox"]).optional(),
+  modelProfile: z.string().optional(),
+  maxRuntimeMinutes: z.number().int().positive().optional(),
+  allowPartial: z.boolean().optional()
+});
+proxyTool("fabric_list_agents", "Return Codex-style Agent Fabric background worker cards for a project queue.", {
+  queueId: z.string(),
+  includeCompleted: z.boolean().optional(),
+  maxEventsPerLane: z.number().int().positive().optional()
+});
+proxyTool("fabric_open_agent", "Open one Agent Fabric worker card with transcript, checkpoints, task detail, and artifacts.", {
+  queueId: z.string(),
+  agent: z.string(),
+  maxEventsPerRun: z.number().int().positive().optional()
+});
+proxyTool("fabric_message_agent", "Send a durable message or ask to an Agent Fabric worker handle such as @af/rami-123abc.", {
+  queueId: z.string(),
+  agent: z.string(),
+  body: z.string(),
+  kind: z.string().optional(),
+  ask: z.boolean().optional(),
+  urgency: z.string().optional(),
+  refs: z.array(z.string()).optional()
+});
+proxyTool("fabric_wait_agents", "Return a non-blocking wait snapshot for Agent Fabric worker cards.", {
+  queueId: z.string(),
+  agents: z.array(z.string()).optional(),
+  targetStatuses: z.array(z.string()).optional(),
+  maxEventsPerLane: z.number().int().positive().optional()
+});
+proxyTool("fabric_accept_patch", "Accept a patch-ready Agent Fabric worker result without applying files locally.", {
+  queueId: z.string(),
+  agent: z.string().optional(),
+  queueTaskId: z.string().optional(),
+  summary: z.string().optional(),
+  reviewedBy: z.string().optional(),
+  reviewSummary: z.string().optional()
+});
+proxyTool("fabric_senior_start", "Start or attach to a Senior-mode Agent Fabric queue and return Codex-like worker cards/progress.", {
+  queueId: z.string().optional(),
+  projectPath: z.string().optional(),
+  promptSummary: z.string().optional(),
+  title: z.string().optional(),
+  count: z.number().int().positive().max(16).optional(),
+  worker: z.enum(["deepseek-direct", "jcode-deepseek"]).optional(),
+  modelProfile: z.string().optional(),
+  approveModelCalls: z.boolean().optional(),
+  allowPartial: z.boolean().optional()
+});
+proxyTool("fabric_senior_status", "Return Senior-mode worker cards and resumable progress for an Agent Fabric queue.", {
+  queueId: z.string(),
+  maxEventsPerLane: z.number().int().positive().optional()
+});
+proxyTool("fabric_senior_resume", "Return the next Senior-mode command and progress snapshot for resuming an Agent Fabric queue.", {
+  queueId: z.string(),
+  maxEventsPerLane: z.number().int().positive().optional()
+});
 proxyTool("fabric_notification_self_test_start", "Create a notification visibility challenge for this bridge session.", {
   ttlSeconds: z.number().int().positive().optional()
 });
@@ -218,7 +279,7 @@ proxyTool("llm_approve_pending", "List pending LLM approval requests for IDE or 
 proxyTool("llm_approve", "Record a human decision for a pending LLM approval request and optionally issue an approval token.", {
   requestId: z.string(),
   decision: z.enum(["allow", "compact", "downgrade", "cancel"]),
-  scope: z.enum(["call", "chain", "session", "day"]).optional(),
+  scope: z.enum(["call", "chain", "queue", "session", "day"]).optional(),
   boundResourceId: z.string().optional(),
   expiresInSeconds: z.number().int().positive().optional(),
   note: z.string().optional()
@@ -335,21 +396,21 @@ proxyTool("project_queue_task_detail", "Read one queue task drawer/detail model 
   queueId: z.string(),
   queueTaskId: z.string(),
   includeResume: z.boolean().optional(),
-  preferredWorker: z.enum(["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"]).optional(),
+  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional(),
   maxEventsPerRun: z.number().int().positive().optional(),
   maxModelApprovals: z.number().int().positive().optional()
 });
 proxyTool("project_queue_resume_task", "Build a queue-level resume packet from the latest worker checkpoint.", {
   queueId: z.string(),
   queueTaskId: z.string(),
-  preferredWorker: z.enum(["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"]).optional()
+  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional()
 });
 proxyTool("project_queue_task_packet", "Build a copyable queue task or resume packet for worker handoff.", {
   queueId: z.string(),
   queueTaskId: z.string(),
   format: z.enum(["json", "markdown"]).optional(),
   includeResume: z.boolean().optional(),
-  preferredWorker: z.enum(["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"]).optional(),
+  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional(),
   workspaceMode: z.enum(["in_place", "git_worktree", "clone", "sandbox"]).optional(),
   workspacePath: z.string().optional(),
   modelProfile: z.string().optional(),
@@ -405,7 +466,7 @@ proxyTool("project_queue_launch_plan", "Read a non-mutating launch plan with lau
 proxyTool("project_queue_claim_next", "Atomically claim one dependency-free ready queue task for a worker gateway.", {
   queueId: z.string(),
   workerRunId: z.string().optional(),
-  worker: z.enum(["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"]).optional(),
+  worker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional(),
   workspaceMode: z.enum(["in_place", "git_worktree", "clone", "sandbox"]).optional(),
   workspacePath: z.string().optional(),
   modelProfile: z.string().optional(),
@@ -436,15 +497,27 @@ proxyTool("project_queue_agent_lanes", "Read per-worker lanes for the Agent Fabr
   includeCompleted: z.boolean().optional(),
   maxEventsPerLane: z.number().int().positive().optional()
 });
+proxyTool("project_queue_approve_model_calls", "Issue one audited queue-scoped model approval token for matching Senior DeepSeek worker calls.", {
+  queueId: z.string(),
+  candidateModel: z.string().optional(),
+  requestedProvider: z.string().optional(),
+  requestedReasoning: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
+  expiresInSeconds: z.number().int().positive().optional(),
+  note: z.string().optional()
+});
+proxyTool("project_queue_progress_report", "Return a resumable Senior-mode queue progress report with worker cards, blockers, patch-ready tasks, and next commands.", {
+  queueId: z.string(),
+  maxEventsPerLane: z.number().int().positive().optional()
+});
 proxyTool("project_queue_approval_inbox", "Read queue-scoped tool/context and model-call approvals.", {
   queueId: z.string(),
   includeExpired: z.boolean().optional(),
   limit: z.number().int().positive().optional()
 });
-proxyTool("project_queue_assign_worker", "Mark a ready queue task as assigned to a worker run.", {
+proxyTool("project_queue_assign_worker", "Mark a ready queue task as assigned to a live worker run.", {
   queueId: z.string(),
   queueTaskId: z.string(),
-  workerRunId: z.string().optional()
+  workerRunId: z.string()
 });
 proxyTool("project_queue_update_task", "Update queue-task status, worker link, summary, patch refs, and test refs.", {
   queueId: z.string(),
@@ -546,7 +619,7 @@ proxyTool("fabric_task_create", "Create a durable fabric task before assigning i
 });
 proxyTool("fabric_task_start_worker", "Start or register an external worker run for a durable fabric task.", {
   taskId: z.string(),
-  worker: z.enum(["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"]),
+  worker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]),
   projectPath: z.string(),
   workspaceMode: z.enum(["in_place", "git_worktree", "clone", "sandbox"]),
   modelProfile: z.string(),
@@ -596,7 +669,7 @@ proxyTool("fabric_task_status", "Read durable task, worker run, event, and check
 });
 proxyTool("fabric_task_resume", "Return the smallest useful prompt/state for a worker to continue a durable task.", {
   taskId: z.string(),
-  preferredWorker: z.enum(["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"]).optional()
+  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional()
 });
 proxyTool("fabric_task_finish", "Mark a durable fabric task completed, failed, or canceled.", {
   taskId: z.string(),

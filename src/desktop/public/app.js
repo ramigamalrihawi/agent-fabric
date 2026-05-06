@@ -1,20 +1,23 @@
+const SENIOR_CLAIM_DEFAULTS = {
+  worker: "deepseek-direct",
+  workspaceMode: "git_worktree",
+  workspacePath: "",
+  modelProfile: "deepseek-v4-pro:max",
+  maxRuntimeMinutes: "",
+  batchLimit: 10
+};
+
 const state = {
   queues: [],
   selectedQueueId: null,
-  claimDefaults: {
-    worker: "local-cli",
-    workspaceMode: "git_worktree",
-    workspacePath: "",
-    modelProfile: "execute.cheap",
-    maxRuntimeMinutes: "",
-    batchLimit: 4
-  },
+  claimDefaults: { ...SENIOR_CLAIM_DEFAULTS },
   dashboard: null,
   matrix: null,
   actionInbox: null,
   approvals: null,
   timeline: null,
   lanes: null,
+  lastSnapshotAt: null,
   readiness: null,
   launchPlan: null,
   readyPacketLinks: null,
@@ -27,13 +30,19 @@ const state = {
   activeTab: "dashboard",
   apiToken: null,
   theaterFocus: false,
+  theaterOnlyActive: true,
+  commandPaletteOpen: false,
+  commandPaletteQuery: "",
+  commandPaletteIndex: 0,
+  commandPaletteReturnFocus: null,
+  pendingActions: new Set(),
   notices: [],
   nextNoticeId: 1,
   lastPolicyResult: null,
   lastImprovedPrompt: ""
 };
 
-const DESKTOP_PREFS_KEY = "agent-fabric.desktop.preferences.v1";
+const DESKTOP_PREFS_KEY = "agent-fabric.desktop.preferences.v2";
 const VALID_TABS = new Set(["dashboard", "pipeline", "tasks", "matrix", "approvals", "memory", "context", "model-brain", "theater", "activity"]);
 const TAB_LABELS = {
   dashboard: "Dashboard",
@@ -71,6 +80,73 @@ const PIPELINE_STAGES = [
 
 const $ = (selector) => document.querySelector(selector);
 
+function isActionPending(key) {
+  return state.pendingActions.has(key);
+}
+
+function claimActionPending() {
+  return isActionPending("claim-next") || isActionPending("claim-ready");
+}
+
+function setActionPending(key, pending) {
+  if (pending) state.pendingActions.add(key);
+  else state.pendingActions.delete(key);
+  syncPendingButtons();
+}
+
+async function withPendingAction(key, task, busyMessage = "Action already running.") {
+  if (isActionPending(key)) {
+    toast(busyMessage);
+    return null;
+  }
+  setActionPending(key, true);
+  try {
+    return await task();
+  } finally {
+    setActionPending(key, false);
+  }
+}
+
+function syncPendingButtons() {
+  const claimBusy = claimActionPending();
+  document.querySelectorAll("#claim-worker-form button[type='submit'], #claim-ready-batch, [data-action-claim-ready], [data-theater-claim]").forEach((button) => {
+    setButtonBusyState(button, claimBusy, "Claiming...");
+  });
+  document.querySelectorAll("[data-review-accept]").forEach((button) => {
+    setButtonBusyState(button, isActionPending(`review-accept:${button.dataset.reviewAccept || ""}`), "Accepting...");
+  });
+  document.querySelectorAll("[data-review-retry]").forEach((button) => {
+    setButtonBusyState(button, isActionPending(`review-retry:${button.dataset.reviewRetry || ""}`), "Retrying...");
+  });
+  document.querySelectorAll("[data-tool-approval], [data-claim-tool-approval], [data-task-tool-approval]").forEach((button) => {
+    setButtonBusyState(button, isActionPending(`tool:${button.dataset.proposalId || ""}:${button.dataset.decision || ""}`), "Saving...");
+  });
+  document.querySelectorAll("[data-model-approval], [data-brain-model-approval]").forEach((button) => {
+    setButtonBusyState(button, isActionPending(`model:${button.dataset.requestId || ""}:${button.dataset.decision || ""}`), "Saving...");
+  });
+  document.querySelectorAll("[data-memory-review]").forEach((button) => {
+    setButtonBusyState(button, isActionPending(`memory:${button.dataset.memoryId || ""}:${button.dataset.decision || ""}`), "Saving...");
+  });
+}
+
+function setButtonBusyState(button, busy, label) {
+  if (!button) return;
+  if (!button.dataset.idleLabel) button.dataset.idleLabel = button.textContent.trim();
+  if (busy) {
+    if (!button.disabled) button.dataset.pendingEnabled = "1";
+    button.disabled = true;
+    button.textContent = label;
+    button.classList.add("is-busy");
+    return;
+  }
+  if (button.dataset.pendingEnabled === "1") {
+    button.disabled = false;
+    delete button.dataset.pendingEnabled;
+  }
+  button.textContent = button.dataset.idleLabel;
+  button.classList.remove("is-busy");
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   if (window.location.protocol === "file:") {
     upsertNotice("file-mode", "Desktop server required", {
@@ -94,6 +170,17 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   restoreDesktopPreferences();
   restoreUrlState();
+  $("#command-palette-open").addEventListener("click", () => openCommandPalette());
+  $("#command-palette-close").addEventListener("click", () => closeCommandPalette());
+  $("#command-palette").addEventListener("mousedown", (event) => {
+    if (event.target === $("#command-palette")) closeCommandPalette();
+  });
+  $("#command-palette-input").addEventListener("input", (event) => {
+    state.commandPaletteQuery = event.target.value;
+    state.commandPaletteIndex = 0;
+    renderCommandPalette();
+  });
+  $("#command-palette-input").addEventListener("keydown", handleCommandPaletteInputKeydown);
   $("#refresh-all").addEventListener("click", () => refreshAll());
   $("#seed-demo-queue").addEventListener("click", () => seedDemoQueue());
   $("#new-queue-toggle").addEventListener("click", () => showNewQueueForm(true));
@@ -145,6 +232,16 @@ document.addEventListener("DOMContentLoaded", () => {
     routeModelBrain();
   });
   document.addEventListener("keydown", (event) => {
+    if (isCommandPaletteShortcut(event)) {
+      event.preventDefault();
+      openCommandPalette();
+      return;
+    }
+    if (event.key === "Escape" && state.commandPaletteOpen) {
+      event.preventDefault();
+      closeCommandPalette();
+      return;
+    }
     if (event.key === "Escape" && state.theaterFocus) {
       state.theaterFocus = false;
       renderTheater();
@@ -276,6 +373,7 @@ function applyQueueSnapshot(snapshot = {}) {
   state.approvals = snapshot.approvals || {};
   state.timeline = snapshot.timeline || {};
   state.lanes = snapshot.lanes || {};
+  state.lastSnapshotAt = new Date().toISOString();
   state.memoryInbox = snapshot.memoryInbox || {};
 }
 
@@ -379,12 +477,12 @@ function normalizeClaimDefaults(defaults = {}) {
   const maxRuntime = Number(defaults.maxRuntimeMinutes);
   const batchLimit = Number(defaults.batchLimit);
   return {
-    worker: ["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"].includes(defaults.worker) ? defaults.worker : "local-cli",
-    workspaceMode: ["git_worktree", "in_place", "clone", "sandbox"].includes(defaults.workspaceMode) ? defaults.workspaceMode : "git_worktree",
+    worker: ["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"].includes(defaults.worker) ? defaults.worker : SENIOR_CLAIM_DEFAULTS.worker,
+    workspaceMode: ["git_worktree", "in_place", "clone", "sandbox"].includes(defaults.workspaceMode) ? defaults.workspaceMode : SENIOR_CLAIM_DEFAULTS.workspaceMode,
     workspacePath: typeof defaults.workspacePath === "string" ? defaults.workspacePath : "",
-    modelProfile: typeof defaults.modelProfile === "string" && defaults.modelProfile.trim() ? defaults.modelProfile.trim() : "execute.cheap",
+    modelProfile: typeof defaults.modelProfile === "string" && defaults.modelProfile.trim() ? defaults.modelProfile.trim() : SENIOR_CLAIM_DEFAULTS.modelProfile,
     maxRuntimeMinutes: Number.isFinite(maxRuntime) && maxRuntime > 0 ? String(Math.floor(maxRuntime)) : "",
-    batchLimit: Number.isFinite(batchLimit) && batchLimit > 0 ? Math.min(16, Math.max(1, Math.floor(batchLimit))) : 4
+    batchLimit: Number.isFinite(batchLimit) && batchLimit > 0 ? Math.min(16, Math.max(1, Math.floor(batchLimit))) : SENIOR_CLAIM_DEFAULTS.batchLimit
   };
 }
 
@@ -395,7 +493,7 @@ function updateClaimDefaultsFromForm() {
     worker: $("#claim-worker")?.value,
     workspaceMode: $("#claim-workspace-mode")?.value,
     workspacePath: $("#claim-workspace-path")?.value.trim() || "",
-    modelProfile: $("#claim-model-profile")?.value.trim() || "execute.cheap",
+    modelProfile: $("#claim-model-profile")?.value.trim() || SENIOR_CLAIM_DEFAULTS.modelProfile,
     maxRuntimeMinutes: Number.isFinite(maxRuntime) && maxRuntime > 0 ? String(Math.floor(maxRuntime)) : "",
     batchLimit: Number.isFinite(batchLimit) && batchLimit > 0 ? Math.floor(batchLimit) : 4
   });
@@ -414,13 +512,76 @@ function bindClaimDefaultControls(root) {
   });
 }
 
+function applySeniorFactoryDefaults(options = {}) {
+  state.claimDefaults = normalizeClaimDefaults(SENIOR_CLAIM_DEFAULTS);
+  syncClaimDefaultsForm();
+  persistDesktopPreferences();
+  if (!options.quiet) toast("Senior Factory defaults applied.");
+}
+
+function syncClaimDefaultsForm() {
+  const claim = state.claimDefaults || {};
+  const values = {
+    "#claim-worker": claim.worker,
+    "#claim-workspace-mode": claim.workspaceMode,
+    "#claim-workspace-path": claim.workspacePath,
+    "#claim-model-profile": claim.modelProfile,
+    "#claim-max-runtime": claim.maxRuntimeMinutes,
+    "#claim-batch-limit": claim.batchLimit
+  };
+  for (const [selector, value] of Object.entries(values)) {
+    const input = $(selector);
+    if (input) input.value = value ?? "";
+  }
+}
+
+function seniorFactoryCommandText() {
+  if (!state.selectedQueueId) return "";
+  const queueId = shellQuote(state.selectedQueueId);
+  const limit = Math.max(1, Math.min(16, Number(state.claimDefaults?.batchLimit || 10) || 10));
+  return [
+    "AGENT_FABRIC_SENIOR_MODE=permissive",
+    "agent-fabric-project",
+    "factory-run",
+    "--queue",
+    queueId,
+    "--start-execution",
+    "--parallel",
+    String(limit),
+    "--limit",
+    String(limit),
+    "--deepseek-role",
+    "auto",
+    "--patch-mode",
+    "write",
+    "--allow-sensitive-context",
+    "--continue-on-failure",
+    "--json"
+  ].join(" ");
+}
+
+async function copySeniorFactoryCommand() {
+  if (!state.selectedQueueId) {
+    toast("Select a queue before copying the Senior Factory command.");
+    return;
+  }
+  await copyText(seniorFactoryCommandText());
+  toast("Senior Factory command copied.");
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
 function claimWorkerOptionsHtml(current) {
   return [
+    ["ramicode", "RamiCode"],
     ["local-cli", "Local CLI"],
     ["openhands", "OpenHands"],
     ["aider", "Aider"],
     ["smolagents", "smolagents"],
     ["deepseek-direct", "DeepSeek direct"],
+    ["jcode-deepseek", "Jcode DeepSeek"],
     ["manual", "Manual"]
   ]
     .map(([value, label]) => `<option value="${value}"${value === current ? " selected" : ""}>${label}</option>`)
@@ -500,9 +661,9 @@ function taskPacketUrl() {
   const claim = state.claimDefaults || {};
   url.searchParams.set("format", "markdown");
   url.searchParams.set("includeResume", "1");
-  url.searchParams.set("preferredWorker", claim.worker || "local-cli");
-  url.searchParams.set("workspaceMode", claim.workspaceMode || "git_worktree");
-  url.searchParams.set("modelProfile", claim.modelProfile || "execute.cheap");
+  url.searchParams.set("preferredWorker", claim.worker || SENIOR_CLAIM_DEFAULTS.worker);
+  url.searchParams.set("workspaceMode", claim.workspaceMode || SENIOR_CLAIM_DEFAULTS.workspaceMode);
+  url.searchParams.set("modelProfile", claim.modelProfile || SENIOR_CLAIM_DEFAULTS.modelProfile);
   if (claim.workspacePath) url.searchParams.set("workspacePath", claim.workspacePath);
   return url;
 }
@@ -514,9 +675,9 @@ function readyPacketLinksUrl() {
   url.searchParams.set("limit", String(claim.batchLimit || 4));
   url.searchParams.set("format", "markdown");
   url.searchParams.set("includeResume", "1");
-  url.searchParams.set("preferredWorker", claim.worker || "local-cli");
-  url.searchParams.set("workspaceMode", claim.workspaceMode || "git_worktree");
-  url.searchParams.set("modelProfile", claim.modelProfile || "execute.cheap");
+  url.searchParams.set("preferredWorker", claim.worker || SENIOR_CLAIM_DEFAULTS.worker);
+  url.searchParams.set("workspaceMode", claim.workspaceMode || SENIOR_CLAIM_DEFAULTS.workspaceMode);
+  url.searchParams.set("modelProfile", claim.modelProfile || SENIOR_CLAIM_DEFAULTS.modelProfile);
   if (claim.workspacePath) url.searchParams.set("workspacePath", claim.workspacePath);
   return url;
 }
@@ -581,6 +742,7 @@ function renderSelectedQueue() {
   renderTheater();
   renderActivity();
   renderTabBadges();
+  syncPendingButtons();
 }
 
 function renderQueueHealthStrip() {
@@ -700,6 +862,7 @@ function renderDashboard() {
   const counts = summary.counts || {};
   const board = dashboard.queueBoard || {};
   const claim = state.claimDefaults || {};
+  const claimBusy = claimActionPending();
   root.innerHTML = `
     <div class="grid metrics">
       ${metric("Health", summary.status || "unknown", summary.severity || "")}
@@ -710,6 +873,7 @@ function renderDashboard() {
       ${metric("Estimate", money(summary.cost?.estimatedCostUsd || 0), `${summary.cost?.preflightCount || 0} preflights`)}
     </div>
     ${operatorBriefPanelHtml()}
+    ${liveLanesPanelHtml()}
     ${costRiskStripHtml()}
     ${launchReadinessPanelHtml()}
     ${parallelWorkPreviewPanelHtml()}
@@ -783,7 +947,7 @@ function renderDashboard() {
           </label>
           <label>
             <span>Model Profile</span>
-            <input id="claim-model-profile" type="text" value="${esc(claim.modelProfile || "execute.cheap")}" />
+            <input id="claim-model-profile" type="text" value="${esc(claim.modelProfile || SENIOR_CLAIM_DEFAULTS.modelProfile)}" />
           </label>
           <label>
             <span>Max Minutes</span>
@@ -799,8 +963,10 @@ function renderDashboard() {
           <input id="claim-workspace-path" type="text" value="${esc(claim.workspacePath || "")}" placeholder="Optional; default is project path or project.worktrees/task" />
         </label>
         <div class="row-actions">
-          <button class="primary" type="submit">Claim Next Worker</button>
-          <button id="claim-ready-batch" type="button">Claim Ready Slots</button>
+          <button id="senior-factory-defaults" type="button">Senior Factory</button>
+          <button id="copy-senior-factory-command" type="button" ${state.selectedQueueId ? "" : "disabled"}>Copy Senior Command</button>
+          <button class="primary" type="submit" ${claimBusy ? "disabled" : ""}>${claimBusy ? "Claiming..." : "Claim Next Worker"}</button>
+          <button id="claim-ready-batch" type="button" ${claimBusy ? "disabled" : ""}>${claimBusy ? "Claiming..." : "Claim Ready Slots"}</button>
         </div>
       </form>
       <div id="claim-worker-result">${claimWorkerResultHtml(state.lastClaimResult)}</div>
@@ -825,6 +991,8 @@ function renderDashboard() {
     claimNextWorker();
   });
   root.querySelector("#claim-ready-batch")?.addEventListener("click", () => claimReadyBatch());
+  root.querySelector("#senior-factory-defaults")?.addEventListener("click", () => applySeniorFactoryDefaults());
+  root.querySelector("#copy-senior-factory-command")?.addEventListener("click", () => copySeniorFactoryCommand());
   root.querySelectorAll("[data-copy-operator-brief]").forEach((button) => {
     button.addEventListener("click", () => copyOperatorBrief());
   });
@@ -856,6 +1024,7 @@ function renderDashboard() {
   root.querySelectorAll("[data-open-theater]").forEach((button) => {
     button.addEventListener("click", () => selectTab("theater"));
   });
+  bindLiveLanesActions(root);
   root.querySelectorAll("[data-action-tab]").forEach((button) => {
     button.addEventListener("click", () => selectTab(button.dataset.actionTab));
   });
@@ -898,6 +1067,7 @@ function renderDashboard() {
   root.querySelectorAll("[data-ready-packet-task]").forEach((button) => {
     button.addEventListener("click", () => loadTaskDetail(button.dataset.readyPacketTask));
   });
+  bindLaneActions(root);
   renderTaskDetail();
 }
 
@@ -1559,6 +1729,10 @@ function renderTheater() {
   const summary = dashboard.summaryStrip || {};
   const counts = summary.counts || {};
   const active = lanes.filter((lane) => !["completed", "done", "failed", "canceled"].includes(String(lane.workerRun?.status || lane.queueTask?.status || "")));
+  const lanesToShow = state.theaterOnlyActive ? active : lanes;
+  const emptyTheaterText = state.theaterOnlyActive && lanes.length
+    ? "No active lanes. Toggle Show All to review completed or failed lanes."
+    : "No active lanes. Start or claim ready work to populate the theater.";
   root.innerHTML = `
     <div class="theater-stage${state.theaterFocus ? " theater-fullscreen" : ""}">
       <div class="theater-head">
@@ -1568,6 +1742,7 @@ function renderTheater() {
         </div>
         <div class="row-actions">
           <button type="button" data-theater-focus>${state.theaterFocus ? "Exit Focus" : "Focus"}</button>
+          <button type="button" data-theater-active-toggle>${state.theaterOnlyActive ? "Show All" : "Active Only"}</button>
           <button type="button" data-theater-refresh>Refresh</button>
           <button type="button" data-copy-all-lane-briefs ${lanes.length ? "" : "disabled"}>Copy Lane Briefs</button>
           <button type="button" data-theater-claim>Claim Ready Slots</button>
@@ -1580,7 +1755,7 @@ function renderTheater() {
         ${metric("Approvals", counts.pendingApprovals || 0, "waiting")}
       </div>
       <div class="theater-lanes">
-        ${lanes.length ? lanes.map(theaterLaneHtml).join("") : emptyLine("No active lanes. Start or claim ready work to populate the theater.")}
+        ${lanesToShow.length ? lanesToShow.map(theaterLaneHtml).join("") : emptyLine(emptyTheaterText)}
       </div>
     </div>
   `;
@@ -1590,7 +1765,12 @@ function renderTheater() {
     state.theaterFocus = !state.theaterFocus;
     renderTheater();
   });
+  root.querySelector("[data-theater-active-toggle]")?.addEventListener("click", () => {
+    state.theaterOnlyActive = !state.theaterOnlyActive;
+    renderTheater();
+  });
   bindLaneActions(root);
+  syncPendingButtons();
 }
 
 async function recordPipelineStage() {
@@ -1700,6 +1880,7 @@ async function recordPipelineDecision() {
   }
   const decision = $("#pipeline-decision").value;
   const note = $("#pipeline-decision-note").value.trim() || "Recorded from Agent Fabric Console pipeline gate.";
+  if (!confirmQueueDecision(decision)) return;
   const result = await callTool("project_queue_decide", {
     queueId: state.selectedQueueId,
     decision,
@@ -1720,66 +1901,118 @@ async function prepareReady() {
 
 async function claimNextWorker() {
   if (!state.selectedQueueId) return;
-  const input = claimWorkerInput("single");
-  const result = await callTool("project_queue_claim_next", input);
-  state.lastClaimResult = result;
-  state.lastClaimBatchId = null;
-  if (result.approvalRequired) {
-    toast("Tool/context approval required before worker claim.");
-  } else if (result.executionBlocked) {
-    toast("Queue is not open for execution.");
-  } else if (result.claimed) {
-    state.selectedTaskId = result.claimed.queueTaskId || state.selectedTaskId;
-    toast("Worker claimed.");
-  } else {
-    toast("No ready task available.");
+  if (claimActionPending()) {
+    toast("A worker claim is already running.");
+    return;
   }
-  await loadSelectedQueue({ quiet: true });
-  if (result.claimed?.queueTaskId) await loadTaskDetail(result.claimed.queueTaskId, { quiet: true });
+  await withPendingAction("claim-next", async () => {
+    const input = claimWorkerInput("single");
+    const result = await callTool("project_queue_claim_next", input);
+    state.lastClaimResult = result;
+    state.lastClaimBatchId = null;
+    if (result.approvalRequired) {
+      toast("Tool/context approval required before worker claim.");
+    } else if (result.executionBlocked) {
+      toast("Queue is not open for execution.");
+    } else if (result.claimed) {
+      state.selectedTaskId = result.claimed.queueTaskId || state.selectedTaskId;
+      toast("Worker claimed.");
+    } else {
+      toast("No ready task available.");
+    }
+    await loadSelectedQueue({ quiet: true });
+    if (result.claimed?.queueTaskId) await loadTaskDetail(result.claimed.queueTaskId, { quiet: true });
+  });
 }
 
 async function claimReadyBatch() {
   if (!state.selectedQueueId) return;
-  const limitInput = Number($("#claim-batch-limit").value);
-  const availableSlots = Number(state.dashboard?.summaryStrip?.counts?.availableSlots ?? state.dashboard?.availableSlots ?? state.dashboard?.queue?.maxParallelAgents ?? 4);
-  const limit = Math.max(1, Math.min(16, Number.isFinite(limitInput) && limitInput > 0 ? limitInput : availableSlots || 4));
-  const batchId = `desktop-batch-${Date.now()}`;
-  const started = [];
-  const skipped = [];
-  const skipQueueTaskIds = [];
-  for (let index = 0; index < limit; index += 1) {
-    const result = await callTool("project_queue_claim_next", {
-      ...claimWorkerInput("batch"),
-      skipQueueTaskIds,
-      _idempotencyKey: `${batchId}-${index}`
-    });
-    if (result.approvalRequired) {
-      const proposal = result.toolContextProposal || {};
-      skipped.push({
-        reason: "tool/context approval required",
-        queueTaskId: proposal.queueTaskId,
-        proposalId: proposal.proposalId,
-        missingGrants: proposal.missingGrants || []
-      });
-      if (proposal.queueTaskId) {
-        skipQueueTaskIds.push(proposal.queueTaskId);
-        continue;
-      }
-      break;
-    }
-    if (result.executionBlocked) {
-      skipped.push({ reason: result.blockedReason || "queue is not runnable", executionBlocked: true });
-      break;
-    }
-    if (!result.claimed) break;
-    started.push(result);
+  if (claimActionPending()) {
+    toast("A worker claim is already running.");
+    return;
   }
-  state.lastClaimBatchId = batchId;
-  state.lastClaimResult = { batch: true, batchId, started, skipped, requested: limit };
-  if (started[0]?.claimed?.queueTaskId) state.selectedTaskId = started[0].claimed.queueTaskId;
-  toast(`Claimed ${started.length}; skipped ${skipped.length}.`);
-  await loadSelectedQueue({ quiet: true });
-  if (started[0]?.claimed?.queueTaskId) await loadTaskDetail(started[0].claimed.queueTaskId, { quiet: true });
+  await withPendingAction("claim-ready", async () => {
+    const limitInput = Number($("#claim-batch-limit").value);
+    const availableSlots = Number(state.dashboard?.summaryStrip?.counts?.availableSlots ?? state.dashboard?.availableSlots ?? state.dashboard?.queue?.maxParallelAgents ?? 4);
+    const limit = Math.max(1, Math.min(16, Number.isFinite(limitInput) && limitInput > 0 ? limitInput : availableSlots || 4));
+    const batchId = `desktop-batch-${Date.now()}`;
+    const started = [];
+    const skipped = [];
+    const skipQueueTaskIds = [];
+    for (let index = 0; index < limit; index += 1) {
+      const result = await callTool("project_queue_claim_next", {
+        ...claimWorkerInput("batch"),
+        skipQueueTaskIds,
+        _idempotencyKey: `${batchId}-${index}`
+      });
+      if (result.approvalRequired) {
+        const proposal = result.toolContextProposal || {};
+        skipped.push({
+          reason: "tool/context approval required",
+          queueTaskId: proposal.queueTaskId,
+          proposalId: proposal.proposalId,
+          missingGrants: proposal.missingGrants || []
+        });
+        if (proposal.queueTaskId) {
+          skipQueueTaskIds.push(proposal.queueTaskId);
+          continue;
+        }
+        break;
+      }
+      if (result.executionBlocked) {
+        skipped.push({ reason: result.blockedReason || "queue is not runnable", executionBlocked: true });
+        break;
+      }
+      if (!result.claimed) break;
+      started.push(result);
+    }
+    state.lastClaimBatchId = batchId;
+    state.lastClaimResult = { batch: true, batchId, started, skipped, requested: limit };
+    if (started[0]?.claimed?.queueTaskId) state.selectedTaskId = started[0].claimed.queueTaskId;
+    toast(`Claimed ${started.length}; skipped ${skipped.length}.`);
+    await loadSelectedQueue({ quiet: true });
+    if (started[0]?.claimed?.queueTaskId) await loadTaskDetail(started[0].claimed.queueTaskId, { quiet: true });
+  });
+}
+
+function confirmQueueDecision(decision) {
+  const labels = {
+    cancel: "Canceling this queue stops further worker launch for the selected queue.",
+    complete: "Completing this queue closes active queue work."
+  };
+  const message = labels[decision];
+  return !message || window.confirm(`${message}\n\nContinue?`);
+}
+
+function confirmReviewDecision(action, task) {
+  const label = task?.title || task?.queueTaskId || "this task";
+  const messages = {
+    accept: `Accept ${label} and mark the patch-ready task as accepted?`,
+    retry: `Return ${label} to queued for another worker pass?`
+  };
+  return window.confirm(messages[action] || "Continue?");
+}
+
+function confirmToolDecision(proposalId, decision) {
+  return window.confirm(`Record tool/context decision "${decision}" for ${proposalId || "this proposal"}?\n\nApproved tool/context grants can unblock worker launch.`);
+}
+
+function confirmModelDecision(requestId, decision) {
+  return window.confirm(`Record model request decision "${decision}" for ${requestId || "this request"}?\n\nThis can allow, change, or cancel a metered model call.`);
+}
+
+function confirmPolicyGrant(grantKind, value, status) {
+  return window.confirm(`${status === "approved" ? "Approve" : "Reject"} ${grantKind}:${String(value)} for this project?\n\nProject policy changes can affect future ready-task approvals.`);
+}
+
+function confirmMemoryDecision(memoryId, decision) {
+  if (decision === "approve") return true;
+  return window.confirm(`Record memory decision "${decision}" for ${memoryId || "this memory"}?`);
+}
+
+function confirmTaskOutcomeStatus(status) {
+  const highImpact = ["patch_ready", "accepted", "done", "completed", "failed", "blocked", "canceled"].includes(String(status || ""));
+  return !highImpact || window.confirm(`Save selected task outcome as "${status}"?`);
 }
 
 function claimWorkerInput(source) {
@@ -1790,7 +2023,7 @@ function claimWorkerInput(source) {
     worker: state.claimDefaults.worker,
     workspaceMode: state.claimDefaults.workspaceMode,
     workspacePath: state.claimDefaults.workspacePath || undefined,
-    modelProfile: state.claimDefaults.modelProfile || "execute.cheap",
+    modelProfile: state.claimDefaults.modelProfile || SENIOR_CLAIM_DEFAULTS.modelProfile,
     maxRuntimeMinutes: Number.isFinite(maxRuntime) && maxRuntime > 0 ? maxRuntime : undefined,
     metadata: { source: `local-cli-desktop-${source}` }
   };
@@ -2099,32 +2332,41 @@ async function loadReadyPacketLinks() {
 
 async function decideQueue(decision, note = "Recorded from Agent Fabric Console command center.") {
   if (!state.selectedQueueId) return;
-  await callTool("project_queue_decide", { queueId: state.selectedQueueId, decision, note });
-  toast(`Queue decision recorded: ${decision}.`);
-  await loadSelectedQueue({ quiet: true });
+  if (!confirmQueueDecision(decision)) return;
+  await withPendingAction(`queue-decision:${decision}`, async () => {
+    await callTool("project_queue_decide", { queueId: state.selectedQueueId, decision, note });
+    toast(`Queue decision recorded: ${decision}.`);
+    await loadSelectedQueue({ quiet: true });
+  }, "Queue decision is already being recorded.");
 }
 
 async function decideTool(proposalId, decision) {
-  await callTool("tool_context_decide", { proposalId, decision, remember: true, note: "Decided from Agent Fabric Console command center." });
-  toast(`Tool/context ${decision}.`);
-  await loadSelectedQueue({ quiet: true });
+  if (!confirmToolDecision(proposalId, decision)) return;
+  await withPendingAction(`tool:${proposalId}:${decision}`, async () => {
+    await callTool("tool_context_decide", { proposalId, decision, remember: true, note: "Decided from Agent Fabric Console command center." });
+    toast(`Tool/context ${decision}.`);
+    await loadSelectedQueue({ quiet: true });
+  }, "Tool/context decision is already running.");
 }
 
 async function decideClaimToolAndMaybeRetry(proposalId, decision, retry) {
   if (!proposalId || !decision) return;
-  await callTool("tool_context_decide", {
-    proposalId,
-    decision,
-    remember: true,
-    note: "Decided from Agent Fabric Console worker-claim result."
-  });
-  toast(`Tool/context ${decision}.`);
-  if (retry && decision === "approve") {
-    await claimReadyBatch();
-    return;
-  }
-  markClaimProposalDecision(proposalId, decision);
-  await loadSelectedQueue({ quiet: true });
+  if (!confirmToolDecision(proposalId, decision)) return;
+  await withPendingAction(`tool:${proposalId}:${decision}`, async () => {
+    await callTool("tool_context_decide", {
+      proposalId,
+      decision,
+      remember: true,
+      note: "Decided from Agent Fabric Console worker-claim result."
+    });
+    toast(`Tool/context ${decision}.`);
+    if (retry && decision === "approve") {
+      await claimReadyBatch();
+      return;
+    }
+    markClaimProposalDecision(proposalId, decision);
+    await loadSelectedQueue({ quiet: true });
+  }, "Tool/context decision is already running.");
 }
 
 function markClaimProposalDecision(proposalId, decision) {
@@ -2155,9 +2397,12 @@ function markClaimProposalDecision(proposalId, decision) {
 }
 
 async function decideModel(requestId, decision) {
-  await callTool("llm_approve", { requestId, decision, scope: "call", note: "Decided from Agent Fabric Console command center." });
-  toast(`Model request ${decision}.`);
-  await loadSelectedQueue({ quiet: true });
+  if (!confirmModelDecision(requestId, decision)) return;
+  await withPendingAction(`model:${requestId}:${decision}`, async () => {
+    await callTool("llm_approve", { requestId, decision, scope: "call", note: "Decided from Agent Fabric Console command center." });
+    toast(`Model request ${decision}.`);
+    await loadSelectedQueue({ quiet: true });
+  }, "Model decision is already running.");
 }
 
 async function inspectContext() {
@@ -2279,6 +2524,8 @@ function estimateTaskInputTokens(task, detail = {}) {
 
 function renderModelBrain(result) {
   const route = result.route || {};
+  const requested = result.requested || {};
+  const resolution = result.routeResolution || {};
   const gate = result.gate || {};
   const estimate = result.estimate || {};
   const approval = result.approval || {};
@@ -2288,6 +2535,8 @@ function renderModelBrain(result) {
       ${metric("Estimate", money(estimate.estimatedCostUsd || 0), `${estimate.inputTokens || 0} in / ${estimate.reservedOutputTokens || 0} out`)}
       ${metric("Risk", result.risk || "unknown", result.taskType || "")}
       ${metric("Route", route.model || "unknown", `${route.provider || ""} ${route.reasoning || ""}`)}
+      ${metric("Requested", requested.candidateModel || requested.roleAlias || "unknown", `${requested.provider || "auto"} ${requested.reasoning || "auto"}`)}
+      ${metric("Resolution", resolution.changed ? "resolved" : "direct", resolution.summary || "")}
     </div>
     <div class="grid detail-grid">
       ${detailPanel(
@@ -2302,12 +2551,20 @@ function renderModelBrain(result) {
       ${detailPanel(
         "Route",
         `<div class="kv">
+          <div>Requested source</div><div>${esc(requested.source || "")}</div>
+          <div>Requested candidate</div><div>${esc(requested.candidateModel || "")}</div>
+          <div>Requested provider</div><div>${esc(requested.provider || "auto")}</div>
+          <div>Requested reasoning</div><div>${esc(requested.reasoning || "auto")}</div>
           <div>Provider</div><div>${esc(route.provider || "")}</div>
           <div>Model</div><div>${esc(route.model || "")}</div>
           <div>Reasoning</div><div>${esc(route.reasoning || "")}</div>
           <div>Budget</div><div>${esc(result.budgetScope || "")}</div>
         </div>
-        <div class="listline">${(route.reasonCodes || []).map((code) => `<span class="pill">${esc(code)}</span>`).join("")}</div>`
+        <div class="listline">
+          ${resolution.changed ? `<span class="pill amber">resolved route</span>` : `<span class="pill green">direct route</span>`}
+          ${(route.reasonCodes || []).map((code) => `<span class="pill">${esc(code)}</span>`).join("")}
+        </div>
+        ${resolution.summary ? `<div class="muted">${esc(resolution.summary)}</div>` : ""}`
       )}
       ${detailPanel("Recommendations", listItems(result.recommendations || []))}
       ${detailPanel("Warnings", listItems(result.warnings || []))}
@@ -2358,6 +2615,235 @@ function selectTab(tab, options = {}) {
     }
   }
   if (options.persist !== false) persistDesktopPreferences();
+}
+
+function isCommandPaletteShortcut(event) {
+  return (event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && String(event.key || "").toLowerCase() === "k";
+}
+
+function openCommandPalette(query = "") {
+  if (!state.commandPaletteOpen) state.commandPaletteReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  state.commandPaletteOpen = true;
+  state.commandPaletteQuery = query;
+  state.commandPaletteIndex = 0;
+  $("#command-palette").classList.remove("hidden");
+  $("#command-palette").setAttribute("aria-hidden", "false");
+  $("#command-palette-input").value = query;
+  $("#command-palette-input").setAttribute("aria-expanded", "true");
+  renderCommandPalette();
+  window.requestAnimationFrame(() => $("#command-palette-input").focus());
+}
+
+function closeCommandPalette() {
+  const returnFocus = state.commandPaletteReturnFocus;
+  state.commandPaletteOpen = false;
+  state.commandPaletteQuery = "";
+  state.commandPaletteIndex = 0;
+  state.commandPaletteReturnFocus = null;
+  $("#command-palette").classList.add("hidden");
+  $("#command-palette").setAttribute("aria-hidden", "true");
+  $("#command-palette-input").setAttribute("aria-expanded", "false");
+  $("#command-palette-input").removeAttribute("aria-activedescendant");
+  if (returnFocus?.isConnected) window.requestAnimationFrame(() => returnFocus.focus());
+}
+
+function handleCommandPaletteInputKeydown(event) {
+  const commands = filteredCommandPaletteCommands();
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const direction = event.key === "ArrowDown" ? 1 : -1;
+    state.commandPaletteIndex = clampIndex(state.commandPaletteIndex + direction, commands.length);
+    renderCommandPalette();
+    return;
+  }
+  if (event.key === "Enter") {
+    event.preventDefault();
+    const command = commands[state.commandPaletteIndex];
+    if (command) executeCommandPaletteCommand(command);
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeCommandPalette();
+  }
+}
+
+function clampIndex(index, length) {
+  if (!length) return 0;
+  return ((index % length) + length) % length;
+}
+
+function renderCommandPalette() {
+  if (!state.commandPaletteOpen) return;
+  const list = $("#command-palette-list");
+  const commands = filteredCommandPaletteCommands();
+  if (state.commandPaletteIndex >= commands.length) state.commandPaletteIndex = Math.max(0, commands.length - 1);
+  const activeId = commands.length ? `command-palette-option-${state.commandPaletteIndex}` : "";
+  if (activeId) $("#command-palette-input").setAttribute("aria-activedescendant", activeId);
+  else $("#command-palette-input").removeAttribute("aria-activedescendant");
+  list.innerHTML = commands.length
+    ? commands
+        .map(
+          (command, index) => `
+            <button id="command-palette-option-${index}" class="command-row${index === state.commandPaletteIndex ? " active" : ""}" data-command-id="${esc(command.id)}" type="button" role="option" aria-selected="${index === state.commandPaletteIndex ? "true" : "false"}" aria-disabled="${command.disabled ? "true" : "false"}"${command.disabled ? " disabled" : ""}>
+              <span>
+                <strong>${esc(command.title)}</strong>
+                ${command.detail ? `<span class="muted">${esc(command.detail)}</span>` : ""}
+              </span>
+              ${command.badge ? `<span class="pill ${esc(command.badgeClass || "")}">${esc(command.badge)}</span>` : ""}
+            </button>
+          `
+        )
+        .join("")
+    : `<div class="empty">No matching command.</div>`;
+  list.querySelectorAll("[data-command-id]").forEach((button) => {
+    button.addEventListener("mouseenter", () => {
+      state.commandPaletteIndex = commands.findIndex((command) => command.id === button.dataset.commandId);
+      renderCommandPalette();
+    });
+    button.addEventListener("click", () => {
+      const command = commands.find((entry) => entry.id === button.dataset.commandId);
+      if (command) executeCommandPaletteCommand(command);
+    });
+  });
+}
+
+function filteredCommandPaletteCommands() {
+  const query = state.commandPaletteQuery.trim().toLowerCase();
+  const commands = commandPaletteCommands();
+  if (!query) return commands;
+  return commands.filter((command) => commandPaletteHaystack(command).includes(query));
+}
+
+function commandPaletteHaystack(command) {
+  return [command.title, command.detail, command.badge, ...(command.keywords || [])].filter(Boolean).join(" ").toLowerCase();
+}
+
+function executeCommandPaletteCommand(command) {
+  if (command.disabled) {
+    toast(command.disabledReason || "Command unavailable.");
+    return;
+  }
+  closeCommandPalette();
+  Promise.resolve(command.run()).catch((error) => {
+    upsertNotice("command-palette", "Command failed", {
+      severity: "error",
+      detail: messageOf(error),
+      code: error?.code
+    });
+    toast(`Command failed: ${messageOf(error)}`);
+  });
+}
+
+function commandPaletteCommands() {
+  const hasQueue = Boolean(state.selectedQueueId);
+  const selectedTaskId = state.selectedTaskId;
+  const queueStatus = state.dashboard?.queue?.status || state.matrix?.queue?.status || "";
+  const disabledQueue = hasQueue ? {} : { disabled: true, disabledReason: "Select a queue first." };
+  const liveLanes = liveLaneDashboardData();
+  const disabledLiveCopy = hasQueue && liveLanes.active.length
+    ? {}
+    : { disabled: true, disabledReason: hasQueue ? "No active lanes to copy." : "Select a queue first." };
+  const badges = tabBadgeData();
+  const commands = [
+    { id: "refresh", title: "Refresh", detail: "Reload queues and active queue state", run: () => refreshAll(), keywords: ["reload"] },
+    {
+      id: "new-queue",
+      title: "New Queue",
+      detail: "Open the queue intake form",
+      run: () => {
+        showNewQueueForm(true);
+        focusSelector("#new-project-path");
+      },
+      keywords: ["create project"]
+    },
+    { id: "focus-project", title: "Project Filter", detail: "Focus the queue project filter", run: () => focusSelector("#project-filter"), keywords: ["search queues"] },
+    { id: "copy-link", title: "Copy Current Link", detail: "Copy a link to this queue view", run: () => copyCurrentLink(), ...disabledQueue },
+    { id: "prepare-ready", title: "Prepare Ready Tasks", detail: "Create tool/context proposals for launchable work", run: () => prepareReady(), ...disabledQueue },
+    { id: "launch-plan", title: "Plan Launch", detail: "Preview ready work and launch blockers", run: () => loadLaunchPlan(true), ...disabledQueue },
+    { id: "start-execution", title: "Start Execution", detail: `Queue status ${queueStatus || "unknown"}`, run: () => decideQueue("start_execution"), ...disabledQueue },
+    { id: "pause", title: "Pause Queue", detail: `Queue status ${queueStatus || "unknown"}`, run: () => decideQueue("pause"), ...disabledQueue },
+    { id: "resume", title: "Resume Queue", detail: `Queue status ${queueStatus || "unknown"}`, run: () => decideQueue("resume"), ...disabledQueue },
+    { id: "senior-factory", title: "Senior Factory Defaults", detail: "DeepSeek direct, git worktrees, 10 ready lanes", run: () => applySeniorFactoryDefaults(), ...disabledQueue, keywords: ["deepseek 10 agents worker"] },
+    { id: "copy-senior-factory-command", title: "Copy Senior Factory Command", detail: "Copy a 10-lane DeepSeek factory-run command", run: () => copySeniorFactoryCommand(), ...disabledQueue, keywords: ["deepseek factory cli command"] },
+    {
+      id: "live-lanes",
+      title: "Open Live Lanes",
+      detail: `${liveLanes.active.length} active / ${liveLanes.deepseek.length} DeepSeek lane(s)`,
+      run: () => {
+        selectTab("dashboard");
+        focusSelector("[data-live-refresh]");
+      },
+      badge: liveLanes.active.length ? String(liveLanes.active.length) : "",
+      badgeClass: liveLanes.quiet.length ? "amber" : "green",
+      ...disabledQueue,
+      keywords: ["dashboard theater active workers deepseek lanes"]
+    },
+    {
+      id: "copy-active-lane-briefs",
+      title: "Copy Active Lane Briefs",
+      detail: "Copy only the currently active lane briefs",
+      run: () => copyActiveLaneBriefs(),
+      ...disabledLiveCopy,
+      keywords: ["live lanes briefs deepseek workers"]
+    },
+    { id: "claim-next", title: "Claim Next Worker", detail: claimDefaultsLabel(), run: () => claimNextWorker(), ...disabledQueue },
+    { id: "claim-ready", title: "Claim Ready Slots", detail: claimDefaultsLabel(), run: () => claimReadyBatch(), ...disabledQueue, badge: String(state.claimDefaults.batchLimit || SENIOR_CLAIM_DEFAULTS.batchLimit), badgeClass: "blue" },
+    { id: "recover-stale", title: "Recover Stale Workers", detail: "Dry-run stale worker recovery from dashboard defaults", run: () => recoverStale(), ...disabledQueue },
+    { id: "copy-task-link", title: "Copy Task Link", detail: selectedTaskId || "No task selected", run: () => copySelectedTaskLink(), disabled: !selectedTaskId, disabledReason: "Select a task first." },
+    { id: "copy-task-brief", title: "Copy Task Brief", detail: selectedTaskId || "No task selected", run: () => copySelectedTaskBrief("worker"), disabled: !selectedTaskId, disabledReason: "Select a task first." }
+  ];
+  for (const tab of VALID_TABS) {
+    commands.push({
+      id: `tab-${tab}`,
+      title: `Open ${TAB_LABELS[tab] || tab}`,
+      detail: tab === state.activeTab ? "Current view" : "Switch queue view",
+      run: () => selectTab(tab),
+      badge: badges[tab]?.count ? String(badges[tab].count) : "",
+      badgeClass: badges[tab]?.severity || "blue",
+      ...disabledQueue
+    });
+  }
+  for (const task of commandPaletteTasks()) {
+    commands.push({
+      id: `task-${task.queueTaskId}`,
+      title: task.title || task.queueTaskId,
+      detail: `${task.status || "task"} - ${task.goal || ""}`,
+      badge: task.status || "",
+      badgeClass: statusClass(task.status),
+      run: () => loadTaskDetail(task.queueTaskId),
+      keywords: [task.queueTaskId, task.risk, task.phase, task.category].filter(Boolean)
+    });
+  }
+  return commands;
+}
+
+function claimDefaultsLabel() {
+  const claim = state.claimDefaults || {};
+  return `${claim.worker || "worker"} - ${claim.workspaceMode || "workspace"} - ${claim.modelProfile || "model"}`;
+}
+
+function commandPaletteTasks() {
+  const board = state.dashboard?.queueBoard || {};
+  const buckets = ["ready", "running", "review", "blocked"];
+  const seen = new Set();
+  return buckets
+    .flatMap((bucket) => (Array.isArray(board[bucket]) ? board[bucket] : []))
+    .map((task) => {
+      const id = task?.queueTaskId || task?.id;
+      if (!id || seen.has(id)) return null;
+      seen.add(id);
+      return { ...task, queueTaskId: id };
+    })
+    .filter(Boolean)
+    .slice(0, 18);
+}
+
+function focusSelector(selector) {
+  window.requestAnimationFrame(() => {
+    const element = $(selector);
+    if (element) element.focus();
+  });
 }
 
 function metric(label, value, detail) {
@@ -2477,6 +2963,250 @@ function operatorBriefText(options = {}) {
 async function copyOperatorBrief() {
   await copyText(operatorBriefText());
   toast("Operator brief copied.");
+}
+
+function liveLanesPanelHtml() {
+  const data = liveLaneDashboardData();
+  const headerDetail = data.active.length
+    ? `${data.active.length} active / ${data.deepseek.length} DeepSeek`
+    : "No active lanes";
+  return `
+    <div class="panel live-lanes-panel">
+      <div class="section-head live-lanes-headline">
+        <div>
+          <h2>Background Agents</h2>
+          <div class="muted">${esc(data.nextAction)}</div>
+        </div>
+        <div class="section-actions">
+          <span class="pill">${esc(data.lanes.length)} background agents</span>
+          <span class="pill ${data.quiet.length ? "amber" : data.active.length ? "green" : "blue"}">${esc(headerDetail)}</span>
+          <span class="live-lane-freshness">${esc(data.refreshLabel)}</span>
+        </div>
+      </div>
+      <div class="grid metrics live-lane-metrics">
+        ${metric("Active", data.active.length, "worker lanes")}
+        ${metric("DeepSeek", data.deepseek.length, "active lanes")}
+        ${metric("Review", data.reviewReady.length, "patch-ready")}
+        ${metric("Quiet", data.quiet.length, "needs attention")}
+      </div>
+      <div class="live-lane-grid">
+        ${data.visible.length ? data.visible.map(liveLaneCardHtml).join("") : liveLaneEmptyHtml()}
+        ${data.hiddenCount ? liveLaneMoreHtml(data.hiddenCount) : ""}
+      </div>
+      <div class="row-actions live-lanes-actions">
+        <button class="primary" data-live-refresh type="button">Refresh</button>
+        <button data-live-open-theater type="button">Open</button>
+        <button data-live-copy-lanes type="button" ${data.active.length ? "" : "disabled"}>Copy Active Briefs</button>
+        <button data-live-claim-ready type="button">Claim Ready Slots</button>
+        <button data-live-copy-senior type="button" ${state.selectedQueueId ? "" : "disabled"}>Copy Senior Command</button>
+      </div>
+    </div>
+  `;
+}
+
+function liveLaneDashboardData() {
+  const lanes = Array.isArray(state.lanes?.lanes) ? state.lanes.lanes : [];
+  const active = lanes.filter(isActiveLane);
+  const deepseek = active.filter(isDeepSeekLane);
+  const reviewReady = active.filter((lane) => {
+    const status = laneStatus(lane);
+    return status.includes("patch") || status.includes("review");
+  });
+  const quiet = active.filter((lane) => liveLaneActivity(lane).severity !== "green");
+  const visible = active
+    .slice()
+    .sort((left, right) => liveLaneUpdatedMs(right) - liveLaneUpdatedMs(left))
+    .slice(0, 6);
+  const dashboard = state.dashboard || {};
+  const summary = dashboard.summaryStrip || {};
+  return {
+    lanes,
+    active,
+    deepseek,
+    reviewReady,
+    quiet,
+    visible,
+    hiddenCount: Math.max(0, active.length - visible.length),
+    refreshLabel: state.lastSnapshotAt ? `Refreshed ${ageLabel(state.lastSnapshotAt)}` : "Waiting for first snapshot",
+    nextAction: summary.nextAction || (active.length ? "Watch active worker lanes from the dashboard." : "Start or claim ready work to populate live lanes.")
+  };
+}
+
+function liveLaneCardHtml(lane = {}) {
+  const task = lane.queueTask || {};
+  const run = lane.workerRun || {};
+  const progress = lane.progress || {};
+  const checkpointSummary = lane.latestCheckpoint?.summary || {};
+  const status = laneStatus(lane);
+  const activity = liveLaneActivity(lane);
+  const percent = theaterProgressPercent(status);
+  const laneId = laneStableId(lane);
+  const files = laneListValues(progress.filesTouched || checkpointSummary.filesTouched);
+  const tests = laneListValues(progress.testsRun || checkpointSummary.testsRun);
+  const events = Array.isArray(lane.recentEvents) ? lane.recentEvents : [];
+  const title = task.title || lane.laneId || run.workerRunId || "Worker lane";
+  const agentName = codexLaneDisplayName(lane);
+  const handle = codexLaneHandle(lane);
+  const workerDetail = [run.worker || "worker", run.modelProfile, run.workspaceMode].filter(Boolean).join(" / ");
+  const summary = progress.summary || checkpointSummary.nextAction || lane.latestEvent?.body || "Waiting for worker events.";
+  return `
+    <div class="live-lane-card ${activity.severity}">
+      <div class="live-lane-card-head">
+        <div class="live-lane-title">
+          <strong>${esc(agentName)}</strong>
+          <div class="muted truncate">${esc(handle)} - ${esc(workerDetail)}</div>
+          <div class="truncate">${esc(title)}</div>
+        </div>
+        <div class="live-lane-pills">
+          <span class="pill ${statusClass(status)}">${esc(progress.label || run.status || task.status || "active")}</span>
+          <span class="pill ${activity.severity}">${esc(activity.label)}</span>
+        </div>
+      </div>
+      <div class="live-lane-progress" aria-label="Lane progress"><span style="width: ${percent}%"></span></div>
+      <div class="live-lane-summary">${esc(summary)}</div>
+      <div class="live-lane-facts">
+        <div><strong>${files.length || 0}</strong><span>files</span></div>
+        <div><strong>${tests.length || 0}</strong><span>tests</span></div>
+        <div><strong>${events.length || 0}</strong><span>events</span></div>
+      </div>
+      <div class="row-actions live-lane-card-actions">
+        ${task.queueTaskId ? `<button type="button" data-live-task="${esc(task.queueTaskId)}">Open</button>` : ""}
+        <button type="button" data-copy-lane-brief="${esc(laneId)}">Copy Brief</button>
+      </div>
+    </div>
+  `;
+}
+
+const CODEX_AGENT_NAMES = ["Volta", "Ada", "Turing", "Noether", "Euler", "Curie", "Hopper", "Dirac", "Feynman", "Lovelace"];
+
+function codexLaneDisplayName(lane = {}) {
+  const runId = String(lane.workerRun?.workerRunId || lane.laneId || "");
+  const index = stableNameIndex(runId);
+  return CODEX_AGENT_NAMES[index % CODEX_AGENT_NAMES.length];
+}
+
+function codexLaneHandle(lane = {}) {
+  const runId = String(lane.workerRun?.workerRunId || lane.laneId || "agent");
+  return `@af/${codexLaneDisplayName(lane).toLowerCase()}-${runId.slice(-6)}`;
+}
+
+function stableNameIndex(value) {
+  let hash = 0;
+  for (const ch of String(value)) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  return hash;
+}
+
+function liveLaneEmptyHtml() {
+  return `
+    <div class="live-lane-empty">
+      <strong>No active lanes</strong>
+      <div class="muted">Claim ready slots with Senior Factory defaults or open Theater when work starts.</div>
+    </div>
+  `;
+}
+
+function laneListValues(values) {
+  return Array.isArray(values) ? values.filter(Boolean) : [];
+}
+
+function liveLaneMoreHtml(hiddenCount) {
+  return `
+    <div class="live-lane-card live-lane-more">
+      <strong>${esc(hiddenCount)} more active lane(s)</strong>
+      <div class="muted">Open Theater for the full lane board, event lists, checkpoints, and per-lane briefs.</div>
+      <div class="row-actions live-lane-card-actions">
+        <button type="button" data-live-open-theater>Open Theater</button>
+      </div>
+    </div>
+  `;
+}
+
+function bindLiveLanesActions(root) {
+  root.querySelectorAll("[data-live-refresh]").forEach((button) => {
+    button.addEventListener("click", () => loadSelectedQueue({ quiet: true }));
+  });
+  root.querySelectorAll("[data-live-open-theater]").forEach((button) => {
+    button.addEventListener("click", () => selectTab("theater"));
+  });
+  root.querySelectorAll("[data-live-copy-lanes]").forEach((button) => {
+    button.addEventListener("click", () => copyActiveLaneBriefs());
+  });
+  root.querySelectorAll("[data-live-claim-ready]").forEach((button) => {
+    button.addEventListener("click", () => claimReadyBatch());
+  });
+  root.querySelectorAll("[data-live-copy-senior]").forEach((button) => {
+    button.addEventListener("click", () => copySeniorFactoryCommand());
+  });
+  root.querySelectorAll("[data-live-task]").forEach((button) => {
+    button.addEventListener("click", () => loadTaskDetail(button.dataset.liveTask));
+  });
+}
+
+async function copyActiveLaneBriefs() {
+  const lanes = liveLaneDashboardData().active;
+  if (!lanes.length) {
+    toast("No active lane briefs to copy.");
+    return;
+  }
+  await copyText(lanes.map(laneBriefText).join("\n\n---\n\n"));
+  toast(`Copied ${lanes.length} active lane brief(s).`);
+}
+
+function isActiveLane(lane = {}) {
+  return !isClosedLaneStatus(laneStatus(lane));
+}
+
+function isClosedLaneStatus(status) {
+  const normalized = String(status || "").toLowerCase();
+  return ["completed", "done", "failed", "canceled", "cancelled"].some((closed) => normalized.includes(closed));
+}
+
+function laneStatus(lane = {}) {
+  return String(lane.progress?.label || lane.workerRun?.status || lane.queueTask?.status || "").toLowerCase();
+}
+
+function isDeepSeekLane(lane = {}) {
+  const run = lane.workerRun || {};
+  const values = [run.worker, run.modelProfile, run.contextPolicy, run.workspacePath, Array.isArray(run.command) ? run.command.join(" ") : ""];
+  return values.some((value) => String(value || "").toLowerCase().includes("deepseek"));
+}
+
+function liveLaneActivity(lane = {}) {
+  const updatedMs = liveLaneUpdatedMs(lane);
+  if (!updatedMs) return { severity: "blue", label: "waiting" };
+  const minutes = Math.max(0, (Date.now() - updatedMs) / 60_000);
+  if (minutes >= 30) return { severity: "red", label: "stale" };
+  if (minutes >= 10) return { severity: "amber", label: "quiet" };
+  return { severity: "green", label: "live" };
+}
+
+function liveLaneUpdatedMs(lane = {}) {
+  const candidates = [
+    lane.latestEvent?.timestamp,
+    lane.latestCheckpoint?.timestamp,
+    lane.workerRun?.updatedAt,
+    lane.workerRun?.startedAt
+  ];
+  return candidates.reduce((latest, value) => Math.max(latest, timestampMs(value)), 0);
+}
+
+function timestampMs(value) {
+  if (!value) return 0;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function ageLabel(value) {
+  const timestamp = timestampMs(value);
+  if (!timestamp) return "unknown";
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
 function costRiskStripHtml() {
@@ -3067,6 +3797,8 @@ function isPatchReviewStatus(status) {
 function patchReviewTaskHtml(task = {}) {
   const patches = Array.isArray(task.patchRefs) ? task.patchRefs : [];
   const tests = Array.isArray(task.testRefs) ? task.testRefs : [];
+  const acceptBusy = isActionPending(`review-accept:${task.queueTaskId || ""}`);
+  const retryBusy = isActionPending(`review-retry:${task.queueTaskId || ""}`);
   return `
     <div class="review-card">
       <div class="review-card-main">
@@ -3081,8 +3813,8 @@ function patchReviewTaskHtml(task = {}) {
         </div>
         <div class="row-actions">
           <button data-review-task="${esc(task.queueTaskId || "")}" type="button">Open Task</button>
-          <button class="primary" data-review-accept="${esc(task.queueTaskId || "")}" type="button">Accept</button>
-          <button class="danger" data-review-retry="${esc(task.queueTaskId || "")}" type="button">Retry</button>
+          <button class="primary" data-review-accept="${esc(task.queueTaskId || "")}" type="button" ${acceptBusy ? "disabled" : ""}>${acceptBusy ? "Accepting..." : "Accept"}</button>
+          <button class="danger" data-review-retry="${esc(task.queueTaskId || "")}" type="button" ${retryBusy ? "disabled" : ""}>${retryBusy ? "Retrying..." : "Retry"}</button>
         </div>
       </div>
       <div class="review-evidence">
@@ -3215,9 +3947,9 @@ function readyWorkerBriefText(options = {}) {
     "",
     `Queue: ${queue.title || queue.queueId || state.selectedQueueId || "selected queue"}`,
     `Project: ${queue.projectPath || selectedProjectPath() || "project path unavailable"}`,
-    `Worker: ${defaults.preferredWorker || state.claimDefaults.worker || "local-cli"}`,
-    `Workspace mode: ${defaults.workspaceMode || state.claimDefaults.workspaceMode || "git_worktree"}`,
-    `Model profile: ${defaults.modelProfile || state.claimDefaults.modelProfile || "execute.cheap"}`,
+    `Worker: ${defaults.preferredWorker || state.claimDefaults.worker || SENIOR_CLAIM_DEFAULTS.worker}`,
+    `Workspace mode: ${defaults.workspaceMode || state.claimDefaults.workspaceMode || SENIOR_CLAIM_DEFAULTS.workspaceMode}`,
+    `Model profile: ${defaults.modelProfile || state.claimDefaults.modelProfile || SENIOR_CLAIM_DEFAULTS.modelProfile}`,
     "",
     "Use each packet URL as the durable task handoff. The packet includes readiness, dependencies, required context, resume state, and worker instructions.",
     "",
@@ -4093,10 +4825,12 @@ async function saveTaskOutcome() {
   if (!state.selectedQueueId || !state.selectedTaskId) return;
   const patchRefs = linesFromTextarea("#task-outcome-patches");
   const testRefs = linesFromTextarea("#task-outcome-tests");
+  const status = $("#task-outcome-status").value;
+  if (!confirmTaskOutcomeStatus(status)) return;
   await callTool("project_queue_update_task", {
     queueId: state.selectedQueueId,
     queueTaskId: state.selectedTaskId,
-    status: $("#task-outcome-status").value,
+    status,
     summary: $("#task-outcome-summary").value.trim() || undefined,
     patchRefs,
     testRefs
@@ -4108,28 +4842,38 @@ async function saveTaskOutcome() {
 
 async function acceptReviewTask(queueTaskId) {
   if (!state.selectedQueueId || !queueTaskId) return;
-  await callTool("project_queue_update_task", {
-    queueId: state.selectedQueueId,
-    queueTaskId,
-    status: "accepted",
-    summary: "Accepted from Agent Fabric Console patch review."
-  });
-  toast("Patch-ready task accepted.");
-  await loadSelectedQueue({ quiet: true });
-  if (state.selectedTaskId === queueTaskId) await loadTaskDetail(queueTaskId, { quiet: true });
+  const selectedTask = state.taskDetail?.task?.queueTaskId === queueTaskId ? state.taskDetail.task : null;
+  const task = patchReviewTasks().find((item) => item.queueTaskId === queueTaskId) || selectedTask;
+  if (!confirmReviewDecision("accept", task)) return;
+  await withPendingAction(`review-accept:${queueTaskId}`, async () => {
+    await callTool("project_queue_update_task", {
+      queueId: state.selectedQueueId,
+      queueTaskId,
+      status: "accepted",
+      summary: "Accepted from Agent Fabric Console patch review."
+    });
+    toast("Patch-ready task accepted.");
+    await loadSelectedQueue({ quiet: true });
+    if (state.selectedTaskId === queueTaskId) await loadTaskDetail(queueTaskId, { quiet: true });
+  }, "Review accept is already running.");
 }
 
 async function retryReviewTask(queueTaskId) {
   if (!state.selectedQueueId || !queueTaskId) return;
-  await callTool("project_queue_retry_task", {
-    queueId: state.selectedQueueId,
-    queueTaskId,
-    reason: "Retry requested from Agent Fabric Console patch review.",
-    clearOutputs: false
-  });
-  toast("Task returned to queued for retry.");
-  await loadSelectedQueue({ quiet: true });
-  if (state.selectedTaskId === queueTaskId) await loadTaskDetail(queueTaskId, { quiet: true });
+  const selectedTask = state.taskDetail?.task?.queueTaskId === queueTaskId ? state.taskDetail.task : null;
+  const task = patchReviewTasks().find((item) => item.queueTaskId === queueTaskId) || selectedTask;
+  if (!confirmReviewDecision("retry", task)) return;
+  await withPendingAction(`review-retry:${queueTaskId}`, async () => {
+    await callTool("project_queue_retry_task", {
+      queueId: state.selectedQueueId,
+      queueTaskId,
+      reason: "Retry requested from Agent Fabric Console patch review.",
+      clearOutputs: false
+    });
+    toast("Task returned to queued for retry.");
+    await loadSelectedQueue({ quiet: true });
+    if (state.selectedTaskId === queueTaskId) await loadTaskDetail(queueTaskId, { quiet: true });
+  }, "Review retry is already running.");
 }
 
 async function proposeSelectedTaskContext() {
@@ -4179,16 +4923,19 @@ async function setTaskPolicyGrant(grantKind, valueJson, status) {
     toast(`Invalid grant value: ${messageOf(error)}`);
     return;
   }
-  await callTool("tool_context_policy_set", {
-    projectPath,
-    grantKind,
-    value,
-    status
-  });
-  await callTool("project_queue_prepare_ready", { queueId: state.selectedQueueId, limit: 4 });
-  toast(`${status === "approved" ? "Approved" : "Rejected"} ${grantKind}:${String(value)}.`);
-  await loadSelectedQueue({ quiet: true });
-  await loadTaskDetail(state.selectedTaskId, { quiet: true });
+  if (!confirmPolicyGrant(grantKind, value, status)) return;
+  await withPendingAction(`policy:${grantKind}:${String(value)}:${status}`, async () => {
+    await callTool("tool_context_policy_set", {
+      projectPath,
+      grantKind,
+      value,
+      status
+    });
+    await callTool("project_queue_prepare_ready", { queueId: state.selectedQueueId, limit: 4 });
+    toast(`${status === "approved" ? "Approved" : "Rejected"} ${grantKind}:${String(value)}.`);
+    await loadSelectedQueue({ quiet: true });
+    await loadTaskDetail(state.selectedTaskId, { quiet: true });
+  }, "Policy decision is already running.");
 }
 
 async function attachSuggestedMemory(queueTaskId, memoryRef) {
@@ -4212,13 +4959,16 @@ async function reviewMemory(memoryId, decision) {
     toast("Memory review action is missing an id or decision.");
     return;
   }
-  await callTool("memory_review", {
-    id: memoryId,
-    decision,
-    reason: `Agent Fabric Console ${decision}`
-  });
-  toast(`Memory ${decision} recorded.`);
-  await loadSelectedQueue({ quiet: true });
+  if (!confirmMemoryDecision(memoryId, decision)) return;
+  await withPendingAction(`memory:${memoryId}:${decision}`, async () => {
+    await callTool("memory_review", {
+      id: memoryId,
+      decision,
+      reason: `Agent Fabric Console ${decision}`
+    });
+    toast(`Memory ${decision} recorded.`);
+    await loadSelectedQueue({ quiet: true });
+  }, "Memory review is already running.");
 }
 
 async function generateSelectedTaskPacket() {
@@ -4228,10 +4978,10 @@ async function generateSelectedTaskPacket() {
     queueTaskId: state.selectedTaskId,
     format: "markdown",
     includeResume: true,
-    preferredWorker: $("#claim-worker")?.value || "local-cli",
-    workspaceMode: $("#claim-workspace-mode")?.value || "git_worktree",
+    preferredWorker: $("#claim-worker")?.value || SENIOR_CLAIM_DEFAULTS.worker,
+    workspaceMode: $("#claim-workspace-mode")?.value || SENIOR_CLAIM_DEFAULTS.workspaceMode,
     workspacePath: $("#claim-workspace-path")?.value.trim() || undefined,
-    modelProfile: $("#claim-model-profile")?.value.trim() || "execute.cheap"
+    modelProfile: $("#claim-model-profile")?.value.trim() || SENIOR_CLAIM_DEFAULTS.modelProfile
   });
   $("#task-context-result").innerHTML = taskPacketResultHtml(result);
   $("#task-context-result").querySelector("[data-copy-task-packet]")?.addEventListener("click", async () => {
@@ -4292,15 +5042,18 @@ function taskPacketResultHtml(result = {}) {
 
 async function retrySelectedTask() {
   if (!state.selectedQueueId || !state.selectedTaskId) return;
-  await callTool("project_queue_retry_task", {
-    queueId: state.selectedQueueId,
-    queueTaskId: state.selectedTaskId,
-    reason: "Retry requested from Agent Fabric Console task detail.",
-    clearOutputs: true
-  });
-  toast("Task returned to queued.");
-  await loadSelectedQueue({ quiet: true });
-  await loadTaskDetail(state.selectedTaskId, { quiet: true });
+  if (!confirmReviewDecision("retry", state.taskDetail?.task)) return;
+  await withPendingAction(`review-retry:${state.selectedTaskId}`, async () => {
+    await callTool("project_queue_retry_task", {
+      queueId: state.selectedQueueId,
+      queueTaskId: state.selectedTaskId,
+      reason: "Retry requested from Agent Fabric Console task detail.",
+      clearOutputs: true
+    });
+    toast("Task returned to queued.");
+    await loadSelectedQueue({ quiet: true });
+    await loadTaskDetail(state.selectedTaskId, { quiet: true });
+  }, "Task retry is already running.");
 }
 
 async function copyText(text) {

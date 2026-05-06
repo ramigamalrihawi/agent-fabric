@@ -18,6 +18,7 @@ describe("desktop command center server", () => {
       expect(html).toContain('id="notice-stack"');
       expect(html).toContain('id="queue-health-strip"');
       expect(html).toContain('id="seed-demo-queue"');
+      expect(html).toContain('id="command-palette"');
       expect(html).toContain("Connecting");
 
       const appJs = await fetch(`${url}app.js`);
@@ -35,6 +36,15 @@ describe("desktop command center server", () => {
       expect(appBody).toContain("renderTabBadges");
       expect(appBody).toContain("queueHealthData");
       expect(appBody).toContain("tab-badge");
+      expect(appBody).toContain("openCommandPalette");
+      expect(appBody).toContain("Senior Factory defaults applied");
+      expect(appBody).toContain("copySeniorFactoryCommand");
+      expect(appBody).toContain("Copy Senior Factory Command");
+      expect(appBody).toContain("syncPendingButtons");
+      expect(appBody).toContain("confirmQueueDecision");
+      expect(appBody).toContain("confirmModelDecision");
+      expect(appBody).toContain("routeResolution");
+      expect(appBody).toContain("data-theater-active-toggle");
       expect(appBody).toContain("Pipeline Gate");
       expect(appBody).toContain("Copy Pipeline Brief");
       expect(appBody).toContain("data-copy-pipeline-brief");
@@ -71,6 +81,11 @@ describe("desktop command center server", () => {
       expect(appBody).toContain("/api/project-start-plan");
       expect(appBody).toContain("theater-fullscreen");
       expect(appBody).toContain("data-open-theater");
+      expect(appBody).toContain("Live Lanes");
+      expect(appBody).toContain("liveLaneDashboardData");
+      expect(appBody).toContain("data-live-refresh");
+      expect(appBody).toContain("copyActiveLaneBriefs");
+      expect(appBody).toContain("Copy Active Lane Briefs");
     });
   });
 

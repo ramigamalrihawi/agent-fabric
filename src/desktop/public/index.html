@@ -16,6 +16,7 @@
         <div class="top-actions">
           <input id="project-filter" type="text" placeholder="Project path" />
           <label class="checkline"><input id="include-closed" type="checkbox" /> Closed</label>
+          <button id="command-palette-open" type="button">Command</button>
           <button id="refresh-all" type="button">Refresh</button>
         </div>
       </header>
@@ -505,6 +506,16 @@
       </main>
 
       <div id="toast" class="toast hidden"></div>
+      <div id="command-palette" class="command-palette hidden" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="command-palette-title">
+        <div class="command-palette-panel">
+          <div class="section-head">
+            <h2 id="command-palette-title">Command</h2>
+            <button id="command-palette-close" type="button" aria-label="Close command palette">Close</button>
+          </div>
+          <input id="command-palette-input" type="search" autocomplete="off" role="combobox" aria-controls="command-palette-list" aria-expanded="false" aria-autocomplete="list" placeholder="Search actions, tabs, queues, tasks" />
+          <div id="command-palette-list" class="command-palette-list" role="listbox"></div>
+        </div>
+      </div>
     </div>
     <script src="/app.js" type="module"></script>
   </body>

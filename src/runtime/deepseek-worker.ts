@@ -1,5 +1,9 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { FabricClient } from "../client.js";
+import { defaultPaths } from "../paths.js";
+import type { BridgeRegister, BridgeSession } from "../types.js";
+import { bridgeCallContext } from "./bridge-context.js";
 import { FabricError } from "./errors.js";
 import { applyPatchWithSystemPatch, resolvePatchFilePath, validateGitStylePatch } from "./patches.js";
 import type { ProjectModelRequest } from "./project-cli.js";
@@ -26,6 +30,7 @@ export type DeepSeekWorkerCommand =
 	      timeoutMs: number;
 	      allowSensitiveContext: boolean;
 	      sensitiveContextMode: SensitiveContextMode;
+	      sensitiveContextModeExplicit: boolean;
 	    }
   | {
       command: "run-task";
@@ -45,6 +50,7 @@ export type DeepSeekWorkerCommand =
 	      patchFile?: string;
 	      allowSensitiveContext: boolean;
 	      sensitiveContextMode: SensitiveContextMode;
+	      sensitiveContextModeExplicit: boolean;
 	    }
   | {
       command: "doctor";
@@ -86,6 +92,26 @@ type RunOptions = {
   cwd?: string;
 };
 
+type QueueBackedDirectRun = {
+  client: FabricClient;
+  session: BridgeSession;
+  queueId: string;
+  queueTaskId: string;
+  fabricTaskId: string;
+  workerRunId: string;
+  taskDir: string;
+};
+
+type SeniorTaskDirQueueMetadata = {
+  schema: "agent-fabric.senior-task-dir-queue.v1";
+  queueId: string;
+  projectPath: string;
+  title: string;
+  taskDir: string;
+  createdAt: string;
+  tasks: Record<string, { queueTaskId: string; fabricTaskId: string; title: string; packetPath: string }>;
+};
+
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-v4-pro";
 const DEFAULT_MAX_TOKENS = 32_000;
@@ -108,7 +134,8 @@ export function parseDeepSeekWorkerArgs(argv: string[]): DeepSeekWorkerCommand {
 	      baseUrl: flags.baseUrl ?? DEFAULT_BASE_URL,
 	      timeoutMs: flags.timeoutMs ?? DEFAULT_TIMEOUT_MS,
 	      allowSensitiveContext: flags.allowSensitiveContext,
-	      sensitiveContextMode: parseSensitiveContextMode(flags.sensitiveContextMode, flags.allowSensitiveContext)
+	      sensitiveContextMode: parseSensitiveContextMode(flags.sensitiveContextMode, flags.allowSensitiveContext),
+	      sensitiveContextModeExplicit: flags.sensitiveContextMode !== undefined
 	    };
   }
   if (command === "run-task") {
@@ -129,7 +156,8 @@ export function parseDeepSeekWorkerArgs(argv: string[]): DeepSeekWorkerCommand {
 	      patchMode: parsePatchMode(flags.patchMode ?? "report"),
 	      patchFile: flags.patchFile,
 	      allowSensitiveContext: flags.allowSensitiveContext,
-	      sensitiveContextMode: parseSensitiveContextMode(flags.sensitiveContextMode, flags.allowSensitiveContext)
+	      sensitiveContextMode: parseSensitiveContextMode(flags.sensitiveContextMode, flags.allowSensitiveContext),
+	      sensitiveContextModeExplicit: flags.sensitiveContextMode !== undefined
 	    };
   }
   if (command === "doctor") {
@@ -230,7 +258,7 @@ async function runProjectModelCommand(
 ): Promise<Record<string, unknown>> {
   const apiKey = deepSeekApiKey(options.env ?? process.env);
   if (!apiKey) throw new FabricError("DEEPSEEK_API_KEY_MISSING", "DEEPSEEK_API_KEY or DEEPSEEK_TOKEN must be set", false);
-	  assertNoSensitiveContext("model-command stdin", options.stdin ?? "", command.sensitiveContextMode);
+	  assertNoSensitiveContext("model-command stdin", options.stdin ?? "", effectiveSensitiveContextMode(command, options.env ?? process.env));
   const messages =
     request.kind === "prompt_improvement"
       ? promptImprovementMessages(request)
@@ -273,61 +301,457 @@ async function runTaskPacket(command: Extract<DeepSeekWorkerCommand, { command: 
   const packetText = readFileSync(command.taskPacketPath, "utf8");
   const packet = parseTaskPacket(packetText, command.taskPacketPath);
   const contextText = command.contextFile ? readFileSync(command.contextFile, "utf8") : undefined;
-	  assertNoSensitiveContext(command.taskPacketPath, packetText, command.sensitiveContextMode);
-	  if (contextText !== undefined) assertNoSensitiveContext(command.contextFile ?? "context file", contextText, command.sensitiveContextMode);
+	  const sensitiveContextMode = effectiveSensitiveContextMode(command, options.env ?? process.env);
+	  assertNoSensitiveContext(command.taskPacketPath, packetText, sensitiveContextMode);
+	  if (contextText !== undefined) assertNoSensitiveContext(command.contextFile ?? "context file", contextText, sensitiveContextMode);
+  const queueRun = await maybeStartQueueBackedDirectRun(command, packet, options);
   const messages = taskPacketMessages(command.role, packet, packetText, contextText);
-  const call = await callDeepSeek({
-    apiKey,
-    baseUrl: command.baseUrl,
-    model: command.model,
-    reasoningEffort: command.reasoningEffort,
-    maxTokens: command.maxTokens,
-    temperature: command.temperature,
-    timeoutMs: command.timeoutMs,
-	    messages,
-	    fetchImpl: options.fetchImpl,
-	    env: options.env ?? process.env
-	  });
-  const parsed = normalizeTaskReport(parseJsonObject(call.content, "DeepSeek run-task response"));
-  const outputFile = command.outputFile ?? defaultOutputFile(command, packet, options.cwd ?? process.cwd());
-  const patchAction = await handleProposedPatch(command, parsed, outputFile, options.cwd ?? process.cwd());
-  const artifact = {
-    schema: "agent-fabric.deepseek-worker-result.v1",
-    role: command.role,
-    provider: "deepseek",
-    model: command.model,
-    reasoningEffort: command.reasoningEffort,
-    taskPacketPath: command.taskPacketPath,
-    fabricTaskId: command.fabricTaskId ?? getNestedString(packet, ["task", "fabricTaskId"]),
-    queueTaskId: getNestedString(packet, ["task", "queueTaskId"]),
-    status: parsed.status,
-    result: parsed,
-    patchMode: command.patchMode,
-    patchFile: patchAction.patchFile,
-	    patchApply: patchAction.patchApply,
-	    usage: call.usage,
-	    costUsd: call.costUsd,
-	    costEstimateSource: call.costEstimateSource,
-	    responseId: call.responseId,
-    finishReason: call.finishReason
-  };
-  mkdirSync(dirname(outputFile), { recursive: true });
-  writeFileSync(outputFile, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
+  try {
+    const call = await callDeepSeek({
+      apiKey,
+      baseUrl: command.baseUrl,
+      model: command.model,
+      reasoningEffort: command.reasoningEffort,
+      maxTokens: command.maxTokens,
+      temperature: command.temperature,
+      timeoutMs: command.timeoutMs,
+	      messages,
+	      fetchImpl: options.fetchImpl,
+	      env: options.env ?? process.env
+	    });
+    const parsed = normalizeTaskReport(parseJsonObject(call.content, "DeepSeek run-task response"));
+    const outputFile = command.outputFile ?? defaultOutputFile(command, packet, options.cwd ?? process.cwd());
+    const patchAction = await handleProposedPatch(command, parsed, outputFile, options.cwd ?? process.cwd());
+    const artifact = {
+      schema: "agent-fabric.deepseek-worker-result.v1",
+      role: command.role,
+      provider: "deepseek",
+      model: command.model,
+      reasoningEffort: command.reasoningEffort,
+      taskPacketPath: command.taskPacketPath,
+      fabricTaskId: queueRun?.fabricTaskId ?? command.fabricTaskId ?? getNestedString(packet, ["task", "fabricTaskId"]),
+      queueTaskId: queueRun?.queueTaskId ?? getNestedString(packet, ["task", "queueTaskId"]),
+      status: parsed.status,
+      result: parsed,
+      patchMode: command.patchMode,
+      patchFile: patchAction.patchFile,
+	      patchApply: patchAction.patchApply,
+	      usage: call.usage,
+	      costUsd: call.costUsd,
+	      costEstimateSource: call.costEstimateSource,
+	      responseId: call.responseId,
+      finishReason: call.finishReason
+    };
+    mkdirSync(dirname(outputFile), { recursive: true });
+    writeFileSync(outputFile, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
+    await finishQueueBackedDirectRun(queueRun, parsed, artifact, outputFile, patchAction.patchFile);
+    return {
+      kind: "run-task",
+      role: command.role,
+      status: parsed.status,
+      outputFile,
+      patchMode: command.patchMode,
+      patchFile: patchAction.patchFile,
+	      patchApply: patchAction.patchApply,
+	      costUsd: call.costUsd,
+	      costEstimateSource: call.costEstimateSource,
+	      usage: call.usage,
+      queueTaskId: artifact.queueTaskId,
+      fabricTaskId: artifact.fabricTaskId,
+      workerRunId: queueRun?.workerRunId,
+      queueBacked: queueRun
+        ? { queueId: queueRun.queueId, queueTaskId: queueRun.queueTaskId, fabricTaskId: queueRun.fabricTaskId, workerRunId: queueRun.workerRunId }
+        : undefined,
+      summary: parsed.summary
+    };
+  } catch (error) {
+    await failQueueBackedDirectRun(queueRun, error);
+    throw error;
+  }
+}
+
+async function maybeStartQueueBackedDirectRun(
+  command: Extract<DeepSeekWorkerCommand, { command: "run-task" }>,
+  packet: Record<string, unknown>,
+  options: RunOptions
+): Promise<QueueBackedDirectRun | undefined> {
+  const env = options.env ?? process.env;
+  const taskDir = seniorTaskDir(env);
+  if (!taskDir) return undefined;
+  const cwd = options.cwd ?? process.cwd();
+  const client = new FabricClient(env.AGENT_FABRIC_SOCKET ?? defaultPaths().socketPath);
+  const session = await registerQueueBackedDirectWorker(client, env, cwd);
+  const metadata = await ensureSeniorTaskDirQueue(client, session, taskDir, packet, command.taskPacketPath, env, cwd);
+  const taskKey = taskPacketKey(packet, command.taskPacketPath);
+  const task = metadata.tasks[taskKey] ?? (await addSeniorPacketTask(client, session, metadata, packet, command.taskPacketPath, taskKey));
+  const workspaceMode = command.patchMode === "report" ? "sandbox" : "git_worktree";
+  const worker = await fabricCall<Record<string, unknown>>(client, session, "fabric_task_start_worker", {
+    taskId: task.fabricTaskId,
+    worker: "deepseek-direct",
+    projectPath: metadata.projectPath,
+    workspaceMode,
+    workspacePath: cwd,
+    modelProfile: command.model,
+    contextPolicy: "senior-mode:queue-backed-direct",
+    command: ["agent-fabric-deepseek-worker", "run-task", "--task-packet", command.taskPacketPath],
+    metadata: {
+      source: "deepseek-worker-direct-senior",
+      role: command.role,
+      taskDir,
+      taskPacketPath: command.taskPacketPath,
+      patchMode: command.patchMode,
+      externalTaskKey: taskKey,
+      queueBacked: true
+    }
+  });
+  const workerRunId = String(worker.workerRunId ?? "");
+  if (!workerRunId) throw new FabricError("DEEPSEEK_QUEUE_BACKING_FAILED", "fabric_task_start_worker did not return workerRunId", true);
+  await fabricCall(client, session, "project_queue_assign_worker", {
+    queueId: metadata.queueId,
+    queueTaskId: task.queueTaskId,
+    workerRunId
+  });
+  await fabricCall(client, session, "fabric_task_event", {
+    taskId: task.fabricTaskId,
+    workerRunId,
+    kind: "started",
+    body: "Senior-mode DeepSeek direct run registered as a queue-backed worker lane.",
+    metadata: { queueId: metadata.queueId, queueTaskId: task.queueTaskId, taskDir, taskPacketPath: command.taskPacketPath, role: command.role }
+  });
   return {
-    kind: "run-task",
-    role: command.role,
-    status: parsed.status,
-    outputFile,
-    patchMode: command.patchMode,
-    patchFile: patchAction.patchFile,
-	    patchApply: patchAction.patchApply,
-	    costUsd: call.costUsd,
-	    costEstimateSource: call.costEstimateSource,
-	    usage: call.usage,
-    queueTaskId: artifact.queueTaskId,
-    fabricTaskId: artifact.fabricTaskId,
-    summary: parsed.summary
+    client,
+    session,
+    queueId: metadata.queueId,
+    queueTaskId: task.queueTaskId,
+    fabricTaskId: task.fabricTaskId,
+    workerRunId,
+    taskDir
   };
+}
+
+function seniorTaskDir(env: NodeJS.ProcessEnv): string | undefined {
+  const mode = String(env.AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE ?? "auto").toLowerCase();
+  if (["0", "false", "off", "no", "disabled"].includes(mode)) return undefined;
+  if (env.AGENT_FABRIC_SENIOR_MODE !== "permissive" && mode !== "required") return undefined;
+  if (!env.TASK_DIR) {
+    if (mode === "required") {
+      throw new FabricError("DEEPSEEK_QUEUE_BACKING_REQUIRED", "AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=required needs TASK_DIR to create queue-backed lanes.", false);
+    }
+    return undefined;
+  }
+  return resolve(env.TASK_DIR);
+}
+
+async function ensureSeniorTaskDirQueue(
+  client: FabricClient,
+  session: BridgeSession,
+  taskDir: string,
+  packet: Record<string, unknown>,
+  taskPacketPath: string,
+  env: NodeJS.ProcessEnv,
+  cwd: string
+): Promise<SeniorTaskDirQueueMetadata> {
+  mkdirSync(taskDir, { recursive: true });
+  const metadataPath = seniorQueueMetadataPath(taskDir);
+  const lockDir = join(taskDir, ".agent-fabric-queue.lock");
+  return withDirectoryLock(lockDir, async () => {
+    const existing = readSeniorQueueMetadata(metadataPath);
+    if (existing) return existing;
+    const projectPath = seniorProjectPath(packet, env, cwd);
+    const title = env.AGENT_FABRIC_QUEUE_TITLE || `Senior DeepSeek lanes: ${basename(taskDir)}`;
+    const queue = await fabricCall<Record<string, unknown>>(client, session, "project_queue_create", {
+      projectPath,
+      title,
+      promptSummary: seniorPromptSummary(packet, taskDir),
+      pipelineProfile: "careful",
+      maxParallelAgents: seniorMaxParallelAgents(env)
+    });
+    const queueId = String(queue.queueId ?? "");
+    if (!queueId) throw new FabricError("DEEPSEEK_QUEUE_BACKING_FAILED", "project_queue_create did not return queueId", true);
+    const packets = seniorTaskDirPackets(taskDir, packet, taskPacketPath);
+    const added = await fabricCall<Record<string, unknown>>(client, session, "project_queue_add_tasks", {
+      queueId,
+      tasks: packets.map((entry) => queueTaskFromPacket(entry.packet, entry.path))
+    });
+    const created = Array.isArray(added.created) ? added.created : [];
+    const tasks: SeniorTaskDirQueueMetadata["tasks"] = {};
+    for (const item of created) {
+      const record = asRecord(item);
+      const key = typeof record.clientKey === "string" ? record.clientKey : "";
+      const queueTaskId = typeof record.queueTaskId === "string" ? record.queueTaskId : "";
+      const fabricTaskId = typeof record.fabricTaskId === "string" ? record.fabricTaskId : "";
+      if (!key || !queueTaskId || !fabricTaskId) continue;
+      const source = packets.find((entry) => taskPacketKey(entry.packet, entry.path) === key);
+      tasks[key] = { queueTaskId, fabricTaskId, title: typeof record.title === "string" ? record.title : key, packetPath: source?.path ?? "" };
+    }
+    await fabricCall(client, session, "project_queue_decide", {
+      queueId,
+      decision: "start_execution",
+      note: "Started automatically for Senior-mode DeepSeek TASK_DIR lanes."
+    });
+    const metadata: SeniorTaskDirQueueMetadata = {
+      schema: "agent-fabric.senior-task-dir-queue.v1",
+      queueId,
+      projectPath,
+      title,
+      taskDir,
+      createdAt: new Date().toISOString(),
+      tasks
+    };
+    writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    return metadata;
+  });
+}
+
+async function addSeniorPacketTask(
+  client: FabricClient,
+  session: BridgeSession,
+  metadata: SeniorTaskDirQueueMetadata,
+  packet: Record<string, unknown>,
+  taskPacketPath: string,
+  taskKey: string
+): Promise<{ queueTaskId: string; fabricTaskId: string; title: string; packetPath: string }> {
+  const lockDir = join(metadata.taskDir, `.agent-fabric-task-${safeFilePart(taskKey)}.lock`);
+  return withDirectoryLock(lockDir, async () => {
+    const current = readSeniorQueueMetadata(seniorQueueMetadataPath(metadata.taskDir)) ?? metadata;
+    if (current.tasks[taskKey]) return current.tasks[taskKey];
+    const added = await fabricCall<Record<string, unknown>>(client, session, "project_queue_add_tasks", {
+      queueId: current.queueId,
+      tasks: [queueTaskFromPacket(packet, taskPacketPath)]
+    });
+    const record = asRecord(Array.isArray(added.created) ? added.created[0] : undefined);
+    const task = {
+      queueTaskId: String(record.queueTaskId ?? ""),
+      fabricTaskId: String(record.fabricTaskId ?? ""),
+      title: String(record.title ?? taskKey),
+      packetPath: taskPacketPath
+    };
+    if (!task.queueTaskId || !task.fabricTaskId) throw new FabricError("DEEPSEEK_QUEUE_BACKING_FAILED", "project_queue_add_tasks did not return task ids", true);
+    current.tasks[taskKey] = task;
+    writeFileSync(seniorQueueMetadataPath(metadata.taskDir), `${JSON.stringify(current, null, 2)}\n`, "utf8");
+    await fabricCall(client, session, "project_queue_decide", {
+      queueId: current.queueId,
+      decision: "start_execution",
+      note: "Resumed execution after adding a late Senior-mode DeepSeek packet."
+    });
+    return task;
+  });
+}
+
+async function finishQueueBackedDirectRun(
+  queueRun: QueueBackedDirectRun | undefined,
+  parsed: Record<string, unknown>,
+  artifact: Record<string, unknown>,
+  outputFile: string,
+  patchFile?: string
+): Promise<void> {
+  if (!queueRun) return;
+  const summary = typeof parsed.summary === "string" ? parsed.summary : "DeepSeek direct worker completed.";
+  const status = queueTaskStatusForDeepSeekStatus(String(parsed.status || ""));
+  const changedFiles = stringArray(parsed.changedFilesSuggested);
+  const tests = stringArray(parsed.testsSuggested);
+  const refs = uniqueStrings([outputFile, patchFile, ...changedFiles].filter((value): value is string => Boolean(value)));
+  await fabricCall(queueRun.client, queueRun.session, "fabric_task_checkpoint", {
+    taskId: queueRun.fabricTaskId,
+    workerRunId: queueRun.workerRunId,
+    summary: {
+      currentGoal: "Senior-mode DeepSeek direct lane.",
+      filesTouched: refs,
+      commandsRun: ["agent-fabric-deepseek-worker run-task"],
+      testsRun: tests,
+      failingTests: [],
+      decisions: [],
+      assumptions: [],
+      blockers: stringArray(parsed.blockers),
+      nextAction: status === "failed" ? "Inspect DeepSeek result and retry or split the lane." : "Review queue-backed DeepSeek result.",
+      structuredResult: artifact
+    }
+  });
+  await fabricCall(queueRun.client, queueRun.session, "fabric_task_event", {
+    taskId: queueRun.fabricTaskId,
+    workerRunId: queueRun.workerRunId,
+    kind: status === "failed" ? "failed" : status === "completed" ? "completed" : "patch_ready",
+    body: summary,
+    refs,
+    metadata: { taskDir: queueRun.taskDir, queueBacked: true, deepseekStatus: parsed.status }
+  });
+  await fabricCall(queueRun.client, queueRun.session, "project_queue_update_task", {
+    queueId: queueRun.queueId,
+    queueTaskId: queueRun.queueTaskId,
+    workerRunId: queueRun.workerRunId,
+    status,
+    summary,
+    patchRefs: refs,
+    testRefs: tests
+  });
+}
+
+async function failQueueBackedDirectRun(queueRun: QueueBackedDirectRun | undefined, error: unknown): Promise<void> {
+  if (!queueRun) return;
+  const message = error instanceof Error ? error.message : String(error);
+  await fabricCall(queueRun.client, queueRun.session, "fabric_task_event", {
+    taskId: queueRun.fabricTaskId,
+    workerRunId: queueRun.workerRunId,
+    kind: "failed",
+    body: message,
+    metadata: { taskDir: queueRun.taskDir, queueBacked: true }
+  }).catch(() => undefined);
+  await fabricCall(queueRun.client, queueRun.session, "project_queue_update_task", {
+    queueId: queueRun.queueId,
+    queueTaskId: queueRun.queueTaskId,
+    workerRunId: queueRun.workerRunId,
+    status: "failed",
+    summary: message,
+    patchRefs: [],
+    testRefs: []
+  }).catch(() => undefined);
+}
+
+function queueTaskStatusForDeepSeekStatus(status: string): string {
+  if (status === "completed") return "completed";
+  if (status === "failed" || status === "blocked") return "failed";
+  return "patch_ready";
+}
+
+async function registerQueueBackedDirectWorker(client: FabricClient, env: NodeJS.ProcessEnv, cwd: string): Promise<BridgeSession> {
+  const payload: BridgeRegister = {
+    bridgeVersion: "0.1.0",
+    agent: {
+      id: env.AGENT_FABRIC_AGENT_ID ?? "deepseek-direct-senior",
+      displayName: env.AGENT_FABRIC_AGENT_NAME ?? "DeepSeek direct Senior worker",
+      vendor: "deepseek"
+    },
+    host: { name: "DeepSeek Direct Worker", transport: "uds" },
+    workspace: { root: env.AGENT_FABRIC_WORKSPACE_ROOT ?? cwd, source: env.AGENT_FABRIC_WORKSPACE_ROOT ? "explicit" : "cwd" },
+    capabilities: {
+      roots: false,
+      notifications: false,
+      notificationsVisibleToAgent: { declared: "no", observed: "no" },
+      sampling: false,
+      streamableHttp: false,
+      litellmRouteable: false,
+      outcomeReporting: "explicit"
+    },
+    notificationSelfTest: { observed: "no", detail: "DeepSeek direct worker is request/response only" },
+    testMode: env.AGENT_FABRIC_TEST_MODE === "1"
+  };
+  try {
+    return await client.register(payload);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new FabricError(
+      "DEEPSEEK_QUEUE_BACKING_FAILED",
+      `Senior-mode TASK_DIR DeepSeek lanes must be queue-backed, but agent-fabric registration failed: ${message}. Start the daemon or set AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=off to intentionally allow file-only lanes.`,
+      true
+    );
+  }
+}
+
+async function fabricCall<T>(client: FabricClient, session: BridgeSession, tool: string, input: Record<string, unknown>): Promise<T> {
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (value !== undefined) cleaned[key] = value;
+  }
+  return client.call<T>(tool, cleaned, bridgeCallContext(session, { tool, input: cleaned }));
+}
+
+function seniorTaskDirPackets(taskDir: string, currentPacket: Record<string, unknown>, currentPath: string): Array<{ path: string; packet: Record<string, unknown> }> {
+  const entries: Array<{ path: string; packet: Record<string, unknown> }> = [];
+  for (const name of readdirSync(taskDir)) {
+    if (!name.endsWith(".json") || name.endsWith(".result.json") || name.endsWith(".stdout.json")) continue;
+    const path = join(taskDir, name);
+    try {
+      const parsed = parseTaskPacket(readFileSync(path, "utf8"), path);
+      const task = asRecord(parsed.task);
+      if (task.queueTaskId || task.clientKey || task.title || task.goal) entries.push({ path, packet: parsed });
+    } catch {
+      continue;
+    }
+  }
+  if (!entries.some((entry) => resolve(entry.path) === resolve(currentPath))) entries.push({ path: currentPath, packet: currentPacket });
+  return entries;
+}
+
+function queueTaskFromPacket(packet: Record<string, unknown>, taskPacketPath: string): Record<string, unknown> {
+  const task = asRecord(packet.task);
+  const title = typeof task.title === "string" && task.title.trim() ? task.title.trim() : taskPacketKey(packet, taskPacketPath);
+  const goal = typeof task.goal === "string" && task.goal.trim() ? task.goal.trim() : title;
+  return {
+    clientKey: taskPacketKey(packet, taskPacketPath),
+    title,
+    goal,
+    phase: typeof task.phase === "string" ? task.phase : "senior-mode",
+    category: typeof task.category === "string" ? task.category : "deepseek-direct",
+    priority: normalizeEnum(task.priority, ["low", "normal", "high", "urgent"], "high"),
+    risk: normalizeEnum(task.risk, ["low", "medium", "high", "breakglass"], "medium"),
+    parallelSafe: typeof task.parallelSafe === "boolean" ? task.parallelSafe : true,
+    expectedFiles: stringArray(task.expectedFiles),
+    acceptanceCriteria: stringArray(task.acceptanceCriteria),
+    requiredTools: uniqueStrings(["shell", ...stringArray(task.requiredTools)]),
+    requiredMcpServers: stringArray(task.requiredMcpServers),
+    requiredMemories: stringArray(task.requiredMemories),
+    requiredContextRefs: stringArray(task.requiredContextRefs),
+    dependsOn: stringArray(task.dependsOn)
+  };
+}
+
+function taskPacketKey(packet: Record<string, unknown>, taskPacketPath: string): string {
+  return getNestedString(packet, ["task", "queueTaskId"]) ?? getNestedString(packet, ["task", "clientKey"]) ?? basename(taskPacketPath).replace(/\.json$/i, "");
+}
+
+function seniorProjectPath(packet: Record<string, unknown>, env: NodeJS.ProcessEnv, cwd: string): string {
+  return env.AGENT_FABRIC_PROJECT_PATH ?? getNestedString(packet, ["queue", "projectPath"]) ?? getNestedString(packet, ["queue", "project_path"]) ?? cwd;
+}
+
+function seniorPromptSummary(packet: Record<string, unknown>, taskDir: string): string {
+  const goal = getNestedString(packet, ["task", "goal"]);
+  const summary = goal ? goal.slice(0, 600) : `Senior-mode DeepSeek lanes from ${taskDir}`;
+  return summary.trim() || `Senior-mode DeepSeek lanes from ${taskDir}`;
+}
+
+function seniorMaxParallelAgents(env: NodeJS.ProcessEnv): number {
+  const parsed = Number(env.AGENT_FABRIC_QUEUE_MAX_AGENTS ?? env.AGENT_FABRIC_SENIOR_LANE_COUNT ?? 10);
+  if (!Number.isFinite(parsed)) return 10;
+  return Math.max(1, Math.min(16, Math.floor(parsed)));
+}
+
+function seniorQueueMetadataPath(taskDir: string): string {
+  return join(taskDir, ".agent-fabric-queue.json");
+}
+
+function readSeniorQueueMetadata(path: string): SeniorTaskDirQueueMetadata | undefined {
+  if (!existsSync(path)) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const record = parsed as SeniorTaskDirQueueMetadata;
+    if (record.schema !== "agent-fabric.senior-task-dir-queue.v1" || !record.queueId || !record.taskDir) return undefined;
+    return record;
+  } catch {
+    return undefined;
+  }
+}
+
+async function withDirectoryLock<T>(lockDir: string, run: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      mkdirSync(lockDir, { recursive: false });
+      try {
+        return await run();
+      } finally {
+        rmSync(lockDir, { recursive: true, force: true });
+      }
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code !== "EEXIST") throw error;
+      await delay(100);
+    }
+  }
+  throw new FabricError("DEEPSEEK_QUEUE_BACKING_LOCKED", `Timed out waiting for queue backing lock ${lockDir}`, true);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function promptImprovementMessages(request: ProjectModelRequest): Array<{ role: "system" | "user"; content: string }> {
@@ -803,6 +1227,10 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+
 function arrayValue(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
@@ -842,6 +1270,15 @@ function parseSensitiveContextMode(value: string | undefined, allowSensitiveCont
   if (value === undefined) return "basic";
   if (value === "basic" || value === "strict" || value === "off") return value;
   throw new FabricError("INVALID_INPUT", "sensitive-context-mode must be basic, strict, or off", false);
+}
+
+function effectiveSensitiveContextMode(
+  command: Extract<DeepSeekWorkerCommand, { command: "model-command" | "run-task" }>,
+  env: NodeJS.ProcessEnv
+): SensitiveContextMode {
+  if (command.allowSensitiveContext) return "off";
+  if (env.AGENT_FABRIC_SENIOR_MODE === "permissive" && !command.sensitiveContextModeExplicit) return "off";
+  return command.sensitiveContextMode;
 }
 
 type ParsedFlags = {

@@ -163,6 +163,16 @@ type ApprovalTokenResult =
   | { accepted: true; requestId: string; scope: string; expiresAt: string; usesRemaining: number }
   | { accepted: false; warning: string };
 
+type PendingApprovalReuseInput = {
+  workspaceRoot: string;
+  budgetScope: string;
+  client: string;
+  selectedProvider: string;
+  selectedModel: string;
+  selectedReasoning: string;
+  nowIso: string;
+};
+
 const KNOWN_PROVIDERS = new Set(["anthropic", "azure", "deepseek", "openai", "openrouter", "copilot"]);
 const HIGH_REASONING = new Set(["high", "xhigh", "max"]);
 const SENSITIVE_BREAKGLASS = new Set(["api_key", "apikey", "secret", "secrets", "cookies", "cookie", "external_action", "production_data"]);
@@ -470,8 +480,20 @@ export function llmPreflight(host: SurfaceHost, input: unknown, context: CallCon
       testMode: session.test_mode === 1
     });
 
-    const approvalRequest =
+    const reusableApprovalRequest =
       decision === "needs_user_approval"
+        ? reusablePendingApprovalRequest(host, {
+            workspaceRoot,
+            budgetScope,
+            client,
+            selectedProvider: selected.provider,
+            selectedModel: selected.model,
+            selectedReasoning: selected.reasoning,
+            nowIso: host.now().toISOString()
+          })
+        : undefined;
+    const approvalRequest =
+      decision === "needs_user_approval" && !reusableApprovalRequest
         ? createApprovalRequest(host, {
             preflightId,
             sessionId: session.id,
@@ -483,6 +505,7 @@ export function llmPreflight(host: SurfaceHost, input: unknown, context: CallCon
             selectedProvider: selected.provider,
             selectedModel: selected.model,
             selectedReasoning: selected.reasoning,
+            budgetScope,
             inputTokens,
             reservedOutputTokens,
             estimatedCostUsd,
@@ -554,6 +577,14 @@ export function llmPreflight(host: SurfaceHost, input: unknown, context: CallCon
             requestId: preflightId,
             expiresAt: approvalRequest.expiresAt
           }
+        : reusableApprovalRequest
+          ? {
+              required: true,
+              reused: true,
+              requestId: reusableApprovalRequest.preflight_request_id,
+              approvalRequestId: reusableApprovalRequest.id,
+              expiresAt: reusableApprovalRequest.expires_at
+            }
         : tokenResult?.accepted
           ? {
               accepted: true,
@@ -625,19 +656,27 @@ export function modelBrainRoute(host: SurfaceHost, input: unknown, context: Call
   if (!candidateModel) {
     throw new FabricError("INVALID_INPUT", "model_brain_route requires roleAlias or candidateModel", false);
   }
+  const requestedProvider = getOptionalString(input, "requestedProvider") ?? alias?.provider;
+  const resolvedRequestedReasoning = requestedReasoning ?? alias?.reasoning;
 
   const gateInput = {
     ...asRecord(input),
     task,
     candidateModel,
-    requestedProvider: getOptionalString(input, "requestedProvider") ?? alias?.provider,
-    requestedReasoning: requestedReasoning ?? alias?.reasoning,
+    requestedProvider,
+    requestedReasoning: resolvedRequestedReasoning,
     budgetScope: getOptionalString(input, "budgetScope") ?? (roleAlias ? `model_brain:${roleAlias}` : "model_brain")
   };
   const gated = llmHardGate(host, gateInput, context);
   const preflight = asRecord(gated.preflight);
   const selected = asRecord(preflight.selected);
   const estimate = asRecord(preflight.estimate);
+  const selectedProvider = stringValue(selected.provider);
+  const selectedModel = stringValue(selected.model);
+  const selectedReasoning = stringValue(selected.reasoning);
+  const providerChanged = Boolean(requestedProvider && requestedProvider !== selectedProvider);
+  const modelChanged = candidateModel !== selectedModel;
+  const reasoningChanged = Boolean(resolvedRequestedReasoning && resolvedRequestedReasoning !== selectedReasoning);
   const aliasWarnings = alias
     ? aliasConstraintWarnings(alias, {
         taskType,
@@ -652,15 +691,33 @@ export function modelBrainRoute(host: SurfaceHost, input: unknown, context: Call
     schema: "agent-fabric.model-brain-route.v1",
     roleAlias,
     taskType,
+    requested: {
+      source: candidateModelInput ? "candidate_model" : "role_alias",
+      candidateModel,
+      provider: requestedProvider,
+      reasoning: resolvedRequestedReasoning,
+      roleAlias,
+      aliasSource: alias?.source
+    },
     route: {
-      provider: selected.provider,
-      model: selected.model,
-      reasoning: selected.reasoning,
+      provider: selectedProvider,
+      model: selectedModel,
+      reasoning: selectedReasoning,
       billingMode: selected.billingMode,
       priceSource: selected.priceSource,
       priceConfidence: selected.priceConfidence,
       aliasSource: alias?.source,
       reasonCodes: aliasWarnings.reasonCodes
+    },
+    routeResolution: {
+      changed: providerChanged || modelChanged || reasoningChanged,
+      providerChanged,
+      modelChanged,
+      reasoningChanged,
+      summary:
+        providerChanged || modelChanged || reasoningChanged
+          ? `Resolved ${candidateModel}${requestedProvider ? ` via ${requestedProvider}` : ""} to ${selectedProvider}/${selectedModel}/${selectedReasoning}.`
+          : "Requested route matches selected route."
     },
     gate: gated.gate,
     estimate,
@@ -704,11 +761,17 @@ export function llmApprove(host: SurfaceHost, input: unknown, context: CallConte
     const requestId = getString(input, "requestId");
     const decision = normalizeApprovalDecision(getString(input, "decision"));
     const scope = normalizeApprovalScope(getOptionalString(input, "scope"));
-    const boundResourceId = getOptionalString(input, "boundResourceId") ?? requestId;
     const note = getOptionalString(input, "note") ?? null;
     const nowIso = host.now().toISOString();
-    const row = host.db.db.prepare("SELECT * FROM approval_requests WHERE preflight_request_id = ?").get(requestId) as
-      | ApprovalRequestRow
+    const row = host.db.db
+      .prepare(
+        `SELECT a.*, p.budget_scope
+         FROM approval_requests a
+         JOIN llm_preflight_requests p ON p.id = a.preflight_request_id
+         WHERE a.preflight_request_id = ?`
+      )
+      .get(requestId) as
+      | (ApprovalRequestRow & { budget_scope: string })
       | undefined;
     if (!row) {
       throw new FabricError("APPROVAL_REQUEST_NOT_FOUND", `Approval request not found for preflight: ${requestId}`, false);
@@ -720,6 +783,7 @@ export function llmApprove(host: SurfaceHost, input: unknown, context: CallConte
       throw new FabricError("APPROVAL_EXPIRED", `Approval request ${requestId} expired at ${row.expires_at}`, false);
     }
 
+    const boundResourceId = getOptionalString(input, "boundResourceId") ?? (scope === "call" ? requestId : row.budget_scope);
     const status = statusForApprovalDecision(decision);
     const token = decision === "allow" ? newSessionToken() : undefined;
     const tokenHash = token ? hashSecret(token) : null;
@@ -1126,6 +1190,7 @@ function createApprovalRequest(
     selectedProvider: string;
     selectedModel: string;
     selectedReasoning: string;
+    budgetScope: string;
     inputTokens: number;
     reservedOutputTokens: number;
     estimatedCostUsd: number;
@@ -1184,6 +1249,7 @@ function createApprovalRequest(
       selectedProvider: input.selectedProvider,
       selectedModel: input.selectedModel,
       selectedReasoning: input.selectedReasoning,
+      budgetScope: input.budgetScope,
       estimatedCostUsd: input.estimatedCostUsd,
       risk: input.risk
     },
@@ -1256,13 +1322,15 @@ function approvalTokenMatches(
   const storedResource = row.bound_resource_id;
   const storedResourceIsOriginalRequest = storedResource === row.preflight_request_id;
   const resourceMatches = !storedResource || storedResourceIsOriginalRequest || storedResource === request.boundResourceId || storedResource === request.budgetScope;
+  const tokenScope = row.scope ?? "call";
+  const estimateMatches =
+    tokenScope === "call" ? request.estimatedCostUsd <= row.estimated_cost_usd && request.inputTokens <= row.input_tokens : true;
   return (
     row.workspace_root === request.workspaceRoot &&
     row.selected_provider === request.selectedProvider &&
     row.selected_model === request.selectedModel &&
     row.selected_reasoning === request.selectedReasoning &&
-    request.estimatedCostUsd <= row.estimated_cost_usd &&
-    request.inputTokens <= row.input_tokens &&
+    estimateMatches &&
     resourceMatches
   );
 }
@@ -1296,15 +1364,44 @@ function statusForApprovalDecision(decision: ApprovalDecision): ApprovalStatus {
 
 function normalizeApprovalScope(value: string | undefined): string {
   if (!value) return "call";
-  if (["call", "chain", "session", "day"].includes(value)) return value;
-  throw new FabricError("INVALID_INPUT", "scope must be call, chain, session, or day", false);
+  if (["call", "chain", "queue", "session", "day"].includes(value)) return value;
+  throw new FabricError("INVALID_INPUT", "scope must be call, chain, queue, session, or day", false);
 }
 
 function tokenMaxUses(scope: string): number {
   if (scope === "call") return 1;
   if (scope === "chain") return 50;
+  if (scope === "queue") return 200;
   if (scope === "day") return 200;
   return 100;
+}
+
+function reusablePendingApprovalRequest(host: SurfaceHost, input: PendingApprovalReuseInput): ApprovalRequestRow | undefined {
+  return host.db.db
+    .prepare(
+      `SELECT a.*
+       FROM approval_requests a
+       JOIN llm_preflight_requests p ON p.id = a.preflight_request_id
+       WHERE a.workspace_root = ?
+         AND a.status = 'pending'
+         AND a.expires_at > ?
+         AND a.client = ?
+         AND a.selected_provider = ?
+         AND a.selected_model = ?
+         AND a.selected_reasoning = ?
+         AND p.budget_scope = ?
+       ORDER BY a.ts_created ASC
+       LIMIT 1`
+    )
+    .get(
+      input.workspaceRoot,
+      input.nowIso,
+      input.client,
+      input.selectedProvider,
+      input.selectedModel,
+      input.selectedReasoning,
+      input.budgetScope
+    ) as ApprovalRequestRow | undefined;
 }
 
 function tokenExpiry(host: SurfaceHost, requestedSeconds: number | undefined): Date {
@@ -1477,6 +1574,10 @@ function sensitiveFlagsFor(input: unknown, contextPackage: Record<string, unknow
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
 }
 
 function hasUnverifiedMemory(contextPackage: Record<string, unknown>): boolean {

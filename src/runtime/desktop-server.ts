@@ -32,6 +32,15 @@ export type DesktopServerRuntime = {
 
 const API_CALL_TOOLS = new Set([
   "fabric_status",
+  "fabric_spawn_agents",
+  "fabric_list_agents",
+  "fabric_open_agent",
+  "fabric_message_agent",
+  "fabric_wait_agents",
+  "fabric_accept_patch",
+  "fabric_senior_start",
+  "fabric_senior_status",
+  "fabric_senior_resume",
   "project_queue_create",
   "project_queue_update_settings",
   "project_queue_record_stage",
@@ -44,6 +53,8 @@ const API_CALL_TOOLS = new Set([
   "project_queue_approval_inbox",
   "project_queue_timeline",
   "project_queue_agent_lanes",
+  "project_queue_approve_model_calls",
+  "project_queue_progress_report",
   "project_queue_prepare_ready",
   "project_queue_launch_plan",
   "project_queue_claim_next",
@@ -115,7 +126,8 @@ const DESKTOP_FEATURES = {
   taskPackets: true,
   taskPacketReadRoute: true,
   readyPacketLinks: true,
-  staleWorkerRecovery: true
+  staleWorkerRecovery: true,
+  codexWorkerBridge: true
 };
 
 export async function createDesktopFabricCaller(options: DesktopServerOptions = {}): Promise<DesktopToolCaller> {
@@ -351,7 +363,7 @@ async function handleApi(
           limit: numberQuery(url, "limit"),
           format: optionalQuery(url, "format") ?? "markdown",
           includeResume: boolQuery(url, "includeResume") ?? true,
-          preferredWorker: optionalQuery(url, "preferredWorker") ?? "local-cli",
+          preferredWorker: optionalQuery(url, "preferredWorker") ?? "ramicode",
           workspaceMode: optionalQuery(url, "workspaceMode") ?? "git_worktree",
           workspacePath: optionalQuery(url, "workspacePath"),
           modelProfile: optionalQuery(url, "modelProfile") ?? "execute.cheap"

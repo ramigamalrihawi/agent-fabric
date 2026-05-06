@@ -9,6 +9,17 @@ import {
   type CostIngestResult
 } from "./costing.js";
 import { fabricInspectContextPackage } from "./surfaces/contextInspector.js";
+import {
+  fabricAcceptPatch,
+  fabricListAgents,
+  fabricMessageAgent,
+  fabricOpenAgent,
+  fabricSeniorResume,
+  fabricSeniorStart,
+  fabricSeniorStatus,
+  fabricSpawnAgents,
+  fabricWaitAgents
+} from "./surfaces/codexBridge.js";
 import { hashSecret, newId, newSessionToken, stableHash } from "./ids.js";
 import type {
   BridgeRegister,
@@ -111,6 +122,7 @@ import {
 import {
   projectQueueAddTasks,
   projectQueueAgentLanes,
+  projectQueueApproveModelCalls,
   projectQueueApprovalInbox,
   projectQueueAssignWorker,
   projectQueueClaimNext,
@@ -121,6 +133,7 @@ import {
   projectQueueLaunchPlan,
   projectQueueNextReady,
   projectQueuePrepareReady,
+  projectQueueProgressReport,
   projectQueueRecordStage,
   projectQueueRecoverStale,
   projectQueueResumeTask,
@@ -315,6 +328,33 @@ export class FabricDaemon {
       if (tool === "fabric_inspect_context_package") {
         return { ok: true, tool, data: fabricInspectContextPackage(this, input, context) as T };
       }
+      if (tool === "fabric_spawn_agents") {
+        return { ok: true, tool, data: fabricSpawnAgents(this, input, context) as T };
+      }
+      if (tool === "fabric_list_agents") {
+        return { ok: true, tool, data: fabricListAgents(this, input, context) as T };
+      }
+      if (tool === "fabric_open_agent") {
+        return { ok: true, tool, data: fabricOpenAgent(this, input, context) as T };
+      }
+      if (tool === "fabric_message_agent") {
+        return { ok: true, tool, data: fabricMessageAgent(this, input, context) as T };
+      }
+      if (tool === "fabric_wait_agents") {
+        return { ok: true, tool, data: fabricWaitAgents(this, input, context) as T };
+      }
+      if (tool === "fabric_accept_patch") {
+        return { ok: true, tool, data: fabricAcceptPatch(this, input, context) as T };
+      }
+      if (tool === "fabric_senior_start") {
+        return { ok: true, tool, data: fabricSeniorStart(this, input, context) as T };
+      }
+      if (tool === "fabric_senior_status") {
+        return { ok: true, tool, data: fabricSeniorStatus(this, input, context) as T };
+      }
+      if (tool === "fabric_senior_resume") {
+        return { ok: true, tool, data: fabricSeniorResume(this, input, context) as T };
+      }
       if (tool === "fabric_notification_self_test_start") {
         return { ok: true, tool, data: this.startNotificationSelfTest(input, context) as T };
       }
@@ -494,6 +534,12 @@ export class FabricDaemon {
       }
       if (tool === "project_queue_agent_lanes") {
         return { ok: true, tool, data: projectQueueAgentLanes(this, input, context) as T };
+      }
+      if (tool === "project_queue_approve_model_calls") {
+        return { ok: true, tool, data: projectQueueApproveModelCalls(this, input, context) as T };
+      }
+      if (tool === "project_queue_progress_report") {
+        return { ok: true, tool, data: projectQueueProgressReport(this, input, context) as T };
       }
       if (tool === "project_queue_approval_inbox") {
         return { ok: true, tool, data: projectQueueApprovalInbox(this, input, context) as T };

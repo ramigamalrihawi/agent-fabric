@@ -88,6 +88,53 @@ describe("DeepSeek direct worker", () => {
     expect(result._meta).toMatchObject({ provider: "deepseek", model: "deepseek-v4-pro", reasoningEffort: "max" });
   });
 
+  it("allows sensitive-looking model-command stdin by default in Senior mode", async () => {
+    let calls = 0;
+    const result = await runDeepSeekWorkerCommand(parseDeepSeekWorkerArgs(["model-command"]), {
+      env: { DEEPSEEK_API_KEY: "test-key", AGENT_FABRIC_SENIOR_MODE: "permissive" },
+      stdin: JSON.stringify({
+        kind: "prompt_improvement",
+        route: { provider: "deepseek", model: "deepseek-v4-pro", reasoning: "max" },
+        input: { prompt: "Review task-relevant config with api_key=abcdefghijklmnopqrstuvwxyzABCDEFGH" }
+      }),
+      fetchImpl: async () => {
+        calls += 1;
+        return fakeJsonResponse({
+          id: "resp_model_command_senior",
+          choices: [
+            {
+              finish_reason: "stop",
+              message: { content: JSON.stringify({ improvedPrompt: "Senior prompt accepted.", summary: "ok" }) }
+            }
+          ],
+          usage: { prompt_tokens: 100, completion_tokens: 20 }
+        });
+      }
+    });
+
+    expect(calls).toBe(1);
+    expect(result).toMatchObject({ improvedPrompt: "Senior prompt accepted." });
+  });
+
+  it("honors explicit sensitive-context scanning for model-command in Senior mode", async () => {
+    let calls = 0;
+    await expect(
+      runDeepSeekWorkerCommand(parseDeepSeekWorkerArgs(["model-command", "--sensitive-context-mode", "basic"]), {
+        env: { DEEPSEEK_API_KEY: "test-key", AGENT_FABRIC_SENIOR_MODE: "permissive" },
+        stdin: JSON.stringify({
+          kind: "prompt_improvement",
+          route: { provider: "deepseek", model: "deepseek-v4-pro", reasoning: "max" },
+          input: { prompt: "Review task-relevant config with api_key=abcdefghijklmnopqrstuvwxyzABCDEFGH" }
+        }),
+        fetchImpl: async () => {
+          calls += 1;
+          return fakeJsonResponse({});
+        }
+      })
+    ).rejects.toThrow("sensitive material");
+    expect(calls).toBe(0);
+  });
+
   it("writes a structured task report artifact", async () => {
     const dir = mkdtempSync(join(tmpdir(), "agent-fabric-deepseek-worker-"));
     const packetPath = join(dir, "packet.json");
@@ -365,6 +412,167 @@ describe("DeepSeek direct worker", () => {
     );
 
     expect(result).toMatchObject({ status: "needs_review", outputFile: outputPath });
+  });
+
+  it("allows sensitive-looking packets by default in Senior mode", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-fabric-deepseek-worker-"));
+    const packetPath = join(dir, "packet.json");
+    const outputPath = join(dir, "result.json");
+    writeFileSync(
+      packetPath,
+      JSON.stringify({
+        schema: "agent-fabric.task-packet.v1",
+        task: {
+          queueTaskId: "pqtask_senior_mode",
+          fabricTaskId: "task_senior_mode",
+          title: "Senior mode",
+          goal: "Review a task-relevant local config sample with api_key=abcdefghijklmnopqrstuvwxyzABCDEFGH"
+        }
+      }),
+      "utf8"
+    );
+
+    const result = await runDeepSeekWorkerCommand(parseDeepSeekWorkerArgs(["run-task", "--task-packet", packetPath, "--output", outputPath]), {
+      cwd: dir,
+      env: { DEEPSEEK_API_KEY: "test-key", AGENT_FABRIC_SENIOR_MODE: "permissive" },
+      fetchImpl: async () =>
+        fakeJsonResponse({
+          id: "resp_senior_mode",
+          choices: [
+            {
+              finish_reason: "stop",
+              message: {
+                content: JSON.stringify({
+                  status: "needs_review",
+                  summary: "Senior mode default accepted."
+                })
+              }
+            }
+          ],
+          usage: { prompt_tokens: 300, completion_tokens: 100 }
+        })
+    });
+
+    expect(result).toMatchObject({ status: "needs_review", outputFile: outputPath });
+  });
+
+  it("honors explicit sensitive-context scanning in Senior mode", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-fabric-deepseek-worker-"));
+    const packetPath = join(dir, "packet.json");
+    const outputPath = join(dir, "result.json");
+    let calls = 0;
+    writeFileSync(
+      packetPath,
+      JSON.stringify({
+        schema: "agent-fabric.task-packet.v1",
+        task: {
+          queueTaskId: "pqtask_senior_strict",
+          fabricTaskId: "task_senior_strict",
+          title: "Senior strict",
+          goal: "Run a sanitized review over api_key=abcdefghijklmnopqrstuvwxyzABCDEFGH"
+        }
+      }),
+      "utf8"
+    );
+
+    await expect(
+      runDeepSeekWorkerCommand(parseDeepSeekWorkerArgs(["run-task", "--task-packet", packetPath, "--output", outputPath, "--sensitive-context-mode", "basic"]), {
+        cwd: dir,
+        env: { DEEPSEEK_API_KEY: "test-key", AGENT_FABRIC_SENIOR_MODE: "permissive" },
+        fetchImpl: async () => {
+          calls += 1;
+          return fakeJsonResponse({});
+        }
+      })
+    ).rejects.toThrow("sensitive material");
+    expect(calls).toBe(0);
+  });
+
+  it("requires queue backing for Senior TASK_DIR direct lanes before calling DeepSeek", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-fabric-deepseek-worker-"));
+    const packetPath = join(dir, "packet.json");
+    const outputPath = join(dir, "result.json");
+    let calls = 0;
+    writeFileSync(
+      packetPath,
+      JSON.stringify({
+        schema: "agent-fabric.task-packet.v1",
+        task: {
+          clientKey: "senior-lane-1",
+          title: "Queue backed lane",
+          goal: "Run as a visible queue-backed Senior lane."
+        }
+      }),
+      "utf8"
+    );
+
+    await expect(
+      runDeepSeekWorkerCommand(parseDeepSeekWorkerArgs(["run-task", "--task-packet", packetPath, "--output", outputPath]), {
+        cwd: dir,
+        env: {
+          DEEPSEEK_API_KEY: "test-key",
+          AGENT_FABRIC_SENIOR_MODE: "permissive",
+          TASK_DIR: dir,
+          AGENT_FABRIC_SOCKET: join(dir, "missing.sock")
+        },
+        fetchImpl: async () => {
+          calls += 1;
+          return fakeJsonResponse({});
+        }
+      })
+    ).rejects.toThrow("must be queue-backed");
+    expect(calls).toBe(0);
+  });
+
+  it("allows explicit file-only Senior TASK_DIR runs when auto queueing is disabled", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-fabric-deepseek-worker-"));
+    const packetPath = join(dir, "packet.json");
+    const outputPath = join(dir, "result.json");
+    let calls = 0;
+    writeFileSync(
+      packetPath,
+      JSON.stringify({
+        schema: "agent-fabric.task-packet.v1",
+        task: {
+          clientKey: "senior-lane-file-only",
+          title: "File only lane",
+          goal: "Run without queue registration only when explicitly disabled."
+        }
+      }),
+      "utf8"
+    );
+
+    const result = await runDeepSeekWorkerCommand(parseDeepSeekWorkerArgs(["run-task", "--task-packet", packetPath, "--output", outputPath]), {
+      cwd: dir,
+      env: {
+        DEEPSEEK_API_KEY: "test-key",
+        AGENT_FABRIC_SENIOR_MODE: "permissive",
+        TASK_DIR: dir,
+        AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE: "off"
+      },
+      fetchImpl: async () => {
+        calls += 1;
+        return fakeJsonResponse({
+          id: "resp_senior_file_only",
+          choices: [
+            {
+              finish_reason: "stop",
+              message: {
+                content: JSON.stringify({
+                  status: "needs_review",
+                  summary: "Explicit file-only Senior run completed."
+                })
+              }
+            }
+          ],
+          usage: { prompt_tokens: 300, completion_tokens: 100 }
+        });
+      }
+    });
+
+    expect(calls).toBe(1);
+    expect(result).toMatchObject({ status: "needs_review", outputFile: outputPath });
+    expect(result.queueBacked).toBeUndefined();
   });
 
   it("writes proposed patches without applying them in patch-mode write", async () => {

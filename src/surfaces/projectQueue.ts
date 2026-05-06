@@ -18,6 +18,7 @@ import {
 } from "../runtime/input.js";
 import type { CallContext } from "../types.js";
 import type { SurfaceHost } from "./host.js";
+import { llmApprove, llmPreflight } from "./costPolicy.js";
 import { fabricTaskResume } from "./worker.js";
 
 type ProjectQueueRow = {
@@ -237,7 +238,7 @@ const STAGE_STATUSES = new Set(["pending", "running", "completed", "needs_review
 const TASK_STATUSES = new Set(["queued", "ready", "running", "blocked", "review", "patch_ready", "completed", "failed", "canceled", "accepted", "done"]);
 const TASK_PRIORITIES = new Set(["low", "normal", "high", "urgent"]);
 const WORKER_PRIORITIES = new Set(["low", "normal", "high"]);
-const WORKERS = new Set(["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"]);
+const WORKERS = new Set(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]);
 const WORKSPACE_MODES = new Set(["in_place", "git_worktree", "clone", "sandbox"]);
 const PACKET_FORMATS = new Set(["json", "markdown"]);
 const RISKS = new Set(["low", "medium", "high", "breakglass"]);
@@ -781,7 +782,7 @@ export function projectQueueTaskPacket(host: SurfaceHost, input: unknown, contex
   const task = requireQueueTask(host, queue.id, getString(input, "queueTaskId"));
   const format = normalizeValue(getOptionalString(input, "format") ?? "json", PACKET_FORMATS, "format");
   const includeResume = getOptionalBoolean(input, "includeResume") ?? false;
-  const preferredWorker = optionalNormalized(input, "preferredWorker", WORKERS) ?? "local-cli";
+  const preferredWorker = optionalNormalized(input, "preferredWorker", WORKERS) ?? "ramicode";
   const workspaceMode = optionalNormalized(input, "workspaceMode", WORKSPACE_MODES) ?? "git_worktree";
   const workspacePath = getOptionalString(input, "workspacePath");
   const modelProfile = getOptionalString(input, "modelProfile") ?? "execute.cheap";
@@ -1551,6 +1552,154 @@ export function projectQueueAgentLanes(host: SurfaceHost, input: unknown, contex
   return { queue: formatQueue(queue), count: lanes.length, lanes };
 }
 
+export function projectQueueApproveModelCalls(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const session = host.requireSession(context);
+  const queue = requireQueue(host, getString(input, "queueId"), session.workspace_root);
+  const budgetScope = `project_queue:${queue.id}`;
+  const candidateModel = getOptionalString(input, "candidateModel") ?? "deepseek-v4-pro";
+  const requestedProvider = getOptionalString(input, "requestedProvider") ?? "deepseek";
+  const requestedReasoning = getOptionalString(input, "requestedReasoning") ?? "max";
+  const expiresInSeconds = getOptionalNumber(input, "expiresInSeconds");
+  const note = getOptionalString(input, "note") ?? `Queue-scoped Senior-mode model approval for ${queue.id}.`;
+  const preflight = llmPreflight(
+    host,
+    {
+      task: {
+        type: "worker_deepseek_direct",
+        queueId: queue.id,
+        purpose: "queue_model_approval"
+      },
+      client: "agent-fabric-project",
+      candidateModel,
+      requestedProvider,
+      requestedReasoning,
+      contextPackageSummary: {
+        queueId: queue.id,
+        title: queue.title,
+        maxParallelAgents: queue.max_parallel_agents
+      },
+      budgetScope,
+      boundResourceId: budgetScope,
+      enforce: true
+    },
+    childContext(context, "model-preflight")
+  );
+
+  if (preflight.decision === "allow") {
+    return {
+      schema: "agent-fabric.project-queue-model-approval.v1",
+      queue: formatQueue(queue),
+      budgetScope,
+      status: "not_required",
+      preflight,
+      approval: undefined,
+      approvalToken: undefined
+    };
+  }
+
+  const approval = asRecord(preflight.approval);
+  const requestId = typeof approval?.requestId === "string" ? approval.requestId : String(preflight.requestId ?? "");
+  if (!requestId) {
+    throw new FabricError("MODEL_APPROVAL_REQUEST_MISSING", `Model preflight for queue ${queue.id} did not return an approval request id`, false);
+  }
+  const approved = llmApprove(
+    host,
+    {
+      requestId,
+      decision: "allow",
+      scope: "queue",
+      boundResourceId: budgetScope,
+      expiresInSeconds,
+      note
+    },
+    childContext(context, "model-approve")
+  );
+
+  return {
+    schema: "agent-fabric.project-queue-model-approval.v1",
+    queue: formatQueue(queue),
+    budgetScope,
+    status: "approved",
+    preflight,
+    approval: approved,
+    approvalToken: typeof approved.approvalToken === "string" ? approved.approvalToken : undefined,
+    audit: {
+      scope: "queue",
+      boundResourceId: budgetScope,
+      candidateModel,
+      requestedProvider,
+      requestedReasoning
+    }
+  };
+}
+
+export function projectQueueProgressReport(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const session = host.requireSession(context);
+  const queue = requireQueue(host, getString(input, "queueId"), session.workspace_root);
+  const maxEventsPerLane = normalizeEventLimit(getOptionalNumber(input, "maxEventsPerLane") ?? 5);
+  const tasks = taskRows(host, queue.id);
+  const counts = statusCounts(tasks);
+  const activeWorkers = tasks.filter((task) => ACTIVE_WORKER_STATUSES.has(task.status)).length;
+  const analyzed = analyzeReadiness(tasks);
+  const executionBlock = queueExecutionBlockReason(queue.status);
+  const scheduled = executionBlock
+    ? { ready: [], blocked: [] }
+    : selectSchedulableReadyTasks(analyzed.ready.sort(compareReadyTasks), tasks, Math.max(0, queue.max_parallel_agents - activeWorkers));
+  const blockedEntries = executionBlock ? queueBlockedEntries(tasks, executionBlock) : [...analyzed.blocked, ...scheduled.blocked];
+  const nowIso = host.now().toISOString();
+  const modelApprovals = pendingModelApprovalRows(host, queue.id, session.workspace_root, false, 50, nowIso);
+  const toolApprovals = host.db.db
+    .prepare(
+      `SELECT * FROM tool_context_proposals
+       WHERE queue_id = ? AND status = 'proposed' AND approval_required = 1
+       ORDER BY ts_created ASC`
+    )
+    .all(queue.id) as ToolContextProposalRow[];
+  const lanes = projectQueueAgentLanes(host, { queueId: queue.id, includeCompleted: true, maxEventsPerLane }, context);
+  const patchReadyTasks = tasks.filter((task) => task.status === "patch_ready").map(formatQueueTask);
+  const acceptedTasks = tasks.filter((task) => task.status === "accepted").map(formatQueueTask);
+  const failedTasks = tasks.filter((task) => task.status === "failed" || task.status === "canceled").map(formatQueueTask);
+  const pendingApprovalCount = modelApprovals.length + toolApprovals.length;
+  const summary = queueSummaryStrip({
+    queue,
+    tasks,
+    counts,
+    activeWorkers,
+    availableSlots: Math.max(0, queue.max_parallel_agents - activeWorkers),
+    readyCount: scheduled.ready.length,
+    blockedCount: blockedEntries.length,
+    pendingToolApprovals: toolApprovals.length,
+    pendingModelApprovals: modelApprovals.length,
+    staleRunningCount: staleWorkerRows(host, queue.id, new Date(host.now().getTime() - 30 * 60_000).toISOString(), host.now().getTime()).length,
+    preflights: queuePreflightRows(host, queue.id, session.workspace_root)
+  });
+  const nextActions = nextProgressActions(queue, summary, pendingApprovalCount, patchReadyTasks.length, scheduled.ready.length);
+
+  return {
+    schema: "agent-fabric.project-queue-progress.v1",
+    queue: formatQueue(queue),
+    generatedAt: nowIso,
+    summary,
+    counts,
+    workers: lanes,
+    blockers: blockedEntries.map(formatBlockedEntry),
+    approvals: {
+      pendingToolApprovals: toolApprovals.map(formatProposal),
+      pendingModelApprovals: modelApprovals.map((row) => formatModelApproval(row, nowIso))
+    },
+    patchReadyTasks,
+    acceptedTasks,
+    failedTasks,
+    nextActions,
+    nextCommand: nextActions[0]?.command,
+    verificationChecklist: [
+      "Review every patch-ready task before acceptance.",
+      "Run targeted tests or checks from each accepted worker result.",
+      "Record accepted or rejected output in the queue before final handoff."
+    ]
+  };
+}
+
 export function projectQueueAssignWorker(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const queueId = getString(input, "queueId");
   const queueTaskId = getString(input, "queueTaskId");
@@ -1561,6 +1710,13 @@ export function projectQueueAssignWorker(host: SurfaceHost, input: unknown, cont
     const executionBlock = queueWorkerStartBlockReason(queue.status);
     if (executionBlock) {
       throw new FabricError("PROJECT_QUEUE_EXECUTION_BLOCKED", `Queue ${queue.id} cannot assign workers because ${executionBlock}`, false);
+    }
+    if (!workerRunId) {
+      throw new FabricError(
+        "PROJECT_QUEUE_WORKER_RUN_REQUIRED",
+        "project_queue_assign_worker requires workerRunId; start/register the worker with fabric_task_start_worker or use project_queue_claim_next with worker settings.",
+        false
+      );
     }
     const task = requireQueueTask(host, queue.id, queueTaskId);
     if (!["queued", "ready", "running"].includes(task.status)) {
@@ -1584,6 +1740,7 @@ export function projectQueueAssignWorker(host: SurfaceHost, input: unknown, cont
         queueId: queue.id,
         queueTaskId: task.id,
         fabricTaskId: task.fabric_task_id ?? undefined,
+        workerRunId,
         status: task.status,
         assigned: false,
         approvalRequired: true,
@@ -2369,6 +2526,10 @@ function requireQueueTask(host: SurfaceHost, queueId: string, queueTaskId: strin
   return row;
 }
 
+function childContext(context: CallContext, suffix: string): CallContext {
+  return { ...context, idempotencyKey: context.idempotencyKey ? `${context.idempotencyKey}:${suffix}` : suffix };
+}
+
 function requireFabricTask(host: SurfaceHost, taskId: string, workspaceRoot: string): void {
   const row = host.db.db.prepare("SELECT id, workspace_root FROM tasks WHERE id = ?").get(taskId) as { id: string; workspace_root: string } | undefined;
   if (!row || row.workspace_root !== workspaceRoot) {
@@ -2614,7 +2775,13 @@ function defaultWorkerCommand(worker: string, fabricTaskId: string): string[] {
   if (worker === "manual") return [];
   if (worker === "aider") return ["aider", "--message", `Work on fabric task ${fabricTaskId}`];
   if (worker === "deepseek-direct") return ["agent-fabric-deepseek-worker", "run-task", "--fabric-task", fabricTaskId];
+  if (worker === "jcode-deepseek") return [jcodeDeepSeekDispatcherPath(), "<task-packet>"];
   return [worker, "run", "--fabric-task", fabricTaskId];
+}
+
+function jcodeDeepSeekDispatcherPath(): string {
+  const configured = process.env.AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER?.trim();
+  return configured || "dispatch-deepseek-with-collab.sh";
 }
 
 function queueBlockedEntries(tasks: ProjectQueueTaskRow[], reason: string): Array<{ task: ProjectQueueTaskRow; reasons: string[] }> {
@@ -3265,6 +3432,53 @@ function queueSummaryStrip(input: {
   };
 }
 
+function nextProgressActions(
+  queue: ProjectQueueRow,
+  summary: Record<string, unknown>,
+  pendingApprovalCount: number,
+  patchReadyCount: number,
+  readyCount: number
+): Array<Record<string, unknown>> {
+  if (pendingApprovalCount > 0) {
+    return [
+      {
+        label: "Approve pending model/tool requests",
+        command: `agent-fabric-project senior-run --queue ${queue.id} --approve-model-calls`
+      }
+    ];
+  }
+  if (patchReadyCount > 0) {
+    return [
+      {
+        label: "Review patch-ready workers before accepting output",
+        command: `agent-fabric-project review-patches --queue ${queue.id}`
+      }
+    ];
+  }
+  if (queue.status !== "running" && readyCount > 0) {
+    return [
+      {
+        label: "Start Senior worker execution",
+        command: `agent-fabric-project senior-run --queue ${queue.id} --approve-model-calls`
+      }
+    ];
+  }
+  if (readyCount > 0) {
+    return [
+      {
+        label: "Launch remaining ready Senior workers",
+        command: `agent-fabric-project senior-run --queue ${queue.id} --approve-model-calls`
+      }
+    ];
+  }
+  return [
+    {
+      label: String(summary.nextAction ?? "Inspect queue status"),
+      command: `agent-fabric-project status --queue ${queue.id}`
+    }
+  ];
+}
+
 function queueRiskStrip(tasks: ProjectQueueTaskRow[]): Record<string, unknown> {
   const order = ["low", "medium", "high", "breakglass"];
   const openTasks = tasks.filter((task) => !DEPENDENCY_DONE.has(task.status) && task.status !== "failed" && task.status !== "canceled");
@@ -3877,13 +4091,19 @@ function buildQueueWorkerHandoff(
 ): Record<string, unknown> {
   const packetDir = dirnameFromPath(options.packetPath);
   const deepseekCommand = options.worker === "deepseek-direct";
+  const jcodeDeepSeekCommand = options.worker === "jcode-deepseek";
+  const jcodeDispatcher = jcodeDeepSeekDispatcherPath();
   const runReadyCommandTemplate =
-    options.worker === "deepseek-direct"
+    deepseekCommand
       ? "agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}} --fabric-task {{fabricTaskId}} --role implementer"
-      : `<${options.worker} command using {{taskPacket}}>`;
+      : jcodeDeepSeekCommand
+        ? `${shellQuote(jcodeDispatcher)} {{taskPacket}}`
+        : `<${options.worker} command using {{taskPacket}}>`;
   const runTaskCommand = deepseekCommand
-    ? `agent-fabric-deepseek-worker run-task --task-packet ${options.packetPath} --fabric-task ${task.fabric_task_id ?? ""} --role implementer`
-    : runReadyCommandTemplate;
+    ? `agent-fabric-deepseek-worker run-task --task-packet ${shellQuote(options.packetPath)} --fabric-task ${shellQuote(task.fabric_task_id ?? "")} --role implementer`
+    : jcodeDeepSeekCommand
+      ? `${shellQuote(jcodeDispatcher)} ${shellQuote(options.packetPath)}`
+      : runReadyCommandTemplate;
   const claimArgs = [
     "npm",
     "run",
@@ -3985,18 +4205,18 @@ function buildQueueWorkerHandoff(
         key: "run_this_task",
         label: "Run this task with a packet",
         command: shellCommand(runTaskArgs),
-        editRequired: !deepseekCommand
+        editRequired: !(deepseekCommand || jcodeDeepSeekCommand)
       },
       {
         key: "run_ready_parallel",
         label: "Run ready tasks in parallel",
         command: shellCommand(runReadyArgs),
-        editRequired: !deepseekCommand
+        editRequired: !(deepseekCommand || jcodeDeepSeekCommand)
       }
     ],
     notes: [
-      deepseekCommand
-        ? "DeepSeek direct commands call the OpenAI-compatible DeepSeek API and require DEEPSEEK_API_KEY or DEEPSEEK_TOKEN in the environment."
+      deepseekCommand || jcodeDeepSeekCommand
+        ? "DeepSeek-backed commands call the OpenAI-compatible DeepSeek API and require DEEPSEEK_API_KEY or DEEPSEEK_TOKEN in the environment."
         : "Commands marked editRequired contain a worker command placeholder that should be replaced with the real local worker invocation.",
       "The packet path is a handoff convention; write the packet first or copy the packet body into the worker UI."
     ]

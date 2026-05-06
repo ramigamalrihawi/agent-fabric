@@ -34,6 +34,7 @@ try {
         requestId: command.requestId,
         decision: command.decision,
         scope: command.scope,
+        boundResourceId: command.boundResourceId,
         expiresInSeconds: command.expiresInSeconds,
         note: command.note
       });
@@ -108,6 +109,7 @@ async function promptForApproval(
         requestId: request.requestId,
         decision,
         scope: command.scope,
+        boundResourceId: command.boundResourceId,
         expiresInSeconds: command.expiresInSeconds,
         note: command.note
       });
@@ -125,7 +127,8 @@ async function decide(
   input: {
     requestId: string;
     decision: ApprovalCliDecision;
-    scope: "call" | "chain" | "session" | "day";
+    scope: "call" | "chain" | "queue" | "session" | "day";
+    boundResourceId?: string;
     expiresInSeconds?: number;
     note?: string;
   }

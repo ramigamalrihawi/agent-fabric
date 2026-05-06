@@ -277,6 +277,7 @@ Terminal gateway:
 
 ```bash
 npm run dev:approve -- approve <requestId> --scope call
+npm run dev:approve -- approve <requestId> --scope queue --queue <queueId>
 npm run dev:approve -- compact <requestId> --note "drop logs and retry"
 npm run dev:approve -- downgrade <requestId>
 npm run dev:approve -- cancel <requestId>
@@ -287,8 +288,8 @@ npm run dev:approve -- cancel <requestId>
 {
   requestId: string;          // llm_preflight request id
   decision: "allow" | "compact" | "downgrade" | "cancel";
-  scope?: "call" | "chain" | "session" | "day";  // default "call"
-  boundResourceId?: string;   // default requestId; future plan chains bind this to chainId
+  scope?: "call" | "chain" | "queue" | "session" | "day";  // default "call"
+  boundResourceId?: string;   // default requestId for call scope; default budgetScope for non-call scopes
   expiresInSeconds?: number;  // default 900, max 86400
   note?: string;
 }
@@ -300,13 +301,15 @@ npm run dev:approve -- cancel <requestId>
   requestId: string;
   status: "approved" | "compact_requested" | "downgrade_requested" | "canceled";
   decision: "allow" | "compact" | "downgrade" | "cancel";
-  scope: "call" | "chain" | "session" | "day";
+  scope: "call" | "chain" | "queue" | "session" | "day";
   boundResourceId: string;
   approvalToken?: string;     // only for decision "allow"; store only the hash
   tokenExpiresAt: string | null;
   expiresAt: string;          // approval request expiry
 }
 ```
+
+Queue-scoped approvals are intended for Senior-mode worker batches. A token bound to `project_queue:<queueId>` can satisfy multiple matching DeepSeek preflights for that queue while preserving audit rows and token use counts.
 
 Token use limits are conservative in this server-side slice: `call` allows one matching preflight, `chain` allows 50, `session` allows 100, and `day` allows 200. Wider semantics can be revised once the VS Code client approval panel and plan-chain runner are calling the tool.
 

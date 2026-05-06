@@ -21,9 +21,27 @@ In Full Parallel DeepSeek Factory Mode, the worker surface records each DeepSeek
 
 Every long-running lane should emit worker events, heartbeats, and checkpoints through `fabric_task_*`. Review lanes should never directly apply patches. Direct `--patch-mode apply` remains implementer-only and is intended for isolated worker directories; queue-driven factory runs should prefer write-mode patch artifacts plus `agent-fabric-project review-patches`.
 
-`agent-fabric-deepseek-worker` scans task packets and context files for common secret patterns before API calls. If the scan trips, redact the packet/context or pass `--allow-sensitive-context` only after an explicit operator decision. Use `--sensitive-context-mode strict` when sanitized review packets should also catch high-entropy token candidates; use `off` only as an explicit operator override. Transient HTTP 429 and empty JSON content responses are retried up to three attempts; persistent rate limits emit structured error codes and should become queue retry/review checkpoints.
+`agent-fabric-deepseek-worker` scans task packets and context files for common secret patterns before API calls in normal mode. In Senior mode, set `AGENT_FABRIC_SENIOR_MODE=permissive`; task-relevant sensitive context is authorized for DeepSeek-direct workers by default. Use `--sensitive-context-mode strict` only when sanitized review packets should also catch high-entropy token candidates. Transient HTTP 429 and empty JSON content responses are retried up to three attempts; persistent rate limits emit structured error codes and should become queue retry/review checkpoints.
 
 DeepSeek cost estimates use built-in defaults unless the runner provides `AGENT_FABRIC_DEEPSEEK_PRICING_JSON` or `AGENT_FABRIC_DEEPSEEK_PRICING_FILE` with per-million-token `hit`, `miss`, and `output` prices. Worker artifacts include the cost estimate source so stale pricing can be spotted during review.
+
+Use the separate `jcode-deepseek` worker value when a queue task should run through a Jcode DeepSeek provider/runtime while staying inside Agent Fabric's durable worker lifecycle. Configure the dispatcher with `AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER`; see [../workers/jcode-deepseek/README.md](../workers/jcode-deepseek/README.md).
+
+Senior-mode supervisors should not substitute untracked local worker pools for DeepSeek lanes. With `AGENT_FABRIC_SENIOR_MODE=permissive`, the project CLI validates execution workers before they can start, rejects DeepSeek-labeled command templates that launch Codex/Claude/local harnesses, and defaults broad work to queue-backed `deepseek-direct` lanes in git worktrees. A worker counts only after `fabric_task_start_worker`, `project_queue_assign_worker`, and `fabric_task_*` events/checkpoints make it visible in the queue.
+
+Codex and Claude Code integrations should prefer the compact worker-card tools when they want native-feeling background agents:
+
+- `fabric_spawn_agents`
+- `fabric_senior_start`
+- `fabric_senior_status`
+- `fabric_senior_resume`
+- `fabric_list_agents`
+- `fabric_open_agent`
+- `fabric_message_agent`
+- `fabric_wait_agents`
+- `fabric_accept_patch`
+
+These tools expose `@af/<name>` handles and openable worker cards while preserving Agent Fabric as the durable source of truth. `fabric_accept_patch` requires senior review metadata (`reviewedBy`, `reviewSummary`).
 
 ## `fabric_task_create`
 
@@ -60,7 +78,7 @@ Start or register a worker run.
 ```ts
 {
   taskId: string;
-  worker: "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "manual";
+  worker: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "jcode-deepseek" | "manual";
   projectPath: string;
   workspaceMode: "in_place" | "git_worktree" | "clone" | "sandbox";
   modelProfile: string;
@@ -227,7 +245,7 @@ Return the smallest useful state needed for a worker to continue.
 ```ts
 {
   taskId: string;
-  preferredWorker?: "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "manual";
+  preferredWorker?: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "jcode-deepseek" | "manual";
 }
 ```
 

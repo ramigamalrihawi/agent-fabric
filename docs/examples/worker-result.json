@@ -1,0 +1,15 @@
+{
+  "schema": "agent-fabric.deepseek-worker-result.v1",
+  "result": {
+    "status": "patch_ready",
+    "summary": "Added a regression test for the DeepSeek-backed model approval gate.",
+    "changedFilesSuggested": [
+      "test/project-cli.test.ts"
+    ],
+    "testsSuggested": [
+      "npm test -- test/project-cli.test.ts"
+    ],
+    "blockers": [],
+    "proposedPatch": "diff --git a/test/project-cli.test.ts b/test/project-cli.test.ts\n--- a/test/project-cli.test.ts\n+++ b/test/project-cli.test.ts\n@@ -1 +1 @@\n-// old\n+// new\n"
+  }
+}

@@ -17,11 +17,12 @@ Boundary:
 | Worker | Status | Role |
 |---|---|---|
 | [smolagents-worker](smolagents-worker/README.md) | experimental safe scaffold | Project mining, context inspection, memory-candidate extraction, and explicit pending-review memory writes. |
+| [jcode-deepseek](jcode-deepseek/README.md) | portable dispatcher example | Runs queue task packets through a configurable Jcode DeepSeek runtime while preserving Agent Fabric preflight, checkpoint, and review gates. |
 | `agent-fabric-deepseek-worker` | first direct API scaffold | DeepSeek V4 Pro/Flash prompt improvement, task generation, structured task-packet reports, and opt-in proposed-patch write/apply modes. |
 
 `agent-fabric-deepseek-worker run-task` is report-only by default. Pass `--patch-mode write` to save a validated proposed patch for review. Queue operators can then apply accepted write-mode patches with `agent-fabric-project review-patches --accept-task <queueTaskId> --apply-patch`. Direct `--patch-mode apply` remains available for isolated implementer runs, but it is guarded by status, role, path, symlink, and dry-run checks.
 
-DeepSeek direct scans task packets and context files for common secret patterns before API calls. Redact flagged packets, use `--sensitive-context-mode strict` for high-entropy detection on sanitized review packets, or pass `--allow-sensitive-context` only after an explicit operator decision.
+DeepSeek direct scans task packets and context files for common secret patterns before API calls in normal mode. In Senior mode, set `AGENT_FABRIC_SENIOR_MODE=permissive`; task-relevant sensitive context is authorized for DeepSeek-direct workers by default. Use `--sensitive-context-mode strict` only when the senior coordinator intentionally wants a sanitized review packet.
 
 DeepSeek direct calls retry transient HTTP 429 rate limits and empty JSON content up to three attempts. `agent-fabric-project factory-run` and `run-ready --adaptive-rate-limit` reduce later batch parallelism when structured or textual 429 evidence appears. Broad queue runners also use a local per-queue lock by default; use `--allow-concurrent-runner` only for intentional overlapping schedulers. Missing API keys, persistent rate limits, unsafe patches, and failed test evidence should be treated as queue review/retry checkpoints rather than ignored worker noise.
 

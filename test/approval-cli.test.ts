@@ -26,8 +26,16 @@ describe("approval CLI runtime", () => {
       requestId: "pf_123",
       decision: "allow",
       scope: "chain",
+      boundResourceId: undefined,
       expiresInSeconds: 600,
       note: "approved by terminal"
+    });
+    expect(parseApprovalCliArgs(["approve", "pf_queue", "--queue", "pqueue_1"])).toMatchObject({
+      command: "decide",
+      requestId: "pf_queue",
+      decision: "allow",
+      scope: "queue",
+      boundResourceId: "project_queue:pqueue_1"
     });
     expect(parseApprovalCliArgs(["compact", "pf_456"])).toMatchObject({ command: "decide", requestId: "pf_456", decision: "compact" });
   });
@@ -38,6 +46,7 @@ describe("approval CLI runtime", () => {
       json: false,
       workspaceRoot: undefined,
       scope: "call",
+      boundResourceId: undefined,
       expiresInSeconds: undefined,
       note: undefined
     });
@@ -83,7 +92,7 @@ describe("approval CLI runtime", () => {
   it("rejects invalid commands and flag values", () => {
     expect(() => parseApprovalCliArgs(["approve"])).toThrow(FabricError);
     expect(() => parseApprovalCliArgs(["list", "--max", "0"])).toThrow("max must be a positive integer");
-    expect(() => parseApprovalCliArgs(["prompt", "--scope", "forever"])).toThrow("scope must be call, chain, session, or day");
+    expect(() => parseApprovalCliArgs(["prompt", "--scope", "forever"])).toThrow("scope must be call, chain, queue, session, or day");
     expect(() => parseApprovalCliArgs(["wat"])).toThrow("Unknown approval CLI command: wat");
   });
 });

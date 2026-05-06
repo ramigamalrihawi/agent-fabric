@@ -277,11 +277,26 @@ describe("ADR-0017 cost-aware routing preflight", () => {
       schema: "agent-fabric.model-brain-route.v1",
       roleAlias: "plan.strong",
       taskType: "plan",
+      requested: {
+        source: "role_alias",
+        candidateModel: "anthropic/claude-4.7-opus",
+        provider: "openrouter",
+        reasoning: "xhigh",
+        roleAlias: "plan.strong",
+        aliasSource: "runtime_seed"
+      },
       route: {
         provider: "openrouter",
         model: "anthropic/claude-4.7-opus",
         reasoning: "xhigh",
         reasonCodes: ["alias_match", "source:runtime_seed"]
+      },
+      routeResolution: {
+        changed: false,
+        providerChanged: false,
+        modelChanged: false,
+        reasoningChanged: false,
+        summary: "Requested route matches selected route."
       },
       gate: {
         enforcementMode: "participating_client",
@@ -346,6 +361,90 @@ describe("ADR-0017 cost-aware routing preflight", () => {
     if (!reused.ok) throw new Error("reused preflight failed");
     expect(reused.data.decision).toBe("needs_user_approval");
     expect(reused.data.warnings as string[]).toContain("Approval token was not accepted: token already used.");
+    daemon.close();
+  });
+
+  it("queue-scoped approval accepts multiple matching DeepSeek preflights for the same project queue", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload({ agentId: "worker", litellmRouteable: true }));
+    const budgetScope = "project_queue:pqueue_123";
+
+    const requested = daemon.callTool(
+      "llm_preflight",
+      preflightPayload({
+        candidateModel: "worker.deepseek.max",
+        requestedProvider: "deepseek",
+        requestedReasoning: "max",
+        budgetScope,
+        boundResourceId: "pqtask_1"
+      }),
+      contextFor(session, "pf-queue-approval-request")
+    );
+    expect(requested.ok).toBe(true);
+    if (!requested.ok) throw new Error("preflight failed");
+    const approval = daemon.callTool(
+      "llm_approve",
+      { requestId: requested.data.requestId, decision: "allow", scope: "queue" },
+      contextFor(session, "approve-queue")
+    );
+    expect(approval.ok).toBe(true);
+    if (!approval.ok) throw new Error("queue approval failed");
+    expect(approval.data).toMatchObject({ scope: "queue", boundResourceId: budgetScope });
+
+    for (const taskId of ["pqtask_2", "pqtask_3"]) {
+      const allowed = daemon.callTool(
+        "llm_preflight",
+        preflightPayload({
+          candidateModel: "worker.deepseek.max",
+          requestedProvider: "deepseek",
+          requestedReasoning: "max",
+          budgetScope,
+          boundResourceId: taskId,
+          approvalToken: approval.data.approvalToken
+        }),
+        contextFor(session, `pf-approved-${taskId}`)
+      );
+      expect(allowed.ok).toBe(true);
+      if (!allowed.ok) throw new Error("approved preflight failed");
+      expect(allowed.data.decision).toBe("allow");
+      expect(allowed.data.approval).toMatchObject({ accepted: true, scope: "queue" });
+    }
+    daemon.close();
+  });
+
+  it("deduplicates equivalent pending queue approval requests across retries", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload({ agentId: "worker", litellmRouteable: true }));
+    const budgetScope = "project_queue:pqueue_retry";
+
+    const first = daemon.callTool(
+      "llm_preflight",
+      preflightPayload({
+        candidateModel: "worker.deepseek.max",
+        requestedProvider: "deepseek",
+        requestedReasoning: "max",
+        budgetScope,
+        boundResourceId: "pqtask_1"
+      }),
+      contextFor(session, "pf-retry-1")
+    );
+    const second = daemon.callTool(
+      "llm_preflight",
+      preflightPayload({
+        candidateModel: "worker.deepseek.max",
+        requestedProvider: "deepseek",
+        requestedReasoning: "max",
+        budgetScope,
+        boundResourceId: "pqtask_2"
+      }),
+      contextFor(session, "pf-retry-2")
+    );
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) throw new Error("preflight failed");
+    expect(tableCount(daemon, "approval_requests")).toBe(1);
+    expect(second.data.approval).toMatchObject({ required: true, reused: true, requestId: first.data.requestId });
     daemon.close();
   });
 
@@ -648,6 +747,8 @@ function preflightPayload(
     sensitiveFlags?: string[];
     approvalToken?: string;
     contextPackage?: Record<string, unknown>;
+    budgetScope?: string;
+    boundResourceId?: string;
   } = {}
 ) {
   return {
@@ -661,7 +762,8 @@ function preflightPayload(
     contextPackageSummary: overrides.contextPackage ? undefined : { inputTokens: 1_000 },
     toolSchemas: overrides.contextPackage ? undefined : [{ name: "read" }, { name: "edit" }],
     mcpServers: overrides.contextPackage ? undefined : ["agent-fabric"],
-    budgetScope: "session",
+    budgetScope: overrides.budgetScope ?? "session",
+    boundResourceId: overrides.boundResourceId,
     sensitiveFlags: overrides.sensitiveFlags,
     approvalToken: overrides.approvalToken
   };

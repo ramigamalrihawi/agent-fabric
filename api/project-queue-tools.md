@@ -18,22 +18,38 @@ Recommended factory flow:
 2. Generate independent implementer tasks plus explicit reviewer, risk-reviewer, docs/test-reviewer, and adjudicator tasks for high-impact changes.
 3. Run `review-matrix`, `prepare-ready`, and `launch-plan` before starting workers so expected-file overlaps, dependency blockers, and tool/context approval gaps are visible.
 4. Record `decide-queue --decision start_execution` only after the queue shape is accepted.
-5. Launch implementers with `run-ready --worker deepseek-direct --workspace-mode sandbox --parallel <n>` and prefer `--patch-mode write` for patch-producing work.
+5. Launch implementers with `run-ready --worker deepseek-direct --workspace-mode git_worktree --parallel <n>` and prefer `--patch-mode write` for patch-producing work.
 6. Feed concrete evidence to review lanes: task packets, structured worker results, patch files, command output, failing tests, and accepted constraints.
 7. Apply only accepted write-mode patches through `review-patches --accept-task <queueTaskId> --apply-patch`.
 8. Run local checks/tests and close with a handoff that lists lanes, costs if available, incorporated/deferred findings, and remaining limitations.
 
 If the `agent-fabric-deepseek-worker` binary is not on PATH, use an explicit command template with the repo-local fallback, for example `npx tsx /path/to/agent-fabric/src/bin/deepseek-worker.ts run-task ...`.
 
-The terminal shortcut for this control-plane flow is `factory-run`. It performs the queue preview reads (`review-matrix`, `prepare-ready`, `launch-plan`), optionally records `start_execution`, writes task packets, runs ready DeepSeek lanes in sandboxed directories, and defaults to adaptive rate-limit backoff:
+The Codex/Claude-friendly shortcut is `senior-run`. It runs doctor-friendly defaults, imports task JSON or locally scaffolds from an MD plan, uses `.agent-fabric/task-packets`, `.agent-fabric/worktrees/<queueTaskId>`, and `.agent-fabric/progress.md`, and can issue one audited queue-scoped model approval:
 
 ```bash
-npm run dev:project -- factory-run --queue <queueId> --start-execution --parallel 8 --min-parallel 1 --task-packet-dir task-packets --cwd-template "/path/to/sandboxes/{{queueTaskId}}" --approve-tool-context
+npm run dev:project -- senior-run --project <path> --tasks-file .agent-fabric/tasks/tasks.json --count 10 --approve-model-calls --progress-file .agent-fabric/progress.md
+```
+
+The lower-level terminal shortcut for this control-plane flow is `factory-run`. It performs the queue preview reads (`review-matrix`, `prepare-ready`, `launch-plan`), optionally records `start_execution`, writes task packets, runs ready DeepSeek lanes in git worktrees, and defaults to adaptive rate-limit backoff:
+
+```bash
+npm run dev:project -- factory-run --queue <queueId> --start-execution --parallel 8 --min-parallel 1 --task-packet-dir .agent-fabric/task-packets --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" --approve-model-calls --approve-tool-context
 ```
 
 Use `--dry-run` to inspect the factory plan without launching workers, `--no-adaptive-rate-limit` to keep fixed parallelism, `--sensitive-context-mode strict` for high-entropy packet scanning, `--allow-sensitive-context` to explicitly pass the DeepSeek worker's sensitive-context override, `--deepseek-role <role>` to force a homogeneous lane role, and `--deepseek-worker-command "<cmd>"` when the global worker binary is not installed.
 
 Run only one `factory-run` or broad `run-ready` scheduler against a queue at a time. The CLI creates a local per-queue runner lock by default; pass `--allow-concurrent-runner` only when overlapping schedulers are intentional. Queue assignment gates still reject duplicate worker assignment if another host bypasses the local lock.
+
+When `AGENT_FABRIC_SENIOR_MODE=permissive` is set, queue-backed DeepSeek execution is the default and the guardrail:
+
+- `claim-next`, `launch`, `run-ready`, and `run-task` default or validate execution workers as `deepseek-direct`.
+- `run-ready` and `factory-run` default to 10 parallel lanes, git worktree paths under the local factory temp directory, and `deepseek-v4-pro:max`.
+- Explicit `ramicode`, `local-cli`, `openhands`, `aider`, `smolagents`, or `manual` execution workers are rejected before tool calls or shell execution.
+- Explicit Senior-mode command templates that record `deepseek-direct` or `jcode-deepseek` while launching Codex, Claude, or another local harness are rejected before shell execution.
+- Use `AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS=1` only for an explicit human-approved fallback.
+
+The practical invariant is simple: a "Senior mode 10 DeepSeek lanes" request must create queue-backed worker runs that are visible through `lanes`, `dashboard`, worker checkpoints, and queue task state. Built-in side pools, unregistered background workers, or reports that never call the Agent Fabric queue are not valid substitutes.
 
 ## Pipeline model
 
@@ -81,13 +97,17 @@ npm run dev:project -- claim-next --queue <queueId> --worker local-cli --workspa
 npm run dev:project -- recover-stale --queue <queueId> --stale-after-minutes 30 --dry-run
 npm run dev:project -- retry-task --queue <queueId> --queue-task <queueTaskId> --reason "Address review comments"
 npm run dev:project -- edit-task --queue <queueId> --queue-task <queueTaskId> --metadata-file task-metadata.json
-npm run dev:project -- write-task-packets --queue <queueId> --out-dir task-packets --format markdown --ready-only
+npm run dev:project -- write-task-packets --queue <queueId> --out-dir .agent-fabric/task-packets --format markdown --ready-only
 npm run dev:project -- resume-task --queue <queueId> --queue-task <queueTaskId> --output-file resume.md
 npm run dev:project -- launch --queue <queueId> --worker local-cli --workspace-mode git_worktree
 npm run dev:project -- run-task --queue <queueId> --queue-task <queueTaskId> --command "npm test" --approve-tool-context
-npm run dev:project -- run-ready --queue <queueId> --parallel 4 --workspace-mode sandbox --cwd-template "/path/to/sandboxes/{{queueTaskId}}" --task-packet-dir task-packets --command-template "local-cli run --fabric-task {{fabricTaskId}} --task-packet {{taskPacket}}" --approve-tool-context
-npm run dev:project -- run-ready --queue <queueId> --worker deepseek-direct --parallel 4 --workspace-mode sandbox --cwd-template "/path/to/sandboxes/{{queueTaskId}}" --task-packet-dir task-packets --approve-tool-context
-npm run dev:project -- factory-run --queue <queueId> --start-execution --parallel 8 --task-packet-dir task-packets --approve-tool-context
+npm run dev:project -- run-ready --queue <queueId> --parallel 4 --workspace-mode git_worktree --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" --task-packet-dir .agent-fabric/task-packets --command-template "local-cli run --fabric-task {{fabricTaskId}} --task-packet {{taskPacket}}" --approve-tool-context
+npm run dev:project -- run-ready --queue <queueId> --worker deepseek-direct --parallel 4 --workspace-mode git_worktree --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" --task-packet-dir .agent-fabric/task-packets --approve-tool-context
+npm run dev:project -- factory-run --queue <queueId> --start-execution --parallel 8 --task-packet-dir .agent-fabric/task-packets --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" --approve-model-calls --approve-tool-context
+npm run dev:project -- fabric-spawn-agents --queue <queueId> --count 10 --worker deepseek-direct --workspace-mode git_worktree
+npm run dev:project -- fabric-list-agents --queue <queueId>
+npm run dev:project -- fabric-open-agent --queue <queueId> --agent @af/rami-123abc
+npm run dev:project -- fabric-message-agent --queue <queueId> --agent @af/rami-123abc --body "Please revise the patch scope."
 npm run dev:project -- review-patches --queue <queueId>
 npm run dev:project -- review-patches --queue <queueId> --accept-task <queueTaskId> --apply-patch
 ```
@@ -171,7 +191,7 @@ High-risk aliases still go through `llm_preflight`. If the command reports `need
 - `fabric_task_checkpoint`
 - final `patch_ready`, `completed`, or `failed` task state
 
-`run-ready` pulls dependency-free ready tasks and calls the same command wrapper for each one. `--parallel <n>` runs batches concurrently. When `--parallel` is greater than 1, tasks must resolve to distinct working directories unless `--allow-shared-cwd` is passed explicitly. With `--workspace-mode sandbox`, the runner creates missing `cwd-template` directories before starting each task. With `git_worktree` or `clone`, it refuses to fake the workspace and expects the directory to already exist. Override that with `--cwd-prep none` for externally managed paths, or `--cwd-prep mkdir` for explicit sandbox-style directory creation.
+`run-ready` pulls dependency-free ready tasks and calls the same command wrapper for each one. `--parallel <n>` runs batches concurrently. When `--parallel` is greater than 1, tasks must resolve to distinct working directories unless `--allow-shared-cwd` is passed explicitly. With `--workspace-mode sandbox`, the runner creates missing `cwd-template` directories before starting each task. With `git_worktree`, auto prep creates a detached worktree from the queue project when the path is missing and refuses non-git projects or invalid existing paths. Override with `--cwd-prep none` for externally managed paths, or `--cwd-prep mkdir` for explicit sandbox-style directory creation.
 
 Pass `--adaptive-rate-limit` to reduce later batch parallelism when failed DeepSeek lanes include structured or textual 429/rate-limit evidence. Use `--min-parallel <n>` to set the lower bound. This does not retry already-failed queue tasks automatically; use `retry-task` after review when a lane should be requeued.
 

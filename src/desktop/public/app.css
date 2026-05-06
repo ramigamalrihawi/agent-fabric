@@ -48,6 +48,16 @@ button:hover {
   background: #f9fafb;
 }
 
+button:disabled,
+button[disabled] {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+button.is-busy {
+  cursor: progress;
+}
+
 button.primary {
   border-color: var(--blue);
   background: var(--blue);
@@ -538,6 +548,145 @@ h3 {
 
 .operator-brief-actions {
   margin-top: 10px;
+}
+
+.live-lanes-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.live-lanes-headline {
+  align-items: flex-start;
+}
+
+.live-lane-freshness {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.live-lane-metrics {
+  margin-bottom: 0;
+}
+
+.live-lane-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.live-lane-card,
+.live-lane-empty {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 10px;
+}
+
+.live-lane-card {
+  display: grid;
+  gap: 8px;
+  border-left-width: 4px;
+}
+
+.live-lane-card.green {
+  border-left-color: #2d8a61;
+}
+
+.live-lane-card.amber {
+  border-color: #f0c36f;
+  border-left-color: #b17425;
+  background: #fffaf0;
+}
+
+.live-lane-card.red {
+  border-color: #e7aaa3;
+  border-left-color: #b94b40;
+  background: #fff5f4;
+}
+
+.live-lane-card.blue {
+  border-left-color: var(--blue);
+}
+
+.live-lane-card-head,
+.live-lane-pills {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.live-lane-title {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.live-lane-pills {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.live-lane-progress {
+  height: 7px;
+  background: #e7edf3;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.live-lane-progress span {
+  display: block;
+  height: 100%;
+  background: var(--blue);
+}
+
+.live-lane-summary {
+  min-height: 38px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.live-lane-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.live-lane-facts div {
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px;
+  background: var(--surface-2);
+}
+
+.live-lane-facts strong {
+  font-size: 16px;
+}
+
+.live-lane-facts span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.live-lane-card-actions,
+.live-lanes-actions {
+  margin-top: 0;
+}
+
+.live-lane-empty,
+.live-lane-more {
+  align-content: center;
+}
+
+.live-lane-empty {
+  display: grid;
+  gap: 4px;
+  border-style: dashed;
+  background: var(--surface-2);
 }
 
 .recovery-metrics {
@@ -1386,6 +1535,69 @@ h3 {
   box-shadow: 0 8px 24px rgba(12, 24, 42, 0.24);
 }
 
+.command-palette {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  align-items: start;
+  justify-items: center;
+  padding: 10vh 18px 18px;
+  background: rgba(15, 23, 36, 0.38);
+}
+
+.command-palette-panel {
+  width: min(760px, 100%);
+  max-height: min(72vh, 760px);
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 22px 70px rgba(12, 24, 42, 0.28);
+  padding: 12px;
+}
+
+#command-palette-input {
+  width: 100%;
+}
+
+.command-palette-list {
+  min-height: 160px;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.command-row {
+  width: 100%;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: left;
+  border-radius: 8px;
+}
+
+.command-row > span:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.command-row.active {
+  border-color: var(--blue);
+  background: #e8f1ff;
+}
+
+.command-row:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 @media (max-width: 900px) {
   .layout {
     grid-template-columns: 1fr;
@@ -1401,6 +1613,8 @@ h3 {
   .queue-header,
   .queue-health-strip,
   .action-main,
+  .live-lanes-headline,
+  .live-lane-card-head,
   .lane-card-head,
   .pipeline-gate-row,
   .recovery-card-main,
@@ -1431,6 +1645,14 @@ h3 {
 
   .queue-health-main .muted {
     white-space: normal;
+  }
+
+  .live-lane-pills {
+    justify-content: flex-start;
+  }
+
+  .live-lane-facts {
+    grid-template-columns: 1fr;
   }
 
   .form-grid,

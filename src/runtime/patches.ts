@@ -29,6 +29,11 @@ export async function applyPatchWithSystemPatch(patch: string, cwd: string): Pro
   };
 }
 
+export async function checkPatchWithSystemPatch(patch: string, cwd: string): Promise<Record<string, unknown>> {
+  validateGitStylePatch(patch, cwd);
+  return runPatch(patch, cwd, true);
+}
+
 export function resolvePatchFilePath(requestedPatchFile: string | undefined, outputFile: string, cwd: string): string {
   const resolvedCwd = resolve(cwd);
   const resolvedOutputFile = isAbsolute(outputFile) ? resolve(outputFile) : resolve(cwd, outputFile);

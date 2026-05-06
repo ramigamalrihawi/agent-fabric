@@ -12,6 +12,8 @@ try {
   const command = parseProjectCliArgs(process.argv.slice(2));
   if (command.command === "help") {
     console.log(projectHelp());
+  } else if (command.command === "version") {
+    console.log("agent-fabric-project 0.1.0");
   } else {
     const session = await register();
     const result = await runProjectCommand(command, (tool, input) => call(session, tool, input));

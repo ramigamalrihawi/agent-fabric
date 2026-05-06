@@ -80,7 +80,7 @@ type WorkerCheckpointRow = {
   agent_id: string;
 };
 
-const WORKERS = new Set(["local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "manual"]);
+const WORKERS = new Set(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]);
 const WORKSPACE_MODES = new Set(["in_place", "git_worktree", "clone", "sandbox"]);
 const EVENT_KINDS = new Set([
   "started",

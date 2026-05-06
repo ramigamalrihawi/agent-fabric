@@ -16,4 +16,5 @@ Please open a private security advisory on GitHub if available. If not, open an 
 - Keep HTTP endpoints bound to localhost unless you have added your own authentication and network controls.
 - Use sandboxed workspaces for untrusted worker lanes.
 - Review worker-generated patches before applying them.
-- Use strict sensitive-context scanning before sending task packets to remote model providers.
+- Use strict sensitive-context scanning before sending task packets to remote model providers in normal mode. In Senior mode, `AGENT_FABRIC_SENIOR_MODE=permissive` intentionally allows task-relevant sensitive context for DeepSeek-direct workers while keeping senior review, no-Azure worker routing, and no auto-commit gates.
+- In Senior mode, do not accept untracked side pools as delegated work. `agent-fabric-project` rejects non-DeepSeek execution workers unless `AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS=1` is set deliberately, and valid lanes must be queue-backed worker runs with checkpoints visible in the dashboard.

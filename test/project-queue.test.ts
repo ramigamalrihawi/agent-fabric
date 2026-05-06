@@ -557,6 +557,15 @@ describe("project queue substrate", () => {
     expect(assignBeforeStart.code).toBe("PROJECT_QUEUE_EXECUTION_BLOCKED");
 
     startExecution(daemon, session, created.data.queueId, "start-gate-start");
+    const assignWithoutWorkerAfterStart = daemon.callTool(
+      "project_queue_assign_worker",
+      { queueId: created.data.queueId, queueTaskId: schemaTask.queueTaskId },
+      contextFor(session, "start-gate-assign-no-worker")
+    );
+    expect(assignWithoutWorkerAfterStart.ok).toBe(false);
+    if (assignWithoutWorkerAfterStart.ok) throw new Error("assignment without worker should have failed");
+    expect(assignWithoutWorkerAfterStart.code).toBe("PROJECT_QUEUE_WORKER_RUN_REQUIRED");
+
     const claimAfterStart = daemon.callTool("project_queue_claim_next", { queueId: created.data.queueId }, contextFor(session, "start-gate-claim-after"));
     expect(claimAfterStart.ok).toBe(true);
     if (!claimAfterStart.ok) throw new Error("claim after start failed");
@@ -918,11 +927,13 @@ describe("project queue substrate", () => {
     );
     expect(completed.ok).toBe(true);
 
+    const surfaceWorker = startWorkerForQueueTask(daemon, session, surfaceTask, "assign-approval-worker");
     const blocked = daemon.callTool(
       "project_queue_assign_worker",
       {
         queueId: created.data.queueId,
-        queueTaskId: surfaceTask.queueTaskId
+        queueTaskId: surfaceTask.queueTaskId,
+        workerRunId: surfaceWorker.workerRunId
       },
       contextFor(session, "assign-approval-blocked")
     );
@@ -949,7 +960,8 @@ describe("project queue substrate", () => {
       "project_queue_assign_worker",
       {
         queueId: created.data.queueId,
-        queueTaskId: surfaceTask.queueTaskId
+        queueTaskId: surfaceTask.queueTaskId,
+        workerRunId: surfaceWorker.workerRunId
       },
       contextFor(session, "assign-approval-after")
     );
@@ -985,7 +997,8 @@ describe("project queue substrate", () => {
       "project_queue_assign_worker",
       {
         queueId: created.data.queueId,
-        queueTaskId: serialTask.queueTaskId
+        queueTaskId: serialTask.queueTaskId,
+        workerRunId: startWorkerForQueueTask(daemon, session, serialTask, "serial-worker").workerRunId
       },
       contextFor(session, "serial-assign")
     );
@@ -995,7 +1008,8 @@ describe("project queue substrate", () => {
       "project_queue_assign_worker",
       {
         queueId: created.data.queueId,
-        queueTaskId: docsTask.queueTaskId
+        queueTaskId: docsTask.queueTaskId,
+        workerRunId: startWorkerForQueueTask(daemon, session, docsTask, "docs-worker-during-serial").workerRunId
       },
       contextFor(session, "docs-assign-during-serial")
     );
@@ -1069,7 +1083,8 @@ describe("project queue substrate", () => {
       "project_queue_assign_worker",
       {
         queueId: created.data.queueId,
-        queueTaskId: highTask.queueTaskId
+        queueTaskId: highTask.queueTaskId,
+        workerRunId: startWorkerForQueueTask(daemon, session, highTask, "high-worker").workerRunId
       },
       contextFor(session, "high-assign")
     );
@@ -1152,7 +1167,7 @@ describe("project queue substrate", () => {
     );
     expect(duplicateAssign.ok).toBe(false);
     if (duplicateAssign.ok) throw new Error("duplicate assignment should have failed");
-    expect(duplicateAssign.code).toBe("PROJECT_QUEUE_TASK_ALREADY_ASSIGNED");
+    expect(duplicateAssign.code).toBe("PROJECT_QUEUE_WORKER_RUN_REQUIRED");
 
     const ready = daemon.callTool("project_queue_next_ready", { queueId: created.data.queueId }, contextFor(session));
     expect(ready.ok).toBe(true);
@@ -1469,6 +1484,45 @@ describe("project queue substrate", () => {
     expect(tableCount(daemon, "project_queues")).toBe(1);
     daemon.close();
   });
+
+  it("issues queue-scoped model approvals and progress reports for Senior runs", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "senior-progress-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+    const add = addThreeTasks(daemon, session, created.data.queueId);
+    expect(add.ok).toBe(true);
+
+    const approved = daemon.callTool(
+      "project_queue_approve_model_calls",
+      { queueId: created.data.queueId },
+      contextFor(session, "senior-model-approval")
+    );
+    expect(approved.ok).toBe(true);
+    if (!approved.ok) throw new Error("model approval failed");
+    expect(approved.data).toMatchObject({
+      schema: "agent-fabric.project-queue-model-approval.v1",
+      budgetScope: `project_queue:${created.data.queueId}`,
+      status: "approved"
+    });
+    expect(typeof approved.data.approvalToken).toBe("string");
+
+    const report = daemon.callTool(
+      "project_queue_progress_report",
+      { queueId: created.data.queueId },
+      contextFor(session, "senior-progress")
+    );
+    expect(report.ok).toBe(true);
+    if (!report.ok) throw new Error("progress report failed");
+    expect(report.data).toMatchObject({
+      schema: "agent-fabric.project-queue-progress.v1",
+      queue: { queueId: created.data.queueId },
+      nextActions: expect.any(Array),
+      verificationChecklist: expect.arrayContaining(["Review every patch-ready task before acceptance."])
+    });
+    daemon.close();
+  });
 });
 
 function createQueue(daemon: FabricDaemon, session: { sessionId: string; sessionToken: string }, idempotencyKey: string) {
@@ -1494,6 +1548,30 @@ function startExecution(daemon: FabricDaemon, session: { sessionId: string; sess
   expect(started.ok).toBe(true);
   if (!started.ok) throw new Error("start execution failed");
   return started;
+}
+
+function startWorkerForQueueTask(
+  daemon: FabricDaemon,
+  session: { sessionId: string; sessionToken: string },
+  task: { fabricTaskId: string; queueTaskId: string },
+  idempotencyKey: string
+): { workerRunId: string } {
+  const started = daemon.callTool(
+    "fabric_task_start_worker",
+    {
+      taskId: task.fabricTaskId,
+      worker: "local-cli",
+      projectPath: "/tmp/workspace/app",
+      workspaceMode: "git_worktree",
+      workspacePath: `/tmp/workspace/app-worktree-${task.queueTaskId}`,
+      modelProfile: "execute.cheap",
+      command: ["local-cli", "run", task.fabricTaskId]
+    },
+    contextFor(session, idempotencyKey)
+  );
+  expect(started.ok).toBe(true);
+  if (!started.ok) throw new Error("worker start failed");
+  return { workerRunId: String(started.data.workerRunId) };
 }
 
 function addThreeTasks(daemon: FabricDaemon, session: { sessionId: string; sessionToken: string }, queueId: string) {
