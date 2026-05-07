@@ -31,7 +31,7 @@ The Codex/Claude-friendly shortcut is `senior-run`. It runs doctor-friendly defa
 npm run dev:project -- senior-run --project <path> --tasks-file .agent-fabric/tasks/tasks.json --count 10 --approve-model-calls --progress-file .agent-fabric/progress.md
 ```
 
-Run `senior-doctor --project <path> [--queue <id>]` before launch. It checks daemon/source parity, required Senior bridge tools, DeepSeek auth, queue visibility, and whether the project can support mutating `git_worktree` lanes. A queue created from another harness workspace remains accessible when the caller's workspace root is the queue `projectPath`; use `agent-fabric-project --project <path> --queue <id>` for cross-harness resumes.
+Run `senior-doctor --project <path> [--queue <id>]` before launch. It checks daemon/source parity, required Senior bridge tools, DeepSeek auth, queue visibility, and whether the project can support mutating `git_worktree` lanes. If it reports daemon/source drift, stale tools, or socket refusal, automated agents must not kill, restart, or remove the shared daemon/socket; ask the operator to restart or relink the canonical daemon, switch to the checkout that already owns it, or use an isolated `AGENT_FABRIC_HOME`/socket. A queue created from another harness workspace remains accessible when the caller's workspace root is the queue `projectPath`; use `agent-fabric-project --project <path> --queue <id>` for cross-harness resumes.
 
 For non-git folders, report-only planner/reviewer work should use `sandbox` and the `research-planner` alias. Mutating implementation work still requires `git_worktree`.
 

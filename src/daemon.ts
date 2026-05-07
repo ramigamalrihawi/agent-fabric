@@ -727,7 +727,7 @@ export class FabricDaemon {
         ok: false,
         tool,
         code: "TOOL_NOT_IMPLEMENTED",
-        message: `${tool} is not implemented by the running Agent Fabric daemon. If this tool exists in the current checkout, rebuild/relink and restart the daemon so Codex, Claude Code, and agent-fabric-project talk to the same source tree.`,
+        message: `${tool} is not implemented by the running Agent Fabric daemon. If this tool exists in the current checkout, this usually means daemon/source drift. Do not kill, restart, or remove the shared daemon/socket from an automated agent session. Run agent-fabric doctor local-config, then ask the operator to restart/relink the canonical daemon or rerun with an isolated AGENT_FABRIC_HOME/socket.`,
         retryable: false
       };
     } catch (error) {
@@ -851,6 +851,41 @@ export class FabricDaemon {
   fabricDoctor(): FabricDoctor {
     const status = this.fabricStatus({ includeSessions: true, sessionLimit: 500, dedupeWarnings: true });
     const diagnostics: FabricDiagnostic[] = [];
+    diagnostics.push({
+      id: "shared-daemon-control",
+      severity: "info",
+      message:
+        "The Agent Fabric daemon/socket is shared by local Codex, Claude Code, project CLI, desktop, and live queue sessions. Automated agents must not kill, restart, or remove the shared daemon/socket.",
+      evidence: {
+        pid: status.daemon.runtime?.pid,
+        cwd: status.daemon.runtime?.cwd,
+        entrypoint: status.daemon.runtime?.entrypoint,
+        dbPath: status.daemon.dbPath,
+        originPeerId: status.daemon.originPeerId
+      },
+      suggestedAction: {
+        actionKind: "inspect",
+        risk: "safe",
+        dryRunCommand: "agent-fabric doctor local-config --project <active-checkout>"
+      }
+    });
+    if (status.daemon.tools?.missingSeniorRequired.length) {
+      diagnostics.push({
+        id: "senior-tool-parity",
+        severity: "error",
+        message:
+          "The running daemon is missing required Senior bridge tools. Treat this as daemon/source drift, not permission for an agent to restart the shared daemon.",
+        evidence: {
+          missingSeniorRequired: status.daemon.tools.missingSeniorRequired,
+          runtime: status.daemon.runtime
+        },
+        suggestedAction: {
+          actionKind: "inspect",
+          risk: "safe",
+          dryRunCommand: "agent-fabric doctor local-config --project <active-checkout>"
+        }
+      });
+    }
     for (const session of status.bridgeSessions.sessions) {
       if (session.notificationsVisibleToAgent.declared === "yes" && session.notificationsVisibleToAgent.observed !== "yes") {
         diagnostics.push({

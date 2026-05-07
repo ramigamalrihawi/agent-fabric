@@ -13,7 +13,7 @@ agent-fabric-project senior-run --project <path> --tasks-file .agent-fabric/task
 
 `senior-run` is the high-level wrapper for Codex and Claude Code. It diagnoses the environment, creates or reuses a queue, imports task JSON or creates a local scaffold from an MD plan, starts execution, validates fabric task links and context refs, uses git worktrees for mutating lanes, launches queue-visible DeepSeek/Jcode workers, and writes a bounded progress file.
 
-`senior-doctor` also checks that the running daemon, global CLI, and MCP bridge are from the same checkout and that the daemon exposes the Senior bridge tools. If it reports a daemon/source mismatch, rebuild/relink and restart the daemon before launching workers.
+`senior-doctor` also checks that the running daemon, global CLI, and MCP bridge are from the same checkout and that the daemon exposes the Senior bridge tools. If it reports a daemon/source mismatch, treat that as an operator-only shared-daemon problem: automated agents must not kill, restart, or remove the shared daemon/socket. Ask the operator to restart or relink the canonical daemon, switch to the checkout that already owns the daemon, or run experiments with an isolated `AGENT_FABRIC_HOME`/socket.
 
 Use `factory-run` only when you need the lower-level primitive:
 
@@ -54,3 +54,4 @@ Cards must be process-evidence based. Native projections should show `planned`, 
 - DeepSeek direct task packets include a bounded generated context sidecar from `expectedFiles` and file-like `requiredContextRefs`; use `{{contextFile}}` in custom command templates when overriding the default runner.
 - Custom `deepseek-direct` templates that invoke `agent-fabric-deepseek-worker` are linked with `--fabric-task {{fabricTaskId}}`; missing fabric task links or moved required context refs block launch.
 - Senior concurrency defaults to 10 lanes and accepts explicit 20-lane requests; the hard local cap is 32.
+- Daemon/source drift, stale Senior tools, or socket refusal are not permission for an agent to kill/restart the shared daemon. Use doctor/status reads, isolate the runtime, or ask the operator before any daemon control action.

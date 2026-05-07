@@ -65,6 +65,8 @@ describe("FabricDaemon Phase 0A.1", () => {
     daemon.registerBridge(registerPayload());
     const doctor = daemon.fabricDoctor();
 
+    expect(doctor.diagnostics.map((diag) => diag.id)).toContain("shared-daemon-control");
+    expect(doctor.diagnostics.find((diag) => diag.id === "shared-daemon-control")?.message).toContain("must not kill, restart, or remove");
     expect(doctor.diagnostics.map((diag) => diag.id)).toContain("billing-missing");
     expect(doctor.diagnostics.some((diag) => diag.id.startsWith("notifications-"))).toBe(true);
     daemon.close();
