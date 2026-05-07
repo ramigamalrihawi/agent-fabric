@@ -398,7 +398,9 @@ function builtDaemonHasSeniorTools(projectPath: string): boolean | undefined {
   return [
     "fabric_senior_start",
     "fabric_spawn_agents",
-    "project_queue_approve_model_calls"
+    "project_queue_approve_model_calls",
+    "project_queue_validate_links",
+    "project_queue_validate_context_refs"
   ].every((tool) => daemonText.includes(tool) && bridgeText.includes(tool));
 }
 

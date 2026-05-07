@@ -41,12 +41,13 @@ proxyTool("fabric_inspect_context_package", "Inspect the sanitized context packa
 });
 proxyTool("fabric_spawn_agents", "Spawn queue-visible Agent Fabric worker lanes for Codex-style background work.", {
   queueId: z.string(),
-  count: z.number().int().positive().max(16).optional(),
+  count: z.number().int().positive().max(32).optional(),
   worker: z.enum(["deepseek-direct", "jcode-deepseek"]).optional(),
   workspaceMode: z.enum(["git_worktree", "sandbox"]).optional(),
   modelProfile: z.string().optional(),
   maxRuntimeMinutes: z.number().int().positive().optional(),
-  allowPartial: z.boolean().optional()
+  allowPartial: z.boolean().optional(),
+  planOnly: z.boolean().optional()
 });
 proxyTool("fabric_list_agents", "Return Codex-style Agent Fabric background worker cards for a project queue.", {
   queueId: z.string(),
@@ -86,7 +87,7 @@ proxyTool("fabric_senior_start", "Start or attach to a Senior-mode Agent Fabric 
   projectPath: z.string().optional(),
   promptSummary: z.string().optional(),
   title: z.string().optional(),
-  count: z.number().int().positive().max(16).optional(),
+  count: z.number().int().positive().max(32).optional(),
   worker: z.enum(["deepseek-direct", "jcode-deepseek"]).optional(),
   modelProfile: z.string().optional(),
   approveModelCalls: z.boolean().optional(),
@@ -468,6 +469,15 @@ proxyTool("project_queue_prepare_ready", "Prepare tool/context proposals for the
 proxyTool("project_queue_launch_plan", "Read a non-mutating launch plan with launchable, approval-needed, and start-gate-blocked queue tasks.", {
   queueId: z.string(),
   limit: z.number().int().positive().optional()
+});
+proxyTool("project_queue_validate_links", "Validate ready queue tasks have linked fabric tasks before runner launch.", {
+  queueId: z.string(),
+  readyOnly: z.boolean().optional()
+});
+proxyTool("project_queue_validate_context_refs", "Validate required context refs resolve before runner launch.", {
+  queueId: z.string(),
+  readyOnly: z.boolean().optional(),
+  markBlocked: z.boolean().optional()
 });
 proxyTool("project_queue_claim_next", "Atomically claim one dependency-free ready queue task for a worker gateway.", {
   queueId: z.string(),

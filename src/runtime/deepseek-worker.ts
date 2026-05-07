@@ -302,6 +302,7 @@ async function runProjectModelCommand(
 async function runTaskPacket(command: Extract<DeepSeekWorkerCommand, { command: "run-task" }>, options: RunOptions): Promise<Record<string, unknown>> {
   const env = options.env ?? process.env;
   assertSeniorDirectRunTracked(env);
+  const envFabricTaskId = typeof env.AGENT_FABRIC_FABRIC_TASK_ID === "string" && env.AGENT_FABRIC_FABRIC_TASK_ID.length > 0 ? env.AGENT_FABRIC_FABRIC_TASK_ID : undefined;
   const apiKey = deepSeekApiKey(env);
   if (!apiKey) throw new FabricError("DEEPSEEK_API_KEY_MISSING", "DEEPSEEK_API_KEY or DEEPSEEK_TOKEN must be set", false);
   const packetText = readFileSync(command.taskPacketPath, "utf8");
@@ -326,7 +327,7 @@ async function runTaskPacket(command: Extract<DeepSeekWorkerCommand, { command: 
 	      env
 	    });
     const parsed = normalizeTaskReport(parseJsonObject(call.content, "DeepSeek run-task response"));
-    const outputFile = command.outputFile ?? defaultOutputFile(command, packet, options.cwd ?? process.cwd());
+    const outputFile = command.outputFile ?? defaultOutputFile(command, packet, options.cwd ?? process.cwd(), env);
     const patchAction = await handleProposedPatch(command, parsed, outputFile, options.cwd ?? process.cwd());
     const artifact = {
       schema: "agent-fabric.deepseek-worker-result.v1",
@@ -335,7 +336,7 @@ async function runTaskPacket(command: Extract<DeepSeekWorkerCommand, { command: 
       model: command.model,
       reasoningEffort: command.reasoningEffort,
       taskPacketPath: command.taskPacketPath,
-      fabricTaskId: queueRun?.fabricTaskId ?? command.fabricTaskId ?? getNestedString(packet, ["task", "fabricTaskId"]),
+      fabricTaskId: queueRun?.fabricTaskId ?? command.fabricTaskId ?? envFabricTaskId ?? getNestedString(packet, ["task", "fabricTaskId"]),
       queueTaskId: queueRun?.queueTaskId ?? getNestedString(packet, ["task", "queueTaskId"]),
       status: parsed.status,
       result: parsed,
@@ -1139,11 +1140,52 @@ async function handleProposedPatch(
 
 function parseTaskPacket(text: string, path: string): Record<string, unknown> {
   if (path.endsWith(".json")) return parseJsonObject(text, "task packet");
+  const frontmatter = parseTaskPacketFrontmatter(text);
+  if (frontmatter) {
+    return {
+      schema: "agent-fabric.task-packet.text",
+      sourcePath: path,
+      text,
+      queue: {
+        queueId: frontmatter.queueId,
+        projectPath: frontmatter.projectPath
+      },
+      task: {
+        queueTaskId: frontmatter.queueTaskId,
+        fabricTaskId: frontmatter.fabricTaskId
+      },
+      contextFilePath: frontmatter.contextFilePath
+    };
+  }
   return {
     schema: "agent-fabric.task-packet.text",
     sourcePath: path,
     text
   };
+}
+
+function parseTaskPacketFrontmatter(text: string): Record<string, string> | undefined {
+  if (!text.startsWith("---\n")) return undefined;
+  const end = text.indexOf("\n---", 4);
+  if (end < 0) return undefined;
+  const body = text.slice(4, end);
+  const record: Record<string, string> = {};
+  for (const line of body.split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z][A-Za-z0-9_-]*):\s*(.*)$/);
+    if (!match) continue;
+    record[match[1]] = unquoteFrontmatterValue(match[2].trim());
+  }
+  return record;
+}
+
+function unquoteFrontmatterValue(value: string): string {
+  if (!value) return "";
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return typeof parsed === "string" ? parsed : value;
+  } catch {
+    return value.replace(/^['"]|['"]$/g, "");
+  }
 }
 
 function parseJsonObject(text: string, label: string): Record<string, unknown> {
@@ -1168,9 +1210,15 @@ function stripJsonFence(text: string): string {
 function defaultOutputFile(
   command: Extract<DeepSeekWorkerCommand, { command: "run-task" }>,
   packet: Record<string, unknown>,
-  cwd: string
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env
 ): string {
-  const id = command.fabricTaskId ?? getNestedString(packet, ["task", "fabricTaskId"]) ?? getNestedString(packet, ["task", "queueTaskId"]) ?? basename(command.taskPacketPath);
+  const id =
+    command.fabricTaskId ??
+    env.AGENT_FABRIC_FABRIC_TASK_ID ??
+    getNestedString(packet, ["task", "fabricTaskId"]) ??
+    getNestedString(packet, ["task", "queueTaskId"]) ??
+    basename(command.taskPacketPath);
   return join(cwd, `deepseek-${command.role}-${safeFilePart(id)}.json`);
 }
 

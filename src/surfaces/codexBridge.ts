@@ -6,17 +6,17 @@ import type { SurfaceHost } from "./host.js";
 import {
   projectQueueApproveModelCalls,
   projectQueueAgentLanes,
-  projectQueueClaimNext,
   projectQueueCreate,
+  projectQueueLaunchPlan,
   projectQueueNextReady,
   projectQueueProgressReport,
   projectQueueTaskDetail,
   projectQueueUpdateTask
 } from "./projectQueue.js";
-import { fabricTaskEvent } from "./worker.js";
 
 const WORKERS = new Set(["deepseek-direct", "jcode-deepseek"]);
 const SENIOR_DEFAULT_WORKER_ENV = "AGENT_FABRIC_SENIOR_DEFAULT_WORKER";
+const MAX_CODEX_AGENT_COUNT = 32;
 const WORKSPACE_MODES = new Set(["git_worktree", "sandbox"]);
 const DEFAULT_AGENT_NAMES = [
   "Rami",
@@ -43,6 +43,7 @@ export function fabricSpawnAgents(host: SurfaceHost, input: unknown, context: Ca
   const modelProfile = getOptionalString(input, "modelProfile") ?? "deepseek-v4-pro:max";
   const maxRuntimeMinutes = getOptionalNumber(input, "maxRuntimeMinutes");
   const allowPartial = getOptionalBoolean(input, "allowPartial") ?? false;
+  const planOnly = getOptionalBoolean(input, "planOnly") ?? false;
   const next = projectQueueNextReady(host, { queueId, limit: count }, context);
   const ready = arrayFrom(next.ready);
   const existing = numberFrom(projectQueueAgentLanes(host, { queueId, includeCompleted: true, maxEventsPerLane: 1 }, context).count);
@@ -86,67 +87,58 @@ export function fabricSpawnAgents(host: SurfaceHost, input: unknown, context: Ca
   }
 
   const toStart = Math.min(count, capacity);
-  const claims: Record<string, unknown>[] = [];
-  const skipped: Record<string, unknown>[] = [];
-  for (let index = 0; index < toStart; index += 1) {
-    const nameIndex = existing + index;
-    const displayName = agentNameForIndex(nameIndex);
-    const claim = projectQueueClaimNext(
-      host,
-      {
-        queueId,
-        worker,
-        workspaceMode,
-        modelProfile,
-        maxRuntimeMinutes,
-        metadata: {
-          source: "fabric_spawn_agents",
-          codexBridge: {
-            displayName,
-            nameIndex,
-            requestedCount: count,
-            mentionPrefix: "@af/"
-          }
-        }
-      },
-      childContext(context, `claim:${index}`)
-    );
-    if (claim.claimed) {
-      const claimed = objectFrom(claim.claimed);
-      const workerRun = objectFrom(claim.workerRun);
-      const fabricTaskId = stringFrom(claimed.fabricTaskId);
-      const workerRunId = stringFrom(workerRun.workerRunId);
-      if (fabricTaskId && workerRunId) {
-        fabricTaskEvent(
-          host,
-          {
-            taskId: fabricTaskId,
-            workerRunId,
-            kind: "started",
-            body: "Agent Fabric worker card started by fabric_spawn_agents.",
-            metadata: { queueId, queueTaskId: claimed.queueTaskId, worker, workspaceMode, modelProfile }
-          },
-          childContext(context, `event:${index}`)
-        );
-      }
-      claims.push(claim);
-    } else skipped.push(claim);
-  }
-
+  const launchPlan = projectQueueLaunchPlan(host, { queueId, limit: toStart }, childContext(context, "launch-plan"));
+  const queue = objectFrom(launchPlan.queue);
+  const projectPath = stringFrom(queue.projectPath);
+  const planned = arrayFrom(launchPlan.launchable).slice(0, toStart);
+  const blocked = [...arrayFrom(launchPlan.approvalRequired), ...arrayFrom(launchPlan.waitingForStart), ...arrayFrom(launchPlan.blocked)];
+  const plannedCards = planned.map((entry, index) =>
+    plannedAgentCard(queueId, entry, existing + index, { worker, workspaceMode, modelProfile, maxRuntimeMinutes })
+  );
   const listed = fabricListAgents(host, { queueId, includeCompleted: true, maxEventsPerLane: 5 }, context);
+  const runnerCommand = [
+    "agent-fabric-project",
+    "run-ready",
+    ...(projectPath ? ["--project", projectPath] : []),
+    "--queue",
+    queueId,
+    "--worker",
+    worker,
+    "--workspace-mode",
+    workspaceMode,
+    "--model-profile",
+    modelProfile,
+    "--parallel",
+    String(toStart),
+    "--task-packet-dir",
+    projectPath ? `${projectPath.replace(/\/+$/, "")}/.agent-fabric/task-packets` : ".agent-fabric/task-packets",
+    "--cwd-template",
+    projectPath ? `${projectPath.replace(/\/+$/, "")}/.agent-fabric/worktrees/{{queueTaskId}}` : ".agent-fabric/worktrees/{{queueTaskId}}",
+    "--approve-tool-context"
+  ];
+  if (maxRuntimeMinutes) runnerCommand.push("--max-runtime-minutes", String(maxRuntimeMinutes));
   return {
     schema: "agent-fabric.codex-agents.v1",
-    status: claims.length === count ? "started" : claims.length > 0 ? "partial" : "blocked",
+    status: planOnly ? "planned" : "runner_required",
     queueId,
     requested: count,
-    started: claims.length,
-    queued: Math.max(0, count - claims.length),
+    started: 0,
+    planned: plannedCards.length,
+    queued: Math.max(0, count - plannedCards.length),
     activeWorkers,
     availableSlots,
     readyCount: ready.length,
-    claims,
-    skipped,
-    cards: listed.cards
+    planOnly,
+    runnerBacked: false,
+    launchSource: "fabric_spawn_agents",
+    nextAction:
+      plannedCards.length === 0
+        ? "No launchable tasks are ready. Add/import tasks, approve required tool/model context, and start queue execution."
+        : "Start real runner processes with agent-fabric-project run-ready; fabric_spawn_agents does not create runnerless running cards.",
+    runnerCommand: runnerCommand.map(shellQuoteIfNeeded).join(" "),
+    launchPlan,
+    blocked,
+    cards: [...plannedCards, ...arrayFrom(listed.cards)]
   };
 }
 
@@ -425,6 +417,21 @@ function laneCard(queueId: string, lane: Record<string, unknown>, index: number)
   const patchRefs = valuesFrom(task.patchRefs);
   const recentEvents = valuesFrom(lane.recentEvents);
   const latestCheckpoint = objectFrom(lane.latestCheckpoint);
+  const eventKinds = new Set(recentEvents.map((event) => stringFrom(objectFrom(event).kind)).filter((kind): kind is string => Boolean(kind)));
+  const latestEvent = objectFrom(lane.latestEvent);
+  const spawnedEvent = recentEvents.find((event) => stringFrom(objectFrom(event).kind) === "command_spawned");
+  const spawnedMetadata = objectFrom(objectFrom(spawnedEvent).metadata);
+  const hasRunnerEvidence =
+    eventKinds.has("command_spawned") ||
+    eventKinds.has("command_started") ||
+    eventKinds.has("command_finished") ||
+    eventKinds.has("test_result") ||
+    eventKinds.has("file_changed") ||
+    eventKinds.has("checkpoint") ||
+    Object.keys(latestCheckpoint).length > 0;
+  const runnerProcessState = runnerState(rawStatus, String(run.status ?? ""), hasRunnerEvidence);
+  const noRunner = runnerProcessState === "no_runner";
+  const pid = numberFrom(spawnedMetadata.pid);
   return {
     agentId,
     handle,
@@ -434,8 +441,18 @@ function laneCard(queueId: string, lane: Record<string, unknown>, index: number)
     workerKind: stringFrom(run.worker) ?? "worker",
     modelProfile: stringFrom(run.modelProfile),
     rawStatus,
-    status: stringFrom(progress.label) ?? rawStatus,
-    currentStep: stringFrom(progress.nextAction) ?? stringFrom(progress.summary) ?? stringFrom(objectFrom(lane.latestEvent).body),
+    status: noRunner ? "No runner" : stringFrom(progress.label) ?? rawStatus,
+    currentStep: noRunner
+      ? "Worker card is registered, but no runner process evidence has been recorded."
+      : stringFrom(progress.nextAction) ?? stringFrom(progress.summary) ?? stringFrom(latestEvent.body),
+    runnerProcessState,
+    pid: pid > 0 ? pid : undefined,
+    runnerStartedAt: stringFrom(run.startedAt),
+    lastHeartbeatAt: stringFrom(run.updatedAt) ?? stringFrom(progress.lastActivityAt),
+    runnerLogPath: stringFrom(metadata.runnerLogPath) ?? stringFrom(spawnedMetadata.runnerLogPath),
+    taskPacketPath: stringFrom(metadata.taskPacketPath) ?? stringFrom(spawnedMetadata.taskPacketPath),
+    contextFilePath: stringFrom(metadata.contextFilePath) ?? stringFrom(spawnedMetadata.contextFilePath),
+    launchSource: stringFrom(metadata.source) ?? stringFrom(objectFrom(metadata.codexBridge).source),
     unreadAskCount: 0,
     patchState: patchRefs.length > 0 ? (rawStatus === "accepted" ? "accepted" : "ready") : "none",
     patchReady: rawStatus === "patch_ready" && patchRefs.length > 0,
@@ -464,6 +481,75 @@ function laneCard(queueId: string, lane: Record<string, unknown>, index: number)
   };
 }
 
+function plannedAgentCard(
+  queueId: string,
+  entry: Record<string, unknown>,
+  index: number,
+  options: { worker: string; workspaceMode: string; modelProfile: string; maxRuntimeMinutes?: number }
+): AgentCard {
+  const task = objectFrom(entry.task);
+  const queueTaskId = String(task.queueTaskId ?? `planned-${index + 1}`);
+  const displayName = agentNameForIndex(index);
+  const agentId = `planned:${queueTaskId}`;
+  return {
+    agentId,
+    handle: `@af/${slug(displayName)}-${queueTaskId.slice(-6)}`,
+    displayName,
+    nameIndex: index,
+    role: "worker",
+    workerKind: options.worker,
+    modelProfile: options.modelProfile,
+    rawStatus: "planned",
+    status: "planned",
+    currentStep: "Ready to launch through agent-fabric-project run-ready.",
+    runnerProcessState: "planned",
+    pid: undefined,
+    runnerStartedAt: undefined,
+    lastHeartbeatAt: undefined,
+    runnerLogPath: undefined,
+    taskPacketPath: undefined,
+    contextFilePath: undefined,
+    launchSource: "fabric_spawn_agents:plan",
+    unreadAskCount: 0,
+    patchState: "none",
+    patchReady: false,
+    reviewState: "not_ready",
+    sourceOfTruth: "agent-fabric.queue",
+    task: {
+      queueTaskId,
+      title: task.title,
+      status: task.status ?? "queued"
+    },
+    workspace: {
+      mode: options.workspaceMode,
+      path: undefined
+    },
+    maxRuntimeMinutes: options.maxRuntimeMinutes,
+    open: {
+      tool: "fabric_open_agent",
+      input: { queueId, agent: queueTaskId },
+      desktopPath: `/api/queues/${encodeURIComponent(queueId)}/tasks/${encodeURIComponent(queueTaskId)}`
+    },
+    lifecycleEvents: [],
+    checkpoint: {},
+    artifacts: {
+      patchRefs: [],
+      testRefs: []
+    }
+  };
+}
+
+function runnerState(rawTaskStatus: string, rawRunStatus: string, hasRunnerEvidence: boolean): string {
+  const taskStatus = rawTaskStatus.toLowerCase();
+  const runStatus = rawRunStatus.toLowerCase();
+  if (taskStatus === "patch_ready" || runStatus === "patch_ready") return "patch_ready";
+  if (CLOSED_STATUSES.has(taskStatus) || CLOSED_STATUSES.has(runStatus)) return taskStatus || runStatus;
+  if ((taskStatus === "running" || runStatus === "running") && !hasRunnerEvidence) return "no_runner";
+  if (taskStatus === "running" || runStatus === "running") return "running";
+  if (taskStatus === "queued" || taskStatus === "ready") return "planned";
+  return taskStatus || runStatus || "unknown";
+}
+
 function agentMatchesCard(agent: string, card: Record<string, unknown>): boolean {
   const normalized = agent.toLowerCase();
   return [card.agentId, card.handle, card.displayName, objectFrom(card.task).queueTaskId]
@@ -472,8 +558,8 @@ function agentMatchesCard(agent: string, card: Record<string, unknown>): boolean
 }
 
 function normalizeCount(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > 16) {
-    throw new FabricError("INVALID_INPUT", "count must be an integer between 1 and 16", false);
+  if (!Number.isInteger(value) || value < 1 || value > MAX_CODEX_AGENT_COUNT) {
+    throw new FabricError("INVALID_INPUT", `count must be an integer between 1 and ${MAX_CODEX_AGENT_COUNT}`, false);
   }
   return value;
 }
@@ -515,4 +601,9 @@ function agentNameForIndex(index: number): string {
 
 function slug(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "agent";
+}
+
+function shellQuoteIfNeeded(value: string): string {
+  if (/^[A-Za-z0-9_./:=@+-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

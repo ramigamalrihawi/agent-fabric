@@ -94,6 +94,69 @@ describe("project queue substrate", () => {
     daemon.close();
   });
 
+  it("validates queue task fabric links and missing context refs before launch", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "validate-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+    const added = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId: created.data.queueId,
+        tasks: [
+          {
+            title: "Use moved context",
+            goal: "Read a context file before launch.",
+            risk: "low",
+            requiredContextRefs: ["docs/missing-after-move.md"]
+          }
+        ]
+      },
+      contextFor(session, "validate-add")
+    );
+    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error("add task failed");
+    const queueTaskId = added.data.created[0].queueTaskId as string;
+
+    const contextRefs = daemon.callTool(
+      "project_queue_validate_context_refs",
+      { queueId: created.data.queueId, readyOnly: true },
+      contextFor(session, "validate-context")
+    );
+    expect(contextRefs.ok).toBe(true);
+    if (!contextRefs.ok) throw new Error("context validation failed");
+    expect(contextRefs.data).toMatchObject({ ok: false, checked: 1 });
+    expect(contextRefs.data.issues[0]).toMatchObject({
+      type: "context_ref_missing",
+      queueTaskId,
+      ref: "docs/missing-after-move.md"
+    });
+
+    const marked = daemon.callTool(
+      "project_queue_validate_context_refs",
+      { queueId: created.data.queueId, readyOnly: true, markBlocked: true },
+      contextFor(session, "validate-context-mark")
+    );
+    expect(marked.ok).toBe(true);
+    const blockedStatus = daemon.callTool("project_queue_status", { queueId: created.data.queueId }, contextFor(session, "validate-status"));
+    expect(blockedStatus.ok).toBe(true);
+    if (!blockedStatus.ok) throw new Error("status failed");
+    expect(blockedStatus.data.tasks[0]).toMatchObject({ queueTaskId, status: "blocked" });
+
+    daemon.db.db.prepare("UPDATE project_queue_tasks SET status = 'queued', fabric_task_id = NULL WHERE id = ?").run(queueTaskId);
+    const links = daemon.callTool(
+      "project_queue_validate_links",
+      { queueId: created.data.queueId, readyOnly: true },
+      contextFor(session, "validate-links")
+    );
+    expect(links.ok).toBe(true);
+    if (!links.ok) throw new Error("link validation failed");
+    expect(links.data).toMatchObject({ ok: false, checked: 1 });
+    expect(links.data.issues[0]).toMatchObject({ type: "missing_fabric_task_id", queueTaskId });
+    daemon.close();
+  });
+
   it("adds dependency-aware tasks and returns only ready work", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload());

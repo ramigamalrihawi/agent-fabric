@@ -30,7 +30,27 @@ describe("Codex-style Agent Fabric worker bridge", () => {
     daemon.close();
   });
 
-  it("spawns queue-visible cards, opens an @af worker, messages it, and accepts a patch-ready result", () => {
+  it("plans explicit 20-lane DeepSeek requests without hitting the old 16-lane cap", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const queueId = createQueue(daemon, session, "twenty-create", 20);
+    addReadyTasks(daemon, session, queueId, 20);
+    startExecution(daemon, session, queueId, "twenty-start");
+
+    const result = daemon.callTool(
+      "fabric_spawn_agents",
+      { queueId, count: 20, worker: "deepseek-direct", workspaceMode: "git_worktree", planOnly: true },
+      contextFor(session, "twenty-spawn")
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("spawn failed");
+    expect(result.data).toMatchObject({ status: "planned", requested: 20, started: 0, planned: 20, queued: 0 });
+    expect(result.data.cards).toHaveLength(20);
+    daemon.close();
+  });
+
+  it("plans bridge cards without fake runners, then opens a real runner-backed @af worker", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload());
     const queueId = createQueue(daemon, session, "codex-create", 4);
@@ -44,16 +64,64 @@ describe("Codex-style Agent Fabric worker bridge", () => {
     );
     expect(spawned.ok).toBe(true);
     if (!spawned.ok) throw new Error("spawn failed");
-    expect(spawned.data).toMatchObject({ status: "started", requested: 2, started: 2, queued: 0 });
+    expect(spawned.data).toMatchObject({ status: "runner_required", requested: 2, started: 0, planned: 2, queued: 0 });
+    expect(spawned.data.cards[0]).toMatchObject({
+      rawStatus: "planned",
+      runnerProcessState: "planned",
+      workerKind: "deepseek-direct"
+    });
+
+    const claim = daemon.callTool(
+      "project_queue_claim_next",
+      {
+        queueId,
+        worker: "deepseek-direct",
+        workspaceMode: "git_worktree",
+        modelProfile: "deepseek-v4-pro:max",
+        metadata: { source: "test-runner" }
+      },
+      contextFor(session, "codex-claim-real-runner")
+    );
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) throw new Error("claim failed");
+    const claimed = claim.data.claimed as { fabricTaskId: string; queueTaskId: string };
+    const workerRun = claim.data.workerRun as { workerRunId: string };
+    const spawnedEvent = daemon.callTool(
+      "fabric_task_event",
+      {
+        taskId: claimed.fabricTaskId,
+        workerRunId: workerRun.workerRunId,
+        kind: "command_spawned",
+        body: "agent-fabric-deepseek-worker run-task",
+        metadata: { pid: 12345, taskPacketPath: "/tmp/task.json", contextFilePath: "/tmp/task.context.md" }
+      },
+      contextFor(session, "codex-command-spawned")
+    );
+    expect(spawnedEvent.ok).toBe(true);
+    const startedEvent = daemon.callTool(
+      "fabric_task_event",
+      {
+        taskId: claimed.fabricTaskId,
+        workerRunId: workerRun.workerRunId,
+        kind: "command_started",
+        body: "agent-fabric-deepseek-worker run-task",
+        metadata: { taskPacketPath: "/tmp/task.json", contextFilePath: "/tmp/task.context.md" }
+      },
+      contextFor(session, "codex-command-started")
+    );
+    expect(startedEvent.ok).toBe(true);
 
     const listed = daemon.callTool("fabric_list_agents", { queueId, includeCompleted: true }, contextFor(session));
     expect(listed.ok).toBe(true);
     if (!listed.ok) throw new Error("list failed");
-    expect(listed.data.cards).toHaveLength(2);
+    expect(listed.data.cards).toHaveLength(1);
     expect(listed.data.cards[0].handle).toMatch(/^@af\//);
-    expect(listed.data.cards.map((card: { displayName: string }) => card.displayName)).toEqual(["Rami", "Belle"]);
     expect(listed.data.cards[0]).toMatchObject({
       workerKind: "deepseek-direct",
+      runnerProcessState: "running",
+      pid: 12345,
+      taskPacketPath: "/tmp/task.json",
+      contextFilePath: "/tmp/task.context.md",
       workspace: { mode: "git_worktree" },
       sourceOfTruth: "agent-fabric.queue"
     });

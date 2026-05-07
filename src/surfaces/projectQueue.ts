@@ -1,4 +1,5 @@
-import { basename } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, isAbsolute, resolve } from "node:path";
 import { newId, stableHash } from "../ids.js";
 import { FabricError } from "../runtime/errors.js";
 import { formatMemory } from "../runtime/format.js";
@@ -266,6 +267,7 @@ const EXECUTION_BLOCKED_QUEUE_STATUSES = new Set(["paused", "canceled", "complet
 const WORKER_START_OPEN_QUEUE_STATUSES = new Set(["running"]);
 const RETRYABLE_TASK_STATUSES = new Set(["blocked", "review", "patch_ready", "failed", "canceled"]);
 const TASK_METADATA_EDITABLE_STATUSES = new Set(["queued", "ready", "blocked", "review", "patch_ready", "failed", "canceled"]);
+const MAX_PARALLEL_AGENTS = 32;
 
 export function projectQueueCreate(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const projectPath = getString(input, "projectPath");
@@ -1062,14 +1064,26 @@ export function projectQueuePrepareReady(host: SurfaceHost, input: unknown, cont
     const scheduled = selectSchedulableReadyTasks(analyzed.ready.sort(compareReadyTasks), tasks, limit);
     const prepared = scheduled.ready.map((task) => {
       const proposal = ensureTaskToolContextProposal(host, queue, task, session, context, "project_queue_prepare_ready");
-      const launchBlockedReason = proposal.approvalRequired ? "tool_context_approval_required" : workerStartBlock;
+      const linkIssues = linkIssuesForTask(host, queue, task);
+      const contextRefIssues = contextRefIssuesForTask(queue, task);
+      const linkBlocked = linkIssues.some((issue) => issue.severity === "error");
+      const contextBlocked = contextRefIssues.some((issue) => issue.severity === "error");
+      const launchBlockedReason = proposal.approvalRequired
+        ? "tool_context_approval_required"
+        : linkBlocked
+          ? "fabric_task_link_missing"
+          : contextBlocked
+            ? "context_ref_missing"
+            : workerStartBlock;
       return {
         task: formatQueueTask(task),
         toolContextProposal: proposal.proposal ? formatProposal(proposal.proposal) : undefined,
         approvalRequired: proposal.approvalRequired,
-        readyToClaim: !proposal.approvalRequired && !workerStartBlock,
-        readyToLaunch: !proposal.approvalRequired && !workerStartBlock,
+        readyToClaim: !proposal.approvalRequired && !linkBlocked && !contextBlocked && !workerStartBlock,
+        readyToLaunch: !proposal.approvalRequired && !linkBlocked && !contextBlocked && !workerStartBlock,
         launchBlockedReason,
+        linkIssues,
+        contextRefIssues,
         noContextRequired: !proposal.proposal,
         reusedProposal: proposal.reused,
         missingGrants: proposal.missingGrants,
@@ -1177,6 +1191,58 @@ export function projectQueueLaunchPlan(host: SurfaceHost, input: unknown, contex
       needsProposal: entries.filter((entry) => entry.needsProposal).length
     }
   };
+}
+
+export function projectQueueValidateLinks(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const session = host.requireSession(context);
+  const queue = requireQueue(host, getString(input, "queueId"), session.workspace_root);
+  const readyOnly = getOptionalBoolean(input, "readyOnly") ?? false;
+  const tasks = taskRows(host, queue.id).filter((task) => !readyOnly || task.status === "queued" || task.status === "ready");
+  const issues = linkIssuesForTasks(host, queue, tasks);
+  return {
+    schema: "agent-fabric.project-queue-link-validation.v1",
+    queueId: queue.id,
+    ok: issues.length === 0,
+    checked: tasks.length,
+    issues,
+    summary: {
+      missingFabricTaskId: issues.filter((issue) => issue.type === "missing_fabric_task_id").length,
+      orphanedFabricTask: issues.filter((issue) => issue.type === "orphaned_fabric_task").length
+    }
+  };
+}
+
+export function projectQueueValidateContextRefs(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const queueId = getString(input, "queueId");
+  const readyOnly = getOptionalBoolean(input, "readyOnly") ?? false;
+  const markBlocked = getOptionalBoolean(input, "markBlocked") ?? false;
+  const validate = (session: ReturnType<SurfaceHost["requireSession"]>): Record<string, unknown> => {
+    const queue = requireQueue(host, queueId, session.workspace_root);
+    const tasks = taskRows(host, queue.id).filter((task) => !readyOnly || task.status === "queued" || task.status === "ready");
+    const issues = contextRefIssuesForTasks(queue, tasks);
+    if (markBlocked) {
+      const ids = new Set(issues.map((issue) => issue.queueTaskId));
+      for (const task of tasks) {
+        if (!ids.has(task.id) || !TASK_METADATA_EDITABLE_STATUSES.has(task.status)) continue;
+        host.db.db
+          .prepare("UPDATE project_queue_tasks SET status = 'blocked', summary = ?, ts_updated = CURRENT_TIMESTAMP WHERE id = ?")
+          .run("Blocked before launch: context_ref_missing", task.id);
+      }
+    }
+    return {
+      schema: "agent-fabric.project-queue-context-ref-validation.v1",
+      queueId: queue.id,
+      ok: issues.length === 0,
+      checked: tasks.length,
+      markedBlocked: markBlocked ? new Set(issues.map((issue) => issue.queueTaskId)).size : 0,
+      issues,
+      summary: {
+        contextRefMissing: issues.filter((issue) => issue.type === "context_ref_missing").length
+      }
+    };
+  };
+  if (markBlocked) return host.recordMutation("project_queue_validate_context_refs", input, context, validate);
+  return validate(host.requireSession(context));
 }
 
 export function projectQueueClaimNext(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
@@ -1874,6 +1940,7 @@ export function projectQueueUpdateTaskMetadata(host: SurfaceHost, input: unknown
   const removeRequiredMcpServers = optionalStringArrayInput(input, "removeRequiredMcpServers");
   const removeRequiredMemories = optionalStringArrayInput(input, "removeRequiredMemories");
   const removeRequiredContextRefs = optionalStringArrayInput(input, "removeRequiredContextRefs");
+  const rewriteContextRefs = parseRewriteSpecs(getStringArray(input, "rewriteContextRefs"), "rewriteContextRefs");
   const dependsOn = optionalStringArrayInput(input, "dependsOn");
   const note = getOptionalString(input, "note") ?? null;
   if (title !== undefined && title.trim().length === 0) throw new FabricError("INVALID_INPUT", "title must not be empty", false);
@@ -1901,7 +1968,10 @@ export function projectQueueUpdateTaskMetadata(host: SurfaceHost, input: unknown
     const nextRequiredTools = nextSetAddRemove(task.required_tools_json, requiredTools, addRequiredTools, removeRequiredTools);
     const nextRequiredMcpServers = nextSetAddRemove(task.required_mcp_servers_json, requiredMcpServers, addRequiredMcpServers, removeRequiredMcpServers);
     const nextRequiredMemories = nextSetAddRemove(task.required_memories_json, requiredMemories, addRequiredMemories, removeRequiredMemories);
-    const nextRequiredContextRefs = nextSetAddRemove(task.required_context_refs_json, requiredContextRefs, addRequiredContextRefs, removeRequiredContextRefs);
+    const nextRequiredContextRefs = applyRewriteSpecs(
+      nextSetAddRemove(task.required_context_refs_json, requiredContextRefs, addRequiredContextRefs, removeRequiredContextRefs),
+      rewriteContextRefs
+    );
     const toolContextRequirementsChanged =
       !jsonArraysEqual(task.required_tools_json, nextRequiredTools) ||
       !jsonArraysEqual(task.required_mcp_servers_json, nextRequiredMcpServers) ||
@@ -2363,8 +2433,8 @@ function defaultQueueTitle(projectPath: string): string {
 }
 
 function normalizeMaxParallelAgents(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > 16) {
-    throw new FabricError("INVALID_INPUT", "maxParallelAgents must be an integer between 1 and 16", false);
+  if (!Number.isInteger(value) || value < 1 || value > MAX_PARALLEL_AGENTS) {
+    throw new FabricError("INVALID_INPUT", `maxParallelAgents must be an integer between 1 and ${MAX_PARALLEL_AGENTS}`, false);
   }
   return value;
 }
@@ -2526,7 +2596,11 @@ function requireQueue(host: SurfaceHost, queueId: string, workspaceRoot: string)
 }
 
 function queueVisibleToWorkspace(queue: ProjectQueueRow, workspaceRoot: string): boolean {
-  return queue.workspace_root === workspaceRoot || queue.project_path === workspaceRoot;
+  return samePath(queue.workspace_root, workspaceRoot) || samePath(queue.project_path, workspaceRoot);
+}
+
+function samePath(left: string, right: string): boolean {
+  return resolve(left) === resolve(right);
 }
 
 function requireQueueTask(host: SurfaceHost, queueId: string, queueTaskId: string): ProjectQueueTaskRow {
@@ -2830,19 +2904,99 @@ function launchPlanEntry(
   workerStartBlock: string | undefined
 ): Record<string, unknown> {
   const readiness = taskToolContextLaunchReadiness(host, queue, task);
-  const workerStartBlocked = !readiness.approvalRequired && Boolean(workerStartBlock);
+  const linkIssues = linkIssuesForTask(host, queue, task);
+  const contextRefIssues = contextRefIssuesForTask(queue, task);
+  const linkBlocked = linkIssues.some((issue) => issue.severity === "error");
+  const contextBlocked = contextRefIssues.some((issue) => issue.severity === "error");
+  const workerStartBlocked = !readiness.approvalRequired && !linkBlocked && !contextBlocked && Boolean(workerStartBlock);
+  const launchBlockedReason = readiness.approvalRequired
+    ? "tool_context_approval_required"
+    : linkBlocked
+      ? "fabric_task_link_missing"
+      : contextBlocked
+        ? "context_ref_missing"
+        : workerStartBlock;
   return {
     task: formatQueueTask(task),
     toolContextProposal: readiness.proposal ? formatProposal(readiness.proposal) : undefined,
     approvalRequired: readiness.approvalRequired,
-    readyToLaunch: !readiness.approvalRequired && !workerStartBlock,
+    readyToLaunch: !readiness.approvalRequired && !linkBlocked && !contextBlocked && !workerStartBlock,
     workerStartBlocked,
-    launchBlockedReason: readiness.approvalRequired ? "tool_context_approval_required" : workerStartBlock,
+    launchBlockedReason,
+    linkIssues,
+    contextRefIssues,
     noContextRequired: readiness.noContextRequired,
     needsProposal: readiness.needsProposal,
     missingGrants: readiness.missingGrants,
     memorySuggestions: taskMemorySuggestions(host, workspaceRoot, task, 3)
   };
+}
+
+function linkIssuesForTasks(host: SurfaceHost, queue: ProjectQueueRow, tasks: ProjectQueueTaskRow[]): Array<Record<string, unknown>> {
+  return tasks.flatMap((task) => linkIssuesForTask(host, queue, task));
+}
+
+function linkIssuesForTask(host: SurfaceHost, queue: ProjectQueueRow, task: ProjectQueueTaskRow): Array<Record<string, unknown>> {
+  if (!task.fabric_task_id) {
+    return [
+      {
+        type: "missing_fabric_task_id",
+        severity: "error",
+        queueId: queue.id,
+        queueTaskId: task.id,
+        title: task.title
+      }
+    ];
+  }
+  const row = host.db.db
+    .prepare("SELECT id, workspace_root, project_path FROM tasks WHERE id = ?")
+    .get(task.fabric_task_id) as { id: string; workspace_root: string; project_path: string | null } | undefined;
+  if (!row) {
+    return [
+      {
+        type: "orphaned_fabric_task",
+        severity: "error",
+        queueId: queue.id,
+        queueTaskId: task.id,
+        fabricTaskId: task.fabric_task_id,
+        title: task.title
+      }
+    ];
+  }
+  return [];
+}
+
+function contextRefIssuesForTasks(queue: ProjectQueueRow, tasks: ProjectQueueTaskRow[]): Array<Record<string, unknown>> {
+  return tasks.flatMap((task) => contextRefIssuesForTask(queue, task));
+}
+
+function contextRefIssuesForTask(queue: ProjectQueueRow, task: ProjectQueueTaskRow): Array<Record<string, unknown>> {
+  const issues: Array<Record<string, unknown>> = [];
+  for (const value of safeJsonArray(task.required_context_refs_json)) {
+    if (typeof value !== "string") continue;
+    const path = contextRefPathForValidation(queue.project_path, value);
+    if (!path) continue;
+    if (!existsSync(path)) {
+      issues.push({
+        type: "context_ref_missing",
+        severity: "error",
+        queueId: queue.id,
+        queueTaskId: task.id,
+        fabricTaskId: task.fabric_task_id ?? undefined,
+        title: task.title,
+        ref: value,
+        path
+      });
+    }
+  }
+  return issues;
+}
+
+function contextRefPathForValidation(projectPath: string, ref: string): string | undefined {
+  const trimmed = ref.trim();
+  if (!trimmed || /^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return undefined;
+  if (/[*?\[\]{}]/.test(trimmed) || trimmed.includes("\0")) return undefined;
+  return isAbsolute(trimmed) ? resolve(trimmed) : resolve(projectPath, trimmed);
 }
 
 function taskToolContextLaunchReadiness(
@@ -3004,6 +3158,22 @@ function nextSetAddRemove(stored: string, setValue?: string[], addValue?: string
   if (!removeValue || removeValue.length === 0) return added;
   const removed = new Set(removeValue);
   return added.filter((value) => !removed.has(value));
+}
+
+function parseRewriteSpecs(values: string[], field: string): Array<{ oldRef: string; newRef: string }> {
+  return values.map((value) => {
+    const index = value.indexOf("=");
+    if (index <= 0 || index === value.length - 1) {
+      throw new FabricError("INVALID_INPUT", `${field} entries must use old=new`, false);
+    }
+    return { oldRef: value.slice(0, index), newRef: value.slice(index + 1) };
+  });
+}
+
+function applyRewriteSpecs(values: string[], rewrites: Array<{ oldRef: string; newRef: string }>): string[] {
+  if (rewrites.length === 0) return values;
+  const rewriteMap = new Map(rewrites.map((entry) => [entry.oldRef, entry.newRef]));
+  return values.map((value) => rewriteMap.get(value) ?? value).filter((value, index, all) => all.indexOf(value) === index);
 }
 
 function markPendingTaskToolContextProposalsForRevision(

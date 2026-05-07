@@ -255,6 +255,11 @@ describe("project CLI runner", () => {
       worker: "jcode-deepseek",
       taskPacketDir: "/tmp/packets"
     });
+    expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1", "--parallel", "20"])).toMatchObject({
+      command: "run-ready",
+      queueId: "pqueue_1",
+      parallel: 20
+    });
 
     expect(
       parseProjectCliArgs([
@@ -1201,6 +1206,7 @@ describe("project CLI runner", () => {
     expect(status.events.map((event) => event.kind)).toEqual([
       "started",
       "command_started",
+      "command_spawned",
       "command_finished",
       "file_changed",
       "patch_ready"
@@ -1382,6 +1388,9 @@ describe("project CLI runner", () => {
 
     expect(result.action).toBe("task_packets_written");
     const packetPath = join(packetsDir, `${task.queueTaskId}.md`);
+    expect(readFileSync(packetPath, "utf8")).toContain("---\nschema: agent-fabric.task-packet.v1");
+    expect(readFileSync(packetPath, "utf8")).toContain(`queueTaskId: "${task.queueTaskId}"`);
+    expect(readFileSync(packetPath, "utf8")).toContain(`contextFilePath: "${join(packetsDir, `${task.queueTaskId}.context.md`)}"`);
     expect(readFileSync(packetPath, "utf8")).toContain("# Run command");
     expect(readFileSync(packetPath, "utf8")).toContain("Use only approved tools and context.");
     expect(readFileSync(packetPath, "utf8")).toContain("## Terminal Tool Guidance");
@@ -2319,6 +2328,101 @@ describe("project CLI runner", () => {
     expect(blocked.action).toBe("run_task_blocked");
     expect(blocked.message).toContain("DeepSeek direct model approval required");
     expect(existsSync(join(projectPath, "should-not-run.txt"))).toBe(false);
+    daemon.close();
+  });
+
+  it("auto-injects fabric task linkage into custom deepseek-direct run-ready templates", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-project-cli-deepseek-template-"));
+    const packetDir = join(projectPath, "packets");
+    const fakeWorker = join(projectPath, "agent-fabric-deepseek-worker");
+    writeFileSync(
+      fakeWorker,
+      [
+        "#!/bin/sh",
+        "printf '%s\\n' \"$@\" > deepseek-args.txt",
+        "printf '%s\\n' '{\"schema\":\"agent-fabric.deepseek-worker-result.v1\",\"status\":\"completed\",\"result\":{\"status\":\"completed\",\"summary\":\"fake DeepSeek worker completed.\"}}' > fake-result.json",
+        "printf '%s\\n' fake-result.json"
+      ].join("\n")
+    );
+    chmodSync(fakeWorker, 0o755);
+    const created = await runProjectCommand(
+      {
+        command: "create",
+        json: false,
+        projectPath,
+        promptSummary: "DeepSeek template linkage test.",
+        pipelineProfile: "balanced",
+        maxParallelAgents: 20
+      },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    const imported = await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile: writeTasksFile(projectPath), approveQueue: true }, call);
+    const task = (imported.data.created as Array<{ queueTaskId: string; fabricTaskId: string }>)[0];
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+    const blocked = await runProjectCommand(
+      {
+        command: "run-ready",
+        json: false,
+        queueId,
+        limit: 1,
+        parallel: 1,
+        taskPacketDir: packetDir,
+        taskPacketFormat: "json",
+        commandTemplate: `${fakeWorker} run-task --task-packet {{taskPacket}} --context-file {{contextFile}} --role planner`,
+        cwd: projectPath,
+        worker: "deepseek-direct",
+        workspaceMode: "in_place",
+        modelProfile: "deepseek-v4-pro:max",
+        successStatus: "completed",
+        maxOutputChars: 4_000,
+        approveToolContext: true,
+        rememberToolContext: false,
+        continueOnFailure: false,
+        allowSharedCwd: false
+      },
+      call
+    );
+    const skipped = blocked.data.skipped as Array<{ requestId?: string; reason?: string }>;
+    expect(skipped[0]).toMatchObject({ reason: "model approval required" });
+    const approval = await call<{ approvalToken: string }>("llm_approve", {
+      requestId: skipped[0].requestId,
+      decision: "allow",
+      scope: "call",
+      expiresInSeconds: 60
+    });
+
+    const result = await runProjectCommand(
+      {
+        command: "run-ready",
+        json: false,
+        queueId,
+        limit: 1,
+        parallel: 1,
+        taskPacketDir: packetDir,
+        taskPacketFormat: "json",
+        commandTemplate: `${fakeWorker} run-task --task-packet {{taskPacket}} --context-file {{contextFile}} --role planner`,
+        cwd: projectPath,
+        worker: "deepseek-direct",
+        workspaceMode: "in_place",
+        modelProfile: "deepseek-v4-pro:max",
+        approvalToken: approval.approvalToken,
+        successStatus: "completed",
+        maxOutputChars: 4_000,
+        approveToolContext: true,
+        rememberToolContext: false,
+        continueOnFailure: false,
+        allowSharedCwd: false
+      },
+      call
+    );
+
+    expect(result.action).toBe("ready_tasks_run");
+    expect(readFileSync(join(projectPath, "deepseek-args.txt"), "utf8")).toContain(`--fabric-task\n${task.fabricTaskId}`);
     daemon.close();
   });
 });

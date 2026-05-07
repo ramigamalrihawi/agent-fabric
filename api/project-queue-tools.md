@@ -18,7 +18,7 @@ Recommended factory flow:
 2. Generate independent implementer tasks plus explicit reviewer, risk-reviewer, docs/test-reviewer, and adjudicator tasks for high-impact changes.
 3. Run `review-matrix`, `prepare-ready`, and `launch-plan` before starting workers so expected-file overlaps, dependency blockers, and tool/context approval gaps are visible.
 4. Record `decide-queue --decision start_execution` only after the queue shape is accepted.
-5. Launch implementers with `run-ready --worker deepseek-direct --workspace-mode git_worktree --parallel <n>` and prefer `--patch-mode write` for patch-producing work.
+5. Launch implementers with `run-ready --project <path> --worker deepseek-direct --workspace-mode git_worktree --parallel <n>` and prefer `--patch-mode write` for patch-producing work.
 6. Feed concrete evidence to review lanes: task packets, structured worker results, patch files, command output, failing tests, and accepted constraints.
 7. Apply only accepted write-mode patches through `review-patches --accept-task <queueTaskId> --apply-patch`.
 8. Run local checks/tests and close with a handoff that lists lanes, costs if available, incorporated/deferred findings, and remaining limitations.
@@ -108,8 +108,8 @@ npm run dev:project -- write-task-packets --queue <queueId> --out-dir .agent-fab
 npm run dev:project -- resume-task --queue <queueId> --queue-task <queueTaskId> --output-file resume.md
 npm run dev:project -- launch --queue <queueId> --worker local-cli --workspace-mode git_worktree
 npm run dev:project -- run-task --queue <queueId> --queue-task <queueTaskId> --command "npm test" --approve-tool-context
-npm run dev:project -- run-ready --queue <queueId> --parallel 4 --workspace-mode git_worktree --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" --task-packet-dir .agent-fabric/task-packets --command-template "local-cli run --fabric-task {{fabricTaskId}} --task-packet {{taskPacket}}" --approve-tool-context
-npm run dev:project -- run-ready --queue <queueId> --worker deepseek-direct --parallel 4 --workspace-mode git_worktree --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" --task-packet-dir .agent-fabric/task-packets --approve-tool-context
+npm run dev:project -- run-ready --project <path> --queue <queueId> --parallel 4 --workspace-mode git_worktree --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" --task-packet-dir .agent-fabric/task-packets --command-template "local-cli run --fabric-task {{fabricTaskId}} --task-packet {{taskPacket}}" --approve-tool-context
+npm run dev:project -- run-ready --project <path> --queue <queueId> --worker deepseek-direct --parallel 4 --workspace-mode git_worktree --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" --task-packet-dir .agent-fabric/task-packets --approve-tool-context
 npm run dev:project -- factory-run --queue <queueId> --start-execution --parallel 8 --task-packet-dir .agent-fabric/task-packets --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" --approve-model-calls --approve-tool-context
 npm run dev:project -- fabric-spawn-agents --queue <queueId> --count 10 --worker deepseek-direct --workspace-mode git_worktree
 npm run dev:project -- fabric-list-agents --queue <queueId>
@@ -192,6 +192,7 @@ High-risk aliases still go through `llm_preflight`. If the command reports `need
 `run-task` wraps an explicit local command for one queue task. It proposes a `shell` tool/context grant plus the task's required MCP servers, tools, memories, and context refs; without existing grants, pass `--approve-tool-context` for a one-shot human-approved run, and optionally `--remember-tool-context` to save those grants for the project. If a task packet already exists, pass `--task-packet <path>` so the worker run and events retain a durable handoff reference. During execution it records:
 
 - `fabric_task_event` `command_started`
+- `fabric_task_event` `command_spawned` with process evidence such as pid
 - `fabric_task_event` `command_finished`
 - `fabric_task_event` `file_changed` for filesystem-detected changes
 - `fabric_task_event` `test_result` when the command looks like a test command
@@ -202,7 +203,7 @@ High-risk aliases still go through `llm_preflight`. If the command reports `need
 
 Pass `--adaptive-rate-limit` to reduce later batch parallelism when failed DeepSeek lanes include structured or textual 429/rate-limit evidence. Use `--min-parallel <n>` to set the lower bound. This does not retry already-failed queue tasks automatically; use `retry-task` after review when a lane should be requeued.
 
-With `--worker deepseek-direct`, `run-ready` defaults to `agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}} --context-file {{contextFile}} --fabric-task {{fabricTaskId}} --role implementer`, so `--task-packet-dir` is required unless an explicit `--command-template` is supplied. For each generated packet, the CLI also writes `<queueTaskId>.context.md` with bounded local contents from `expectedFiles` and file-like `requiredContextRefs`; unsupported, missing, large, binary, outside-project, or secret-looking paths are listed as omitted. The default DeepSeek task mode is report-only: structured worker results can include a proposed patch, but no files are edited unless an explicit command template passes `--patch-mode apply`. Commands that invoke `agent-fabric-deepseek-worker` get an `llm_preflight` gate before the shell command runs; pass `--approval-token <token>` after approving the model-call request when the route is high risk.
+With `--worker deepseek-direct`, `run-ready` defaults to `agent-fabric-deepseek-worker run-task --task-packet {{taskPacket}} --context-file {{contextFile}} --fabric-task {{fabricTaskId}} --role implementer`, so `--task-packet-dir` is required unless an explicit `--command-template` is supplied. Custom templates that invoke `agent-fabric-deepseek-worker` are automatically linked with `--fabric-task {{fabricTaskId}}` when omitted. For each generated packet, the CLI also writes Markdown frontmatter plus `<queueTaskId>.context.md` with bounded local contents from `expectedFiles` and file-like `requiredContextRefs`; unsupported, missing, large, binary, outside-project, or secret-looking paths are listed as omitted. Missing file-like `requiredContextRefs` block launch and mark affected ready tasks `blocked`. The default DeepSeek task mode is report-only: structured worker results can include a proposed patch, but no files are edited unless an explicit command template passes `--patch-mode apply`. Commands that invoke `agent-fabric-deepseek-worker` get an `llm_preflight` gate before the shell command runs; pass `--approval-token <token>` after approving the model-call request when the route is high risk.
 
 To collect proposed patches for human review without editing the worktree, override the command template with `--patch-mode write`:
 
@@ -220,7 +221,9 @@ The apply gate requires the queue task to be `patch_ready`, `review`, or already
 
 `prepare-ready` creates or reuses tool/context proposals for the next schedulable tasks without claiming them. Use it before `launch` so the approval inbox is populated while the human is still reviewing the queue. `claim-next`, `launch`, and `run-task` require an explicit `decide-queue --decision start_execution` or `resume` decision first.
 
-`project_queue_launch_plan` is the read-only companion for Desktop and launchers. It does not create proposals or claim tasks; it only classifies the next schedulable tasks as launchable, waiting for the start gate, or waiting for tool/context approval.
+`project_queue_launch_plan` is the read-only companion for Desktop and launchers. It does not create proposals or claim tasks; it only classifies the next schedulable tasks as launchable, waiting for the start gate, waiting for tool/context approval, missing a linked fabric task, or blocked by missing context refs.
+
+Use `project_queue_validate_links` and `project_queue_validate_context_refs` before custom launchers start shells. `project_queue_validate_context_refs` accepts `markBlocked: true` to move affected ready tasks to `blocked` with a `context_ref_missing` summary. Repair moved files with `edit-task --rewrite-context-ref old=new` or the corresponding `rewriteContextRefs` API field.
 
 `write-task-packets` writes one worker handoff file per queue task. Use `--format json` for machine workers and `--format markdown` for manual or chat-style handoff. Add `--ready-only` to emit packets only for dependency-free ready tasks.
 
@@ -236,7 +239,7 @@ The apply gate requires the queue task to be `patch_ready`, `review`, or already
 
 Command-template values are shell-quoted before substitution. Cwd-template values are substituted as raw path components. Without `--command-template`, the runner uses the worker default command where one exists.
 
-Packet JSON has schema `agent-fabric.task-packet.v1` and includes queue metadata, the full queue task record, and operator instructions. The Markdown format carries the task goal, metadata, expected files, acceptance criteria, and execution rules in a human-readable form. When `run-ready` creates a packet, each run result includes `taskPacketPath` and `taskPacketFormat` for UI links and supervisor review.
+Packet JSON has schema `agent-fabric.task-packet.v1` and includes queue metadata, the full queue task record, context file path, and operator instructions. The Markdown format carries machine-readable frontmatter (`queueId`, `queueTaskId`, `fabricTaskId`, `projectPath`, `contextFilePath`) plus the task goal, metadata, expected files, acceptance criteria, and execution rules in a human-readable form. When `run-ready` creates a packet, each run result includes `taskPacketPath`, `taskPacketFormat`, and context file data for UI links and supervisor review.
 
 `resume-task` builds a recovery handoff for one queue task from the latest worker run/checkpoint. Use it after reloads, crashes, interrupted workers, or manual handoff:
 
@@ -257,7 +260,7 @@ Create one project-scoped queue keyed by project folder.
   promptSummary?: string;   // preferred stored summary
   title?: string;
   pipelineProfile?: "fast" | "balanced" | "careful" | "custom";
-  maxParallelAgents?: number; // default 4, hard range 1-16
+  maxParallelAgents?: number; // default 4, hard range 1-32
   planChainId?: string;
 }
 ```
@@ -293,7 +296,7 @@ Update mutable queue-level settings after creation. This is the substrate for De
   queueId: string;
   title?: string;
   pipelineProfile?: "fast" | "balanced" | "careful" | "custom";
-  maxParallelAgents?: number; // range 1-16
+  maxParallelAgents?: number; // range 1-32
   note?: string;
 }
 ```
@@ -1018,6 +1021,7 @@ Edit generated queue-task metadata during human queue review before a worker cla
   removeRequiredMcpServers?: string[];
   removeRequiredMemories?: string[];
   removeRequiredContextRefs?: string[];
+  rewriteContextRefs?: string[]; // old=new entries for moved files
   dependsOn?: string[];
   note?: string;
 }
@@ -1026,10 +1030,10 @@ Edit generated queue-task metadata during human queue review before a worker cla
 This is the durable API behind the Desktop queue-review editor and the terminal `edit-task` command:
 
 ```bash
-npm run dev:project -- edit-task --queue <queueId> --queue-task <queueTaskId> --metadata-file task-metadata.json --note "Human queue review"
+npm run dev:project -- edit-task --queue <queueId> --queue-task <queueTaskId> --metadata-file task-metadata.json --rewrite-context-ref old.md=new.md --note "Human queue review"
 ```
 
-Edits are allowed only while the queue task is `queued`, `ready`, `blocked`, `review`, `patch_ready`, `failed`, or `canceled`. Running, completed, accepted, and done tasks are locked because workers or reviewers have already acted on the metadata. Dependency edits must point to tasks in the same queue and cannot introduce cycles. Title, goal, and priority updates are mirrored to the linked `tasks` row so worker handoff packets stay consistent. `requiredTools`, `requiredMcpServers`, `requiredMemories`, and `requiredContextRefs` replace the full generated bundle; `addRequired*` appends unique entries and `removeRequired*` removes specific entries. These patch fields are useful for toggling one tool/MCP server/memory/context ref or attaching/removing a single memory suggestion without rewriting the generated bundle. Changing any required tool/context bundle marks pending tool/context proposals for that task as `revision_requested`; run `project_queue_prepare_ready` again to create a fresh proposal for the new bundle.
+Edits are allowed only while the queue task is `queued`, `ready`, `blocked`, `review`, `patch_ready`, `failed`, or `canceled`. Running, completed, accepted, and done tasks are locked because workers or reviewers have already acted on the metadata. Dependency edits must point to tasks in the same queue and cannot introduce cycles. Title, goal, and priority updates are mirrored to the linked `tasks` row so worker handoff packets stay consistent. `requiredTools`, `requiredMcpServers`, `requiredMemories`, and `requiredContextRefs` replace the full generated bundle; `addRequired*` appends unique entries, `removeRequired*` removes specific entries, and `rewriteContextRefs` rewrites exact `old=new` context refs after files move. These patch fields are useful for toggling one tool/MCP server/memory/context ref or attaching/removing a single memory suggestion without rewriting the generated bundle. Changing any required tool/context bundle marks pending tool/context proposals for that task as `revision_requested`; run `project_queue_prepare_ready` again to create a fresh proposal for the new bundle.
 
 Returns:
 

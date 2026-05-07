@@ -18,8 +18,9 @@ const SENIOR_DEFAULT_WORKER = "deepseek-direct" as const;
 const SENIOR_DEFAULT_WORKSPACE_MODE: "git_worktree" = "git_worktree";
 const SENIOR_DEFAULT_MODEL_PROFILE = "deepseek-v4-pro:max";
 const SENIOR_DEFAULT_LANE_COUNT = 10;
+const SENIOR_MAX_LANE_COUNT = 32;
 const SENIOR_DEEPSEEK_WORKERS = new Set<WorkerKind>(["deepseek-direct", "jcode-deepseek"]);
-const JCODE_HEARTBEAT_MS = Number(process.env.AGENT_FABRIC_JCODE_HEARTBEAT_MS ?? 30_000);
+const WORKER_HEARTBEAT_MS = Number(process.env.AGENT_FABRIC_WORKER_HEARTBEAT_MS ?? process.env.AGENT_FABRIC_JCODE_HEARTBEAT_MS ?? 30_000);
 const TASK_CONTEXT_MAX_FILE_BYTES = 48_000;
 const TASK_CONTEXT_MAX_TOTAL_BYTES = 180_000;
 
@@ -149,6 +150,7 @@ export type ProjectCliCommand =
       queueId: string;
       queueTaskId: string;
       metadataFile: string;
+      rewriteContextRefs?: string[];
       note?: string;
     }
   | {
@@ -186,6 +188,7 @@ export type ProjectCliCommand =
       cwdPrep?: CwdPrepMode;
       taskPacketPath?: string;
       taskPacketFormat?: "json" | "markdown";
+      taskContextPath?: string;
       worker: WorkerKind;
       workspaceMode: "in_place" | "git_worktree" | "clone" | "sandbox";
       modelProfile: string;
@@ -199,6 +202,7 @@ export type ProjectCliCommand =
   | {
       command: "run-ready";
       json: boolean;
+      projectPath?: string;
       queueId: string;
       commandTemplate?: string;
       cwd?: string;
@@ -1152,6 +1156,7 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       queueId: required(flags.queueId, "edit-task requires --queue <id>"),
       queueTaskId: required(flags.queueTaskId, "edit-task requires --queue-task <id>"),
       metadataFile: required(flags.metadataFile, "edit-task requires --metadata-file <path>"),
+      rewriteContextRefs: flags.rewriteContextRefs,
       note: flags.note
     };
   }
@@ -1230,6 +1235,7 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
     return {
       command: "run-ready",
       json: flags.json,
+      projectPath: flags.projectPath,
       queueId,
       commandTemplate: flags.commandTemplate,
       cwd: flags.cwd,
@@ -1719,6 +1725,7 @@ export async function runProjectCommand(
       queueId: command.queueId,
       queueTaskId: command.queueTaskId,
       note: command.note,
+      rewriteContextRefs: command.rewriteContextRefs,
       ...metadata
     });
     return {
@@ -1962,7 +1969,7 @@ export function projectHelp(): string {
     "  agent-fabric-project prepare-ready --queue <id> [--limit <n>] [--json]",
     "  agent-fabric-project recover-stale --queue <id> [--stale-after-minutes <n>] [--recovery-action requeue|fail] [--dry-run] [--json]",
     "  agent-fabric-project retry-task --queue <id> --queue-task <queueTaskId> [--reason <text>] [--keep-outputs] [--json]",
-    "  agent-fabric-project edit-task --queue <id> --queue-task <queueTaskId> --metadata-file <file> [--note <text>] [--json]",
+    "  agent-fabric-project edit-task --queue <id> --queue-task <queueTaskId> --metadata-file <file> [--rewrite-context-ref old=new] [--note <text>] [--json]",
     "  agent-fabric-project import-tasks --queue <id> --tasks-file <file> [--approve-queue] [--json]",
     "  agent-fabric-project list [--project <path>] [--queue-status <status>] [--include-closed] [--limit <n>] [--json]",
     "  agent-fabric-project approval-inbox [--project <path>] [--queue <id>] [--limit <n>] [--json]",
@@ -1984,7 +1991,7 @@ export function projectHelp(): string {
     "  agent-fabric-project write-task-packets --queue <id> --out-dir <dir> [--format json|markdown] [--ready-only] [--json]",
     "  agent-fabric-project resume-task --queue <id> --queue-task <queueTaskId> [--worker ramicode|local-cli|openhands|aider|smolagents|deepseek-direct|jcode-deepseek|manual] [--output-file <file>] [--format json|markdown] [--json]",
     "  agent-fabric-project run-task --queue <id> --queue-task <queueTaskId> --command <cmd> [--cwd <path>] [--cwd-prep auto|none|mkdir] [--task-packet <path>] [--task-packet-format json|markdown] [--approval-token <token>] [--approve-tool-context] [--remember-tool-context] [--success-status patch_ready|completed] [--json]",
-    "  agent-fabric-project run-ready --queue <id> [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--adaptive-rate-limit] [--command-template <cmd>] [--cwd-template <path>] [--cwd-prep auto|none|mkdir] [--task-packet-dir <dir>] [--task-packet-format json|markdown] [--worker ramicode|local-cli|openhands|aider|smolagents|deepseek-direct|jcode-deepseek|manual] [--approval-token <token>] [--approve-tool-context] [--allow-concurrent-runner] [--continue-on-failure] [--json]",
+    "  agent-fabric-project run-ready --queue <id> [--project <path>] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--adaptive-rate-limit] [--command-template <cmd>] [--cwd-template <path>] [--cwd-prep auto|none|mkdir] [--task-packet-dir <dir>] [--task-packet-format json|markdown] [--worker ramicode|local-cli|openhands|aider|smolagents|deepseek-direct|jcode-deepseek|manual] [--approval-token <token>] [--approve-tool-context] [--allow-concurrent-runner] [--continue-on-failure] [--json]",
     "  agent-fabric-project factory-run --queue <id> [--start-execution] [--dry-run] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--task-packet-dir <dir>] [--cwd-template <path>] [--deepseek-worker-command <cmd>] [--deepseek-role auto|implementer|reviewer|risk-reviewer|adjudicator|planner] [--sensitive-context-mode basic|strict|off] [--patch-mode report|write] [--approval-token <token>|--approve-model-calls] [--approve-tool-context] [--allow-sensitive-context] [--allow-concurrent-runner] [--continue-on-failure] [--no-adaptive-rate-limit] [--json]",
     "  agent-fabric-project launch-plan --queue <id> [--limit <n>] [--json]",
     "  agent-fabric-project status --queue <id> [--json]",
@@ -2973,7 +2980,7 @@ async function runTask(
       contextPolicy: `tool_context:${proposal.proposalId}`,
       maxRuntimeMinutes: command.maxRuntimeMinutes,
       command: [command.commandLine],
-      metadata: taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat)
+      metadata: taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat, command.taskContextPath)
     });
     workerRunId = String(worker.workerRunId);
     await call("project_queue_assign_worker", {
@@ -2990,7 +2997,7 @@ async function runTask(
         queueId: command.queueId,
         queueTaskId: task.queueTaskId,
         toolContextProposalId: proposal.proposalId,
-        ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat)
+        ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat, command.taskContextPath)
       }
     });
   }
@@ -3001,16 +3008,33 @@ async function runTask(
     workerRunId,
     kind: "command_started",
     body: command.commandLine,
-    metadata: { cwd, queueId: command.queueId, queueTaskId: task.queueTaskId, ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat) }
+    metadata: { cwd, queueId: command.queueId, queueTaskId: task.queueTaskId, ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat, command.taskContextPath) }
   });
   const startedAt = Date.now();
-  const stopHeartbeat = startJcodeHeartbeat(command, task, workerRunId, cwd, call);
+  const stopHeartbeat = startWorkerHeartbeat(command, task, workerRunId, cwd, call);
   const result = await runShellCommand(
     command.commandLine,
     cwd,
     command.maxOutputChars,
     command.maxRuntimeMinutes,
-    queueVisibleWorkerEnv(command, task, status.queue, workerRunId)
+    queueVisibleWorkerEnv(command, task, status.queue, workerRunId),
+    {
+      onSpawn: (pid) => {
+        void call("fabric_task_event", {
+          taskId: task.fabricTaskId,
+          workerRunId,
+          kind: "command_spawned",
+          body: command.commandLine,
+          metadata: {
+            cwd,
+            pid,
+            queueId: command.queueId,
+            queueTaskId: task.queueTaskId,
+            ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat, command.taskContextPath)
+          }
+        }).catch(() => undefined);
+      }
+    }
   ).finally(stopHeartbeat);
   const durationMs = Date.now() - startedAt;
   await call("fabric_task_event", {
@@ -3023,6 +3047,7 @@ async function runTask(
       command: command.commandLine,
       exitCode: result.exitCode,
       signal: result.signal,
+      timedOut: result.timedOut,
       durationMs,
       stdoutTail: tailText(result.stdout, command.maxOutputChars),
       stderrTail: tailText(result.stderr, command.maxOutputChars)
@@ -3142,7 +3167,7 @@ async function runTask(
       structuredResult,
       stdoutTail: tailText(result.stdout, command.maxOutputChars),
       stderrTail: tailText(result.stderr, command.maxOutputChars),
-      ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat)
+      ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat, command.taskContextPath)
     }
   };
 }
@@ -3157,6 +3182,7 @@ async function runReady(
   const minParallel = normalizeMinParallel(command.minParallel ?? 1, currentParallel);
   const ready = next.ready;
   assertParallelCwdPolicy(command, ready, status.queue.projectPath, currentParallel);
+  await blockMissingReadyContextRefs(command.queueId, status.queue.projectPath, ready, call);
   const runs: ProjectRunResult[] = [];
   const skipped: Record<string, unknown>[] = [];
   const parallelAdjustments: Record<string, unknown>[] = [];
@@ -3181,6 +3207,7 @@ async function runReady(
             commandLine,
             taskPacketPath: taskPacket?.path,
             taskPacketFormat: taskPacket?.format === "markdown" ? "markdown" : "json",
+            taskContextPath: taskPacket?.contextPath,
             cwd: cwdForReadyTask(command, task, status.queue.projectPath),
             cwdPrep: command.cwdPrep ?? "auto",
             worker: command.worker,
@@ -3518,7 +3545,7 @@ async function seniorRun(
   call: ProjectToolCaller
 ): Promise<ProjectRunResult> {
   const projectPath = resolve(command.projectPath ?? process.cwd());
-  const count = Math.min(Math.max(command.count, 1), 16);
+  const count = Math.min(Math.max(command.count, 1), SENIOR_MAX_LANE_COUNT);
   const progressFile = command.progressFile ?? join(projectPath, ".agent-fabric", "progress.md");
   const taskPacketDir = join(projectPath, ".agent-fabric", "task-packets");
   const cwdTemplate = join(projectPath, ".agent-fabric", "worktrees", "{{queueTaskId}}");
@@ -4686,9 +4713,21 @@ function commandLineForReadyTask(
     throw new FabricError("INVALID_INPUT", "run-ready requires --command-template when worker has no default command", false);
   }
   const expanded = expandCommandTemplate(template, task, projectPath, taskPacketPath, contextFilePath);
-  return command.worker === "deepseek-direct" && expanded.includes("agent-fabric-deepseek-worker")
-    ? `AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=off ${expanded}`
-    : expanded;
+  if (command.worker === "deepseek-direct" && /\bagent-fabric-deepseek-worker\b/.test(expanded)) {
+    const linked = hasFabricTaskArgument(expanded) ? expanded : `${expanded} --fabric-task ${shellQuote(task.fabricTaskId ?? "")}`;
+    return withDeepSeekAutoQueueOff(linked);
+  }
+  return expanded;
+}
+
+function hasFabricTaskArgument(commandLine: string): boolean {
+  return /(^|\s)--fabric-task(?:=|\s|$)/.test(commandLine);
+}
+
+function withDeepSeekAutoQueueOff(commandLine: string): string {
+  return /\bAGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=/.test(commandLine)
+    ? commandLine
+    : `AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=off ${commandLine}`;
 }
 
 function cwdForReadyTask(command: Extract<ProjectCliCommand, { command: "run-ready" }>, task: QueueTask, projectPath: string): string {
@@ -4780,9 +4819,65 @@ function assertParallelCwdPolicy(
   }
 }
 
+async function blockMissingReadyContextRefs(
+  queueId: string,
+  projectPath: string,
+  tasks: QueueTask[],
+  call: ProjectToolCaller
+): Promise<void> {
+  const issues = missingContextRefIssues(projectPath, tasks);
+  if (issues.length === 0) return;
+
+  const grouped = new Map<string, string[]>();
+  for (const issue of issues) {
+    grouped.set(issue.queueTaskId, [...(grouped.get(issue.queueTaskId) ?? []), `${issue.ref} (${issue.reason})`]);
+  }
+  for (const task of tasks) {
+    const taskIssues = grouped.get(task.queueTaskId);
+    if (!taskIssues) continue;
+    await call("project_queue_update_task", {
+      queueId,
+      queueTaskId: task.queueTaskId,
+      status: "blocked",
+      summary: `Blocked before launch: missing context refs: ${taskIssues.join(", ")}`
+    });
+  }
+
+  const sample = issues.slice(0, 5).map((issue) => `${issue.queueTaskId}:${issue.ref}`).join(", ");
+  throw new FabricError(
+    "PROJECT_QUEUE_CONTEXT_REF_MISSING",
+    `Refusing to launch ${grouped.size} task(s) with missing context refs. Repair or rewrite the refs before running workers. Sample: ${sample}`,
+    false
+  );
+}
+
+function missingContextRefIssues(
+  projectPath: string,
+  tasks: QueueTask[]
+): Array<{ queueTaskId: string; ref: string; reason: string; path?: string }> {
+  const issues: Array<{ queueTaskId: string; ref: string; reason: string; path?: string }> = [];
+  for (const task of tasks) {
+    for (const ref of uniqueStrings(stringArray(task.requiredContextRefs))) {
+      const path = contextRefPathForValidation(projectPath, ref);
+      if (!path) continue;
+      if (!existsSync(path)) {
+        issues.push({ queueTaskId: task.queueTaskId, ref, reason: "missing", path });
+      }
+    }
+  }
+  return issues;
+}
+
+function contextRefPathForValidation(projectPath: string, ref: string): string | undefined {
+  const trimmed = ref.trim();
+  if (!trimmed || /^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return undefined;
+  if (/[*?\[\]{}]/.test(trimmed) || trimmed.includes("\0")) return undefined;
+  return isAbsolute(trimmed) ? resolve(trimmed) : resolve(projectPath, trimmed);
+}
+
 function normalizeParallel(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > 16) {
-    throw new FabricError("INVALID_INPUT", "parallel must be an integer between 1 and 16", false);
+  if (!Number.isInteger(value) || value < 1 || value > SENIOR_MAX_LANE_COUNT) {
+    throw new FabricError("INVALID_INPUT", `parallel must be an integer between 1 and ${SENIOR_MAX_LANE_COUNT}`, false);
   }
   return value;
 }
@@ -4904,21 +4999,25 @@ function writeTaskPacket(
   mkdirSync(outDir, { recursive: true });
   const extension = format === "markdown" ? "md" : "json";
   const path = join(outDir, `${task.queueTaskId}.${extension}`);
-  const packet = taskPacket(status, task);
-  const body = format === "markdown" ? formatTaskPacketMarkdown(packet) : `${JSON.stringify(packet, null, 2)}\n`;
-  writeFileSync(path, body, "utf8");
   const context = taskContextBundle(status.queue.projectPath, task);
   const contextPath = join(outDir, `${task.queueTaskId}.context.md`);
   writeFileSync(contextPath, context.body, "utf8");
+  const packet = taskPacket(status, task, contextPath);
+  const body = format === "markdown" ? formatTaskPacketMarkdown(packet) : `${JSON.stringify(packet, null, 2)}\n`;
+  writeFileSync(path, body, "utf8");
   return { queueTaskId: task.queueTaskId, path, format, contextPath, contextFiles: context.included };
 }
 
-function taskPacketMetadata(taskPacketPath?: string, taskPacketFormat?: "json" | "markdown"): Record<string, string> {
+function taskPacketMetadata(taskPacketPath?: string, taskPacketFormat?: "json" | "markdown", taskContextPath?: string): Record<string, string> {
   if (!taskPacketPath) return {};
-  return { taskPacketPath, taskPacketFormat: taskPacketFormat ?? "json" };
+  return {
+    taskPacketPath,
+    taskPacketFormat: taskPacketFormat ?? "json",
+    ...(taskContextPath ? { contextFilePath: taskContextPath } : {})
+  };
 }
 
-function taskPacket(status: QueueStatus, task: QueueTask): Record<string, unknown> {
+function taskPacket(status: QueueStatus, task: QueueTask, contextFilePath?: string): Record<string, unknown> {
   return {
     schema: "agent-fabric.task-packet.v1",
     queue: {
@@ -4928,6 +5027,7 @@ function taskPacket(status: QueueStatus, task: QueueTask): Record<string, unknow
       planChainId: status.queue.planChainId
     },
     task,
+    contextFilePath,
     terminalToolGuidance: {
       automationSafe: {
         rg: "Use for source/text search.",
@@ -5054,13 +5154,24 @@ function formatTaskPacketMarkdown(packet: Record<string, unknown>): string {
   const task = packet.task as QueueTask;
   const instructions = Array.isArray(packet.operatorInstructions) ? packet.operatorInstructions : [];
   const terminalToolGuidance = packet.terminalToolGuidance as Record<string, Record<string, string>> | undefined;
+  const contextFilePath = typeof packet.contextFilePath === "string" ? packet.contextFilePath : "";
   return [
+    "---",
+    "schema: agent-fabric.task-packet.v1",
+    `queueId: ${frontmatterValue(String(queue.queueId))}`,
+    `queueTaskId: ${frontmatterValue(task.queueTaskId)}`,
+    `fabricTaskId: ${frontmatterValue(task.fabricTaskId ?? "")}`,
+    `projectPath: ${frontmatterValue(String(queue.projectPath))}`,
+    `contextFilePath: ${frontmatterValue(contextFilePath)}`,
+    "---",
+    "",
     `# ${task.title}`,
     "",
     `Queue: ${String(queue.queueId)}`,
     `Project: ${String(queue.projectPath)}`,
     `Queue task: ${task.queueTaskId}`,
     `Fabric task: ${task.fabricTaskId ?? ""}`,
+    `Context file: ${contextFilePath}`,
     `Status: ${task.status}`,
     `Risk: ${task.risk ?? "medium"}`,
     "",
@@ -5096,6 +5207,10 @@ function formatTaskPacketMarkdown(packet: Record<string, unknown>): string {
     ...instructions.map((instruction) => `- ${String(instruction)}`),
     ""
   ].join("\n");
+}
+
+function frontmatterValue(value: string): string {
+  return JSON.stringify(value);
 }
 
 function formatResumePacketMarkdown(packet: Record<string, unknown>): string {
@@ -5167,6 +5282,7 @@ type ShellResult = {
   signal: string | null;
   stdout: string;
   stderr: string;
+  timedOut: boolean;
 };
 
 type StructuredWorkerResult = {
@@ -5188,7 +5304,8 @@ async function runShellCommand(
   cwd: string,
   maxOutputChars: number,
   maxRuntimeMinutes?: number,
-  envOverrides: Record<string, string> = {}
+  envOverrides: Record<string, string> = {},
+  lifecycle: { onSpawn?: (pid: number) => void } = {}
 ): Promise<ShellResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, {
@@ -5203,6 +5320,7 @@ async function runShellCommand(
       },
       stdio: ["ignore", "pipe", "pipe"]
     });
+    if (typeof child.pid === "number") lifecycle.onSpawn?.(child.pid);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -5229,7 +5347,7 @@ async function runShellCommand(
     child.on("error", reject);
     child.on("close", (code, signal) => {
       if (timeout) clearTimeout(timeout);
-      resolve({ exitCode: timedOut ? 124 : (code ?? 1), signal, stdout, stderr });
+      resolve({ exitCode: timedOut ? 124 : (code ?? 1), signal, stdout, stderr, timedOut });
     });
   });
 }
@@ -5599,27 +5717,34 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
-function startJcodeHeartbeat(
+function startWorkerHeartbeat(
   command: Extract<ProjectCliCommand, { command: "run-task" }>,
   task: QueueTask,
   workerRunId: string,
   cwd: string,
   call: ProjectToolCaller
 ): () => void {
-  if (command.worker !== "jcode-deepseek" || !task.fabricTaskId || !Number.isFinite(JCODE_HEARTBEAT_MS) || JCODE_HEARTBEAT_MS <= 0) {
+  if (!task.fabricTaskId || !Number.isFinite(WORKER_HEARTBEAT_MS) || WORKER_HEARTBEAT_MS <= 0) {
     return () => undefined;
   }
+  const label =
+    command.worker === "jcode-deepseek"
+      ? "Jcode DeepSeek worker"
+      : command.worker === "deepseek-direct" || /\bagent-fabric-deepseek-worker\b/.test(command.commandLine)
+        ? "DeepSeek worker"
+        : "Worker command";
   let count = 0;
   const timer = setInterval(() => {
     count += 1;
     void call("fabric_task_heartbeat", {
       taskId: task.fabricTaskId,
       workerRunId,
-      task: "Jcode DeepSeek worker still running.",
+      task: `${label} still running.`,
       metadata: {
         queueId: command.queueId,
         queueTaskId: task.queueTaskId,
         cwd,
+        worker: command.worker,
         heartbeatCount: count
       }
     }).catch(() => undefined);
@@ -5635,13 +5760,13 @@ function startJcodeHeartbeat(
           decisions: [],
           assumptions: [],
           blockers: [],
-          nextAction: "Jcode DeepSeek worker command is still running.",
+          nextAction: `${label} is still running.`,
           cwd,
           heartbeatCount: count
         }
       }).catch(() => undefined);
     }
-  }, JCODE_HEARTBEAT_MS);
+  }, WORKER_HEARTBEAT_MS);
   timer.unref();
   return () => clearInterval(timer);
 }
@@ -5780,6 +5905,7 @@ type ParsedFlags = {
   reviewSummary?: string;
   reason?: string;
   note?: string;
+  rewriteContextRefs?: string[];
 };
 
 function parseFlags(args: string[]): ParsedFlags {
@@ -5908,6 +6034,7 @@ function parseFlags(args: string[]): ParsedFlags {
     else if (arg === "--progress-file") flags.progressFile = requiredValue(args, ++i, arg);
     else if (arg === "--keep-outputs") flags.keepOutputs = true;
     else if (arg === "--reason") flags.reason = requiredValue(args, ++i, arg);
+    else if (arg === "--rewrite-context-ref") flags.rewriteContextRefs = [...(flags.rewriteContextRefs ?? []), requiredValue(args, ++i, arg)];
     else if (arg === "--remember") flags.remember = true;
     else if (arg === "--note") flags.note = requiredValue(args, ++i, arg);
     else if (arg.startsWith("-")) throw new FabricError("INVALID_INPUT", `Unknown flag: ${arg}`, false);
@@ -6115,7 +6242,7 @@ function defaultSeniorLaneCount(fallback: number): number {
   if (!seniorModePermissive(process.env)) return fallback;
   const parsed = Number(process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS ?? process.env.AGENT_FABRIC_SENIOR_LANE_COUNT ?? SENIOR_DEFAULT_LANE_COUNT);
   if (!Number.isFinite(parsed)) return SENIOR_DEFAULT_LANE_COUNT;
-  return Math.min(16, Math.max(1, Math.floor(parsed)));
+  return Math.min(SENIOR_MAX_LANE_COUNT, Math.max(1, Math.floor(parsed)));
 }
 
 function defaultSeniorTaskPacketDir(queueId: string): string {

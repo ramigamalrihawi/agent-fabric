@@ -57,6 +57,8 @@ const API_CALL_TOOLS = new Set([
   "project_queue_progress_report",
   "project_queue_prepare_ready",
   "project_queue_launch_plan",
+  "project_queue_validate_links",
+  "project_queue_validate_context_refs",
   "project_queue_claim_next",
   "project_queue_recover_stale",
   "project_queue_update_task",

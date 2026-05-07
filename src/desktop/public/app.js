@@ -2071,8 +2071,8 @@ async function createQueue() {
     toast("Project folder and prompt are required.");
     return;
   }
-  if (!Number.isInteger(maxParallelAgents) || maxParallelAgents < 1 || maxParallelAgents > 16) {
-    toast("Agents must be an integer between 1 and 16.");
+  if (!Number.isInteger(maxParallelAgents) || maxParallelAgents < 1 || maxParallelAgents > 32) {
+    toast("Agents must be an integer between 1 and 32.");
     return;
   }
   const created = await postProjectCreate({
@@ -2129,8 +2129,8 @@ async function saveQueueSettings() {
     toast("Queue title is required.");
     return;
   }
-  if (!Number.isInteger(maxParallelAgents) || maxParallelAgents < 1 || maxParallelAgents > 16) {
-    toast("Max agents must be an integer between 1 and 16.");
+  if (!Number.isInteger(maxParallelAgents) || maxParallelAgents < 1 || maxParallelAgents > 32) {
+    toast("Max agents must be an integer between 1 and 32.");
     return;
   }
   await callTool("project_queue_update_settings", {

@@ -11,7 +11,7 @@ agent-fabric-project senior-run --dry-run --project <path> --plan-file <plan.md>
 agent-fabric-project senior-run --project <path> --tasks-file .agent-fabric/tasks/tasks.json --count 10 --worker jcode-deepseek --approve-model-calls --progress-file .agent-fabric/progress.md
 ```
 
-`senior-run` is the high-level wrapper for Codex and Claude Code. It diagnoses the environment, creates or reuses a queue, imports task JSON or creates a local scaffold from an MD plan, starts execution, uses git worktrees for mutating lanes, launches queue-visible DeepSeek/Jcode workers, and writes a bounded progress file.
+`senior-run` is the high-level wrapper for Codex and Claude Code. It diagnoses the environment, creates or reuses a queue, imports task JSON or creates a local scaffold from an MD plan, starts execution, validates fabric task links and context refs, uses git worktrees for mutating lanes, launches queue-visible DeepSeek/Jcode workers, and writes a bounded progress file.
 
 `senior-doctor` also checks that the running daemon, global CLI, and MCP bridge are from the same checkout and that the daemon exposes the Senior bridge tools. If it reports a daemon/source mismatch, rebuild/relink and restart the daemon before launching workers.
 
@@ -37,6 +37,8 @@ Codex-like and Claude-like integrations should call:
 
 Cards use stable `@af/<name>` handles. Default names are assigned in this order: `Rami`, `Belle`, `Amir`, `Falak`, `Gamal`, `Angela`, then deterministic numeric suffixes.
 
+Cards must be process-evidence based. Native projections should show `planned`, `starting`, `running`, `no_runner`, `stale`, `failed`, `completed`, or `patch_ready` from runner state, not queue task status alone. `fabric_spawn_agents` may return planned cards and a `run-ready` command, but it must not create fake running cards.
+
 ## Rules
 
 - Agent Fabric queue state is the source of truth for Senior-mode workers.
@@ -50,3 +52,5 @@ Cards use stable `@af/<name>` handles. Default names are assigned in this order:
 - Do not launch Senior Jcode lanes with manual `nohup jcode ...` commands. Use `senior-run` or `run-ready --worker jcode-deepseek` so heartbeats, timeout handling, patch artifacts, and review gates stay queue-visible.
 - Do not launch Senior DeepSeek direct lanes with bare `agent-fabric-deepseek-worker run-task`. Queue runners mark the shell as `AGENT_FABRIC_WORKER_QUEUE_VISIBLE=1`, and untracked direct runs require the explicit `AGENT_FABRIC_DEEPSEEK_ALLOW_UNTRACKED=1` escape hatch.
 - DeepSeek direct task packets include a bounded generated context sidecar from `expectedFiles` and file-like `requiredContextRefs`; use `{{contextFile}}` in custom command templates when overriding the default runner.
+- Custom `deepseek-direct` templates that invoke `agent-fabric-deepseek-worker` are linked with `--fabric-task {{fabricTaskId}}`; missing fabric task links or moved required context refs block launch.
+- Senior concurrency defaults to 10 lanes and accepts explicit 20-lane requests; the hard local cap is 32.

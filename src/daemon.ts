@@ -146,6 +146,8 @@ import {
   projectQueueUpdateSettings,
   projectQueueUpdateTask,
   projectQueueUpdateTaskMetadata,
+  projectQueueValidateContextRefs,
+  projectQueueValidateLinks,
   toolContextDecide,
   toolContextPending,
   toolContextPolicySet,
@@ -176,7 +178,9 @@ const SENIOR_REQUIRED_TOOLS = [
   "fabric_message_agent",
   "fabric_wait_agents",
   "fabric_accept_patch",
-  "project_queue_approve_model_calls"
+  "project_queue_approve_model_calls",
+  "project_queue_validate_links",
+  "project_queue_validate_context_refs"
 ];
 const SUPPORTED_TOOLS = new Set([
   "fabric_status",
@@ -248,6 +252,8 @@ const SUPPORTED_TOOLS = new Set([
   "project_queue_decide",
   "project_queue_prepare_ready",
   "project_queue_launch_plan",
+  "project_queue_validate_links",
+  "project_queue_validate_context_refs",
   "project_queue_claim_next",
   "project_queue_recover_stale",
   "project_queue_retry_task",
@@ -638,6 +644,12 @@ export class FabricDaemon {
       }
       if (tool === "project_queue_launch_plan") {
         return { ok: true, tool, data: projectQueueLaunchPlan(this, input, context) as T };
+      }
+      if (tool === "project_queue_validate_links") {
+        return { ok: true, tool, data: projectQueueValidateLinks(this, input, context) as T };
+      }
+      if (tool === "project_queue_validate_context_refs") {
+        return { ok: true, tool, data: projectQueueValidateContextRefs(this, input, context) as T };
       }
       if (tool === "project_queue_claim_next") {
         return { ok: true, tool, data: projectQueueClaimNext(this, input, context) as T };

@@ -86,6 +86,7 @@ const EVENT_KINDS = new Set([
   "started",
   "thought_summary",
   "file_changed",
+  "command_spawned",
   "command_started",
   "command_finished",
   "test_result",
