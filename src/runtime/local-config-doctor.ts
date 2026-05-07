@@ -13,6 +13,17 @@ export type LocalConfigDoctorCheck = {
   recommendation?: string;
 };
 
+export type LocalConfigDoctorDaemonControl = {
+  scope: "shared-local-daemon";
+  requiresOperatorApproval: true;
+  agentsMayRestart: false;
+  agentsMayKill: false;
+  agentsMayRemoveSocket: false;
+  warning: string;
+  safeActions: string[];
+  forbiddenActions: string[];
+};
+
 export type LocalConfigDoctorMcpConfig = {
   client: "codex" | "codex-foundry" | "claude" | "unknown";
   path: string;
@@ -50,6 +61,7 @@ export type LocalConfigDoctorReport = {
     sourceMatches?: boolean;
     requiredSeniorToolsInBuild?: boolean;
   };
+  daemonControl: LocalConfigDoctorDaemonControl;
   deepseek: {
     apiKey: "env" | "local-env-file" | "missing";
     defaultModel?: string;
@@ -95,6 +107,11 @@ const LOCAL_CONFIG_KEYS = [
   "AGENT_FABRIC_JCODE_DEEPSEEK_DISPATCHER"
 ];
 
+const SHARED_DAEMON_WARNING =
+  "The Agent Fabric daemon/socket is shared across Codex, Claude Code, project CLI sessions, and live queues. Automated agents must not kill, restart, or remove the shared daemon/socket.";
+const SHARED_DAEMON_OPERATOR_REMEDIATION =
+  "Do not kill/restart the shared daemon from an agent session. Ask the operator to restart/relink the canonical daemon, or rerun this experiment with an isolated AGENT_FABRIC_HOME/socket.";
+
 export function runLocalConfigDoctor(options: LocalConfigDoctorOptions = {}): LocalConfigDoctorReport {
   const env = options.env ?? process.env;
   const homeDir = options.homeDir ?? homedir();
@@ -113,6 +130,7 @@ export function runLocalConfigDoctor(options: LocalConfigDoctorOptions = {}): Lo
   const socketPath = join(runtimeHome, "agent.sock");
   const costTokenMode = fileMode(costIngestTokenPath);
   const daemon = runningDaemonStatus(socketPath, projectPath);
+  const daemonControl = sharedDaemonControlPolicy(runtimeHome, socketPath);
   const deepseekKeySource = env.DEEPSEEK_API_KEY ? "env" : localEnvFileHasKey(homeDir, "DEEPSEEK_API_KEY") ? "local-env-file" : "missing";
   const jcode = jcodeDispatcherStatus(env, localConfig);
   const mcpConfigs = mcpConfigReport(options.mcpConfigPaths ?? defaultMcpConfigPaths(homeDir), projectPath, [projectPath, requestedProjectPath]);
@@ -124,8 +142,8 @@ export function runLocalConfigDoctor(options: LocalConfigDoctorOptions = {}): Lo
     check("decisions_local_memory", existsSync(decisionsPath), `Local decisions directory: ${decisionsPath}`, "Keep local architecture memory under decisions/ when useful."),
     check("decisions_ignored", decisionsIgnored === true, decisionsIgnored === null ? "Git ignore status unavailable." : `decisions/ gitignored: ${String(decisionsIgnored)}`, "Add decisions/ to .gitignore."),
     check("cost_ingest_token", env.AGENT_FABRIC_COST_INGEST_TOKEN || existsSync(costIngestTokenPath), `Cost ingest token: ${env.AGENT_FABRIC_COST_INGEST_TOKEN ? "env" : existsSync(costIngestTokenPath) ? costIngestTokenPath : "missing"}`, "Create ~/.agent-fabric/cost-ingest-token or export AGENT_FABRIC_COST_INGEST_TOKEN before enabling HTTP ingest."),
-    check("daemon_source", daemon.status !== "running" || daemon.sourceMatches !== false, daemon.status === "running" ? `Daemon pid ${daemon.pid}; cwd=${daemon.cwd ?? "unknown"}; entrypoint=${daemon.entrypoint ?? daemon.command ?? "unknown"}` : "Agent Fabric daemon is not running.", "Restart the daemon from this checkout after rebuilding/relinking."),
-    check("senior_tool_build", daemon.requiredSeniorToolsInBuild !== false, daemon.requiredSeniorToolsInBuild === false ? "Built daemon is missing Senior-mode bridge tools." : "Built daemon contains Senior-mode bridge tools.", "Run npm run build && npm link, then restart the daemon."),
+    check("daemon_source", daemon.status !== "running" || daemon.sourceMatches !== false, daemon.status === "running" ? `Daemon pid ${daemon.pid}; cwd=${daemon.cwd ?? "unknown"}; entrypoint=${daemon.entrypoint ?? daemon.command ?? "unknown"}` : "Agent Fabric daemon is not running.", SHARED_DAEMON_OPERATOR_REMEDIATION),
+    check("senior_tool_build", daemon.requiredSeniorToolsInBuild !== false, daemon.requiredSeniorToolsInBuild === false ? "Built daemon is missing Senior-mode bridge tools." : "Built daemon contains Senior-mode bridge tools.", `Run npm run build && npm link, then ask the operator to restart/relink the canonical daemon. ${SHARED_DAEMON_WARNING}`),
     check("deepseek_key", deepseekKeySource !== "missing", `DeepSeek API key source: ${deepseekKeySource}`, "Set DEEPSEEK_API_KEY in a private shell/env file."),
     check("codex_mcp", mcpConfigs.some((item) => item.client !== "claude" && item.hasAgentFabric && item.bridgePathMatches), "Codex MCP config points at this checkout.", "Update Codex MCP config to use dist/bin/bridge.js from this checkout."),
     check("claude_mcp", mcpConfigs.some((item) => item.client === "claude" && item.hasAgentFabric && item.bridgePathMatches), "Claude MCP config points at this checkout.", "Update Claude Code MCP config to use dist/bin/bridge.js from this checkout.")
@@ -162,6 +180,7 @@ export function runLocalConfigDoctor(options: LocalConfigDoctorOptions = {}): Lo
       costIngestTokenMode: costTokenMode
     },
     daemon,
+    daemonControl,
     deepseek: {
       apiKey: deepseekKeySource,
       defaultModel: env.DEEPSEEK_DEFAULT_MODEL,
@@ -200,6 +219,12 @@ export function formatLocalConfigDoctor(report: LocalConfigDoctorReport): string
   if (report.daemon.command) lines.push(`- command: ${report.daemon.command}`);
   if (report.daemon.sourceMatches !== undefined) lines.push(`- source matches this checkout: ${String(report.daemon.sourceMatches)}`);
   if (report.daemon.requiredSeniorToolsInBuild !== undefined) lines.push(`- Senior tools in build: ${String(report.daemon.requiredSeniorToolsInBuild)}`);
+  lines.push("", "Shared daemon control:");
+  lines.push(`- ${report.daemonControl.warning}`);
+  lines.push(`- agents may restart: ${String(report.daemonControl.agentsMayRestart)}`);
+  lines.push(`- agents may kill: ${String(report.daemonControl.agentsMayKill)}`);
+  lines.push(`- agents may remove socket: ${String(report.daemonControl.agentsMayRemoveSocket)}`);
+  lines.push(`- safe actions: ${report.daemonControl.safeActions.join("; ")}`);
   lines.push("", "MCP configs:");
   for (const item of report.mcpConfigs) {
     if (!item.exists) {
@@ -239,6 +264,7 @@ export function localConfigDoctorHelp(): string {
     "  agent-fabric-project doctor local-config [--project <path>] [--json]",
     "",
     "Reports active checkout wiring, local ignored config, Agent Fabric runtime state, MCP config paths, DeepSeek key presence, and optional Jcode dispatcher state.",
+    "Daemon restarts, daemon kills, and shared socket removal are operator-only actions; agents should ask or use an isolated AGENT_FABRIC_HOME/socket.",
     "The report never prints API key or bearer token values.",
     "",
     "Onboarding next steps:",
@@ -395,6 +421,29 @@ function jcodeDispatcherStatus(env: NodeJS.ProcessEnv, localConfig: Record<strin
     path,
     exists: existsSync(path),
     executable: Boolean(mode & 0o111)
+  };
+}
+
+function sharedDaemonControlPolicy(runtimeHome: string, socketPath: string): LocalConfigDoctorDaemonControl {
+  return {
+    scope: "shared-local-daemon",
+    requiresOperatorApproval: true,
+    agentsMayRestart: false,
+    agentsMayKill: false,
+    agentsMayRemoveSocket: false,
+    warning: SHARED_DAEMON_WARNING,
+    safeActions: [
+      "run read-only doctor/status commands",
+      "ask the operator to restart or relink the canonical daemon",
+      `use an isolated AGENT_FABRIC_HOME outside ${runtimeHome} for experiments`,
+      `use an isolated socket instead of ${socketPath} for worktree-local tests`
+    ],
+    forbiddenActions: [
+      "kill the daemon process",
+      "restart the shared daemon",
+      "remove or replace the shared daemon socket",
+      "recover or requeue live queues without operator review"
+    ]
   };
 }
 

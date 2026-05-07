@@ -32,6 +32,15 @@ const SENIOR_DEEPSEEK_WORKERS = new Set<WorkerKind>(["deepseek-direct", "jcode-d
 const WORKER_HEARTBEAT_MS = Number(process.env.AGENT_FABRIC_WORKER_HEARTBEAT_MS ?? process.env.AGENT_FABRIC_JCODE_HEARTBEAT_MS ?? 30_000);
 const TASK_CONTEXT_MAX_FILE_BYTES = 48_000;
 const TASK_CONTEXT_MAX_TOTAL_BYTES = 180_000;
+const SHARED_DAEMON_GUARDRAIL =
+  "Automated agents must not kill, restart, or remove the shared Agent Fabric daemon/socket. Ask the operator to restart/relink the canonical daemon, or use an isolated AGENT_FABRIC_HOME/socket for experiments.";
+const SHARED_DAEMON_FORBIDDEN_AGENT_ACTIONS = ["kill-daemon", "restart-shared-daemon", "remove-shared-socket", "recover-live-queue-without-review"];
+const SHARED_DAEMON_SAFE_AGENT_ACTIONS = [
+  "run read-only doctor/status checks",
+  "switch to the checkout that already owns the daemon",
+  "ask the operator to restart or relink the canonical daemon",
+  "use an isolated AGENT_FABRIC_HOME/socket before running worktree-local experiments"
+];
 
 export type ProjectCliCommand =
   | { command: "version"; json: boolean }
@@ -3597,6 +3606,7 @@ async function seniorDoctor(
 ): Promise<ProjectRunResult> {
   const checks: Array<Record<string, unknown>> = [];
   const projectPath = resolve(command.projectPath);
+  const daemonControl = sharedDaemonControlPolicy(projectPath);
   checks.push(checkResult("project_path", existsSync(projectPath), projectPath, existsSync(projectPath) ? undefined : "Pass --project <path> with an existing checkout."));
   checks.push(checkResult("senior_mode", process.env[SENIOR_MODE_ENV] === "permissive", process.env[SENIOR_MODE_ENV] ?? "missing", `Set ${SENIOR_MODE_ENV}=permissive or source the Senior-mode env script.`));
   const deepseekKeyPresent = Boolean(process.env.DEEPSEEK_API_KEY || process.env.DEEPSEEK_TOKEN);
@@ -3626,7 +3636,8 @@ async function seniorDoctor(
         !seniorToolsReported
           ? "running daemon does not report Senior tool parity; it is likely stale"
           : missingSeniorTools.length === 0 ? "all required Senior bridge tools are exposed" : `missing: ${missingSeniorTools.join(", ")}`,
-        "Rebuild/relink Agent Fabric and restart the daemon."
+        SHARED_DAEMON_GUARDRAIL,
+        daemonControlCheckMetadata()
       )
     );
     const localRoot = localPackageRoot();
@@ -3641,11 +3652,20 @@ async function seniorDoctor(
         "daemon_source",
         daemonRuntimeReported && sourceMatches,
         `daemon cwd=${daemonCwd ?? "unknown"} entrypoint=${stringFrom(runtime.entrypoint) ?? "unknown"} packageRoot=${daemonPackageRoot ?? "unknown"} cliRoot=${localRoot ?? "unknown"}`,
-        "Restart the Agent Fabric daemon from the same checkout as agent-fabric-project."
+        SHARED_DAEMON_GUARDRAIL,
+        daemonControlCheckMetadata()
       )
     );
   } catch (error) {
-    checks.push(checkResult("daemon", false, error instanceof Error ? error.message : String(error), "Start the Agent Fabric daemon before queue-backed Senior work."));
+    checks.push(
+      checkResult(
+        "daemon",
+        false,
+        error instanceof Error ? error.message : String(error),
+        `Agent Fabric daemon is unreachable. ${SHARED_DAEMON_GUARDRAIL}`,
+        daemonControlCheckMetadata()
+      )
+    );
   }
 
   let queueStatus: Record<string, unknown> | undefined;
@@ -3666,6 +3686,7 @@ async function seniorDoctor(
       schema: "agent-fabric.senior-doctor.v1",
       projectPath,
       ok: failed.length === 0,
+      daemonControl,
       checks,
       daemonStatus,
       queueStatus
@@ -4946,13 +4967,14 @@ function formatFactoryRunCompleted(
   return lines.join("\n");
 }
 
-function checkResult(id: string, ok: boolean, evidence: unknown, suggestedAction?: string): Record<string, unknown> {
+function checkResult(id: string, ok: boolean, evidence: unknown, suggestedAction?: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id,
     ok,
     severity: ok ? "ok" : "error",
     evidence,
-    suggestedAction
+    suggestedAction,
+    ...extra
   };
 }
 
@@ -4962,7 +4984,33 @@ function formatSeniorDoctor(projectPath: string, ok: boolean, checks: Array<Reco
     lines.push(`  ${check.ok ? "ok" : "fail"} ${String(check.id)}: ${String(check.evidence ?? "")}`);
     if (!check.ok && check.suggestedAction) lines.push(`    next: ${String(check.suggestedAction)}`);
   }
+  lines.push("", `Daemon control guardrail: ${SHARED_DAEMON_GUARDRAIL}`);
   return lines.join("\n");
+}
+
+function sharedDaemonControlPolicy(projectPath: string): Record<string, unknown> {
+  return {
+    scope: "shared-local-daemon",
+    projectPath,
+    requiresOperatorApproval: true,
+    agentsMayRestart: false,
+    agentsMayKill: false,
+    agentsMayRemoveSocket: false,
+    forbiddenAgentActions: SHARED_DAEMON_FORBIDDEN_AGENT_ACTIONS,
+    safeAgentActions: SHARED_DAEMON_SAFE_AGENT_ACTIONS,
+    warning: SHARED_DAEMON_GUARDRAIL
+  };
+}
+
+function daemonControlCheckMetadata(): Record<string, unknown> {
+  return {
+    requiresOperatorApproval: true,
+    agentsMayRestartDaemon: false,
+    agentsMayKillDaemon: false,
+    agentsMayRemoveSocket: false,
+    forbiddenAgentActions: SHARED_DAEMON_FORBIDDEN_AGENT_ACTIONS,
+    safeAgentActions: SHARED_DAEMON_SAFE_AGENT_ACTIONS
+  };
 }
 
 function scaffoldSeniorTasks(planFile: string, count: number): unknown[] {

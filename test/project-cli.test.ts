@@ -546,6 +546,51 @@ describe("project CLI runner", () => {
     });
   });
 
+  it("treats stale daemon/source drift as operator-only daemon control", async () => {
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-senior-doctor-"));
+    try {
+      const result = await runProjectCommand(
+        { command: "senior-doctor", json: false, projectPath },
+        async (tool) => {
+          if (tool !== "fabric_status") throw new Error(`unexpected tool call: ${tool}`);
+          return {
+            daemon: {
+              runtime: {
+                cwd: "/private/other/agent-fabric",
+                entrypoint: "/private/other/agent-fabric/dist/bin/daemon.js",
+                packageRoot: "/private/other/agent-fabric"
+              },
+              tools: {
+                seniorRequired: ["fabric_senior_start"],
+                missingSeniorRequired: []
+              }
+            }
+          };
+        }
+      );
+
+      const checks = result.data.checks as Array<Record<string, unknown>>;
+      const sourceCheck = checks.find((item) => item.id === "daemon_source");
+      expect(sourceCheck).toMatchObject({
+        ok: false,
+        requiresOperatorApproval: true,
+        agentsMayRestartDaemon: false,
+        agentsMayKillDaemon: false,
+        agentsMayRemoveSocket: false
+      });
+      expect(String(sourceCheck?.suggestedAction)).toContain("Automated agents must not kill, restart, or remove the shared Agent Fabric daemon/socket");
+      expect(result.data.daemonControl).toMatchObject({
+        requiresOperatorApproval: true,
+        agentsMayRestart: false,
+        agentsMayKill: false,
+        agentsMayRemoveSocket: false
+      });
+      expect(result.message).toContain("Daemon control guardrail");
+    } finally {
+      rmSync(projectPath, { recursive: true, force: true });
+    }
+  });
+
   it("defaults Senior mode worker execution to queue-backed DeepSeek lanes", () => {
     process.env.AGENT_FABRIC_SENIOR_MODE = "permissive";
 

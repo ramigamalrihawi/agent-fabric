@@ -83,6 +83,8 @@ Fast status for agents and humans. Should be safe to call at session start and a
 
 Status plus actionable diagnostics.
 
+`fabric_doctor` always includes a shared-daemon-control diagnostic. The daemon/socket is shared local infrastructure for Codex, Claude Code, desktop, project CLI, and live queues; automated agents must not kill, restart, or remove it. Source drift and missing Senior tools should be handled by read-only inspection, operator restart/relink, or an isolated `AGENT_FABRIC_HOME`/socket for experiments.
+
 **Input:**
 ```ts
 {

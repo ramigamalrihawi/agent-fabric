@@ -34,7 +34,7 @@ agent-fabric-project senior-run --project <path> --tasks-file .agent-fabric/task
 
 Use `senior-run --dry-run` first when task JSON is not already prepared. If only an MD plan is supplied, `senior-run` uses a local scaffold by default and avoids a project-model task-generation charge.
 
-If `senior-doctor` reports daemon/source drift, stale Senior tools, or a queue namespace mismatch, fix that before launching workers. Queue IDs are resumable across Codex, Claude Code, and `agent-fabric-project --project <path>` when the project path matches the queue.
+If `senior-doctor` reports daemon/source drift, stale Senior tools, or a queue namespace mismatch, fix that before launching workers. The daemon/socket is shared local infrastructure: do not kill, restart, or remove the shared daemon/socket from an automated agent session. Ask the operator to restart or relink the canonical daemon, switch to the checkout that already owns the daemon, or use an isolated `AGENT_FABRIC_HOME`/socket for experiments. Queue IDs are resumable across Codex, Claude Code, and `agent-fabric-project --project <path>` when the project path matches the queue.
 
 Prefer these compact Agent Fabric tools from Codex:
 

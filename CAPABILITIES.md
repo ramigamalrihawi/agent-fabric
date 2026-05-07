@@ -13,7 +13,7 @@ agent-fabric-project senior-run --project <path> --tasks-file .agent-fabric/task
 
 `senior-run` is the high-level wrapper for Codex and Claude Code. It diagnoses the environment, creates or reuses a queue, imports task JSON or creates a local scaffold from an MD plan, starts execution, validates fabric task links and context refs, uses git worktrees for mutating lanes, launches queue-visible DeepSeek/Jcode workers, and writes a bounded progress file.
 
-`senior-doctor` also checks that the running daemon, global CLI, and MCP bridge are from the same checkout and that the daemon exposes the Senior bridge tools. If it reports a daemon/source mismatch, rebuild/relink and restart the daemon before launching workers.
+`senior-doctor` also checks that the running daemon, global CLI, and MCP bridge are from the same checkout and that the daemon exposes the Senior bridge tools. If it reports a daemon/source mismatch, treat that as an operator-only shared-daemon problem: automated agents must not kill, restart, or remove the shared daemon/socket. Ask the operator to restart or relink the canonical daemon, switch to the checkout that already owns the daemon, or run experiments with an isolated `AGENT_FABRIC_HOME`/socket.
 
 Use `factory-run` only when you need the lower-level primitive:
 
@@ -57,3 +57,4 @@ Cards must be process-evidence based. Native projections should show `planned`, 
 - Senior concurrency defaults to 10 lanes and accepts explicit 20-lane requests. Local caps are configurable up to 1000 through `AGENT_FABRIC_SENIOR_MAX_LANE_COUNT`, `AGENT_FABRIC_MAX_PARALLEL_AGENTS`, `AGENT_FABRIC_MAX_CODEX_AGENT_COUNT`, or shared `AGENT_FABRIC_QUEUE_MAX_AGENTS`; set `AGENT_FABRIC_SENIOR_DEFAULT_LANE_COUNT` only when the local default launch size should intentionally be higher than 10.
 - Progress reports include bounded `managerSummary` groups for status, manager, phase, and workstream so expensive senior/manager models can review evidence without reading raw worker transcripts.
 - The desktop server exposes the same manager-health packet at `/api/queues/<queueId>/health` for native dashboards and plugin surfaces.
+- Daemon/source drift, stale Senior tools, or socket refusal are not permission for an agent to kill/restart the shared daemon. Use doctor/status reads, isolate the runtime, or ask the operator before any daemon control action.

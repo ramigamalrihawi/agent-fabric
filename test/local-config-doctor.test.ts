@@ -61,11 +61,19 @@ describe("local config doctor", () => {
       expect(report.runtime.costIngestToken).toBe("file");
       expect(report.deepseek.apiKey).toBe("local-env-file");
       expect(report.jcodeDispatcher.status).toBe("disabled");
+      expect(report.daemonControl).toMatchObject({
+        scope: "shared-local-daemon",
+        requiresOperatorApproval: true,
+        agentsMayRestart: false,
+        agentsMayKill: false,
+        agentsMayRemoveSocket: false
+      });
       expect(report.localConfig.configuredKeys).toContain("AGENT_FABRIC_SENIOR_DEFAULT_WORKER");
       expect(report.localConfig.configuredKeys).toContain("JCODE_BIN");
       expect(report.mcpConfigs.every((item) => item.hasAgentFabric && item.bridgePathMatches && item.workspaceRootMatches)).toBe(true);
       expect(formatted).not.toContain("super-secret-key");
       expect(formatted).not.toContain("local-token");
+      expect(formatted).toContain("Automated agents must not kill, restart, or remove the shared daemon/socket");
       expect(formatted).toContain("Onboarding starter surface");
       expect(formatted).toContain("Essential queue tools");
       expect(formatted).toContain("agent-fabric-project senior-doctor");
