@@ -78,6 +78,27 @@ defmodule AgentFabricOrchestrator.CodexRunnerTest do
 
       CodexRunner.stop(pid)
     end
+
+    test "exposes proof metadata for workspace mode, heartbeats, and duration" do
+      opts =
+        default_opts(
+          heartbeat_interval_ms: 10,
+          workspace_mode: "directory",
+          workspace_source_project: "/tmp/source-project"
+        )
+
+      {:ok, pid} = CodexRunner.start_link(opts)
+      Process.sleep(40)
+
+      status = CodexRunner.status(pid)
+      assert status.workspace_mode == "directory"
+      assert status.workspace_source_project == "/tmp/source-project"
+      assert status.heartbeat_count > 0
+      assert status.command_duration_ms >= 0
+      assert status.last_event.kind in ["command_started", "heartbeat", "command_output"]
+
+      CodexRunner.stop(pid)
+    end
   end
 
   describe "send_prompt/2" do

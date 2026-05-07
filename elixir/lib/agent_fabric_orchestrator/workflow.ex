@@ -205,6 +205,42 @@ defmodule AgentFabricOrchestrator.Workflow do
   def tracker_after_cursor(config),
     do: normalize_optional_string(get_in(config, ["tracker", "after_cursor"]))
 
+  @doc "Return the workspace mode. `directory` preserves legacy plain-directory behavior."
+  @spec workspace_mode(t() | map()) :: String.t()
+  def workspace_mode(%__MODULE__{config: config}), do: workspace_mode(config)
+
+  def workspace_mode(config) do
+    config
+    |> get_in(["workspace", "mode"])
+    |> normalize_optional_string()
+    |> case do
+      nil -> "directory"
+      "local" -> "directory"
+      "sandbox" -> "directory"
+      mode -> mode
+    end
+  end
+
+  @doc "Return the expanded source project used for git-worktree workspace mode."
+  @spec workspace_source_project(t() | map(), map()) :: String.t() | nil
+  def workspace_source_project(workflow_or_config, env \\ System.get_env())
+
+  def workspace_source_project(%__MODULE__{config: config}, env),
+    do: workspace_source_project(config, env)
+
+  def workspace_source_project(config, env) do
+    config
+    |> get_in(["workspace", "source_project"])
+    |> normalize_optional_string()
+    |> expand_path(env)
+  end
+
+  @doc "Return the raw after-create hook from the workspace contract."
+  @spec workspace_after_create(t() | map()) :: term()
+  def workspace_after_create(%__MODULE__{config: config}), do: workspace_after_create(config)
+
+  def workspace_after_create(config), do: get_in(config, ["workspace", "after_create"])
+
   defp split_front_matter(text) do
     case text do
       "---\n---\n" <> markdown ->

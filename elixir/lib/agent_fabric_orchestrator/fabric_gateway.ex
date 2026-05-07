@@ -24,6 +24,7 @@ defmodule AgentFabricOrchestrator.FabricGateway do
   @callback agent_lanes(socket_path(), session(), String.t(), map(), keyword()) :: result()
   @callback timeline(socket_path(), session(), String.t(), map(), keyword()) :: result()
   @callback cleanup_queues(socket_path(), session(), map(), keyword()) :: result()
+  @callback recover_stale(socket_path(), session(), map(), keyword()) :: result()
   @callback decide_queue(socket_path(), session(), String.t(), String.t(), String.t(), keyword()) ::
               result()
   @callback add_task(socket_path(), session(), String.t(), map(), keyword()) :: result()
@@ -108,6 +109,16 @@ defmodule AgentFabricOrchestrator.FabricGateway.Uds do
       |> Map.put(:dryRun, true)
 
     call(socket_path, session, "project_queue_cleanup", payload, opts)
+  end
+
+  @impl true
+  def recover_stale(socket_path, session, input, opts \\ []) do
+    payload =
+      input
+      |> Map.delete("dryRun")
+      |> Map.put(:dryRun, true)
+
+    call(socket_path, session, "project_queue_recover_stale", payload, opts)
   end
 
   @impl true

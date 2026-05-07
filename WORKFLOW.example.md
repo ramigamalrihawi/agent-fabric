@@ -11,7 +11,12 @@ tracker:
   after_cursor:
 workspace:
   root: ../.agent-fabric/workspaces/agent-fabric
-  after_create: npm install
+  # Use git_worktree for mutating runners so each Linear issue gets an isolated checkout.
+  # Use directory for report-only or legacy plain-directory workflows.
+  mode: git_worktree
+  source_project: ..
+  # Prefer argv hooks; shell-string hooks are supported but marked as shell-backed metadata.
+  after_create: ["npm", "install"]
 codex:
   command: codex
   args: ["app-server"]
@@ -48,3 +53,10 @@ Issue URL: {{ issue.url }}
 Labels: {{ issue.labels }}
 
 Use Agent Fabric for queue state, worker lifecycle, checkpoints, patch artifacts, and final review gates.
+
+For operations hygiene, preview stale runner recovery and queue cleanup from `elixir/`:
+
+```bash
+mix af.status --queue <pqueue_id> --project .. --stale-dry-run --stale-after-minutes 30
+mix af.status --queue <pqueue_id> --project .. --cleanup-dry-run --cleanup-older-than-days 7
+```

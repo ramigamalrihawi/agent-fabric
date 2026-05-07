@@ -35,6 +35,7 @@ mix af.orchestrator.run --workflow ../WORKFLOW.example.md --once --dry-run
 mix af.orchestrator.run --workflow ../WORKFLOW.example.md --once --start
 mix af.orchestrator.run --workflow ../WORKFLOW.example.md --watch --concurrency 4
 mix af.status --queue pqueue_123
+mix af.status --queue pqueue_123 --project .. --stale-dry-run --stale-after-minutes 30
 mix af.status --queue pqueue_123 --project .. --cleanup-dry-run --cleanup-older-than-days 7
 ```
 
@@ -45,13 +46,15 @@ A typical operator sequence is:
 3. Run one queue-visible poll: `mix af.orchestrator.run --workflow ../WORKFLOW.example.md --once --start`
 4. Run continuously: `mix af.orchestrator.run --workflow ../WORKFLOW.example.md --watch --concurrency 4`
 5. Monitor runtime and queue health: `mix af.status --queue <pqueue_id> --project ..`
-6. Preview completed/canceled queue cleanup before deleting anything: `mix af.status --queue <pqueue_id> --project .. --cleanup-dry-run`
+6. Preview stale running-lane recovery: `mix af.status --queue <pqueue_id> --project .. --stale-dry-run --stale-after-minutes 30`
+7. Preview completed/canceled queue cleanup before deleting anything: `mix af.status --queue <pqueue_id> --project .. --cleanup-dry-run`
 
-Cleanup remains daemon-owned. The Elixir status task only calls the public
-`project_queue_cleanup` tool in dry-run mode so operators can spot queue buildup
-and row-count impact without deleting Agent Fabric evidence from Elixir.
-Pass `--project` when running from `elixir/` so Agent Fabric namespace checks use
-the repository root rather than the Elixir subdirectory.
+Cleanup and stale recovery remain daemon-owned. The Elixir status task only calls
+the public `project_queue_cleanup` and `project_queue_recover_stale` tools in
+dry-run mode so operators can spot queue buildup, stale runners, and row-count
+impact without deleting or rewriting Agent Fabric evidence from Elixir. Pass
+`--project` when running from `elixir/` so Agent Fabric namespace checks use the
+repository root rather than the Elixir subdirectory.
 
 ## Source Parity
 
@@ -87,7 +90,9 @@ tracker:
   after_cursor:
 workspace:
   root: ~/.agent-fabric/workspaces
-  after_create: npm install
+  mode: git_worktree
+  source_project: /path/to/project
+  after_create: ["npm", "install"]
 codex:
   command: codex
   args: ["app-server"]
@@ -120,6 +125,15 @@ Work on {{ issue.identifier }}: {{ issue.title }}
 ```
 
 The prompt renderer supports `identifier`, `title`, `description`, `state`, `url`, and `labels`.
+
+`workspace.mode` defaults to `directory` for legacy workflows. Use
+`git_worktree` for mutating runners so every Linear issue gets an isolated Git
+worktree created from `workspace.source_project`. Existing workspace paths are
+reused only when they are valid Git worktrees; plain directories fail closed so a
+runner cannot accidentally mutate an unsafe checkout. `workspace.after_create`
+may be an argv list such as `["npm", "install"]`, an explicit command map, a test
+function hook, or a legacy shell string. Prefer argv lists for operator workflows;
+shell strings are still supported but are marked as shell-backed hook metadata.
 
 ### Issue Task Planning
 

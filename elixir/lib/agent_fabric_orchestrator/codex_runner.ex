@@ -46,17 +46,21 @@ defmodule AgentFabricOrchestrator.CodexRunner do
     :socket_path,
     :project_path,
     :workspace_mode,
+    :workspace_source_project,
     :model_profile,
     :queue_id,
     :queue_task_id,
     :workflow_path,
     :issue_identifier,
+    :verification_hints,
     :heartbeat_interval_ms,
     :heartbeat_timer,
     :timeout_timer,
     :started_at,
+    :last_event,
     status: :initializing,
     lifecycle_events: [],
+    heartbeat_count: 0,
     timeout_ms: 600_000
   ]
 
@@ -72,17 +76,21 @@ defmodule AgentFabricOrchestrator.CodexRunner do
           socket_path: String.t() | nil,
           project_path: String.t() | nil,
           workspace_mode: String.t(),
+          workspace_source_project: String.t() | nil,
           model_profile: String.t(),
           queue_id: String.t() | nil,
           queue_task_id: String.t() | nil,
           workflow_path: String.t() | nil,
           issue_identifier: String.t() | nil,
+          verification_hints: map(),
           heartbeat_interval_ms: pos_integer(),
           heartbeat_timer: reference() | nil,
           timeout_timer: reference() | nil,
           started_at: DateTime.t(),
+          last_event: lifecycle_event() | nil,
           status: :initializing | :running | :completed | :failed | :stopped,
           lifecycle_events: [lifecycle_event()],
+          heartbeat_count: non_neg_integer(),
           timeout_ms: pos_integer()
         }
 
@@ -103,11 +111,13 @@ defmodule AgentFabricOrchestrator.CodexRunner do
           | {:worker_run_id, String.t()}
           | {:project_path, String.t()}
           | {:workspace_mode, String.t()}
+          | {:workspace_source_project, String.t()}
           | {:model_profile, String.t()}
           | {:queue_id, String.t()}
           | {:queue_task_id, String.t()}
           | {:workflow_path, String.t()}
           | {:issue_identifier, String.t()}
+          | {:verification_hints, map()}
           | {:heartbeat_interval_ms, pos_integer()}
           | {:timeout_ms, pos_integer()}
 
@@ -202,6 +212,7 @@ defmodule AgentFabricOrchestrator.CodexRunner do
     task_id = Keyword.get(opts, :task_id)
     project_path = Keyword.get(opts, :project_path, workspace)
     workspace_mode = Keyword.get(opts, :workspace_mode, "git_worktree")
+    workspace_source_project = Keyword.get(opts, :workspace_source_project)
     model_profile = Keyword.get(opts, :model_profile, "codex-app-server")
     heartbeat_interval_ms = Keyword.get(opts, :heartbeat_interval_ms, heartbeat_interval_ms())
 
@@ -215,16 +226,19 @@ defmodule AgentFabricOrchestrator.CodexRunner do
       worker_run_id: Keyword.get(opts, :worker_run_id),
       project_path: project_path,
       workspace_mode: workspace_mode,
+      workspace_source_project: workspace_source_project,
       model_profile: model_profile,
       queue_id: Keyword.get(opts, :queue_id),
       queue_task_id: Keyword.get(opts, :queue_task_id),
       workflow_path: Keyword.get(opts, :workflow_path),
       issue_identifier: Keyword.get(opts, :issue_identifier),
+      verification_hints: Keyword.get(opts, :verification_hints, %{}),
       heartbeat_interval_ms: heartbeat_interval_ms,
       timeout_ms: timeout_ms,
       started_at: DateTime.utc_now(),
       status: :initializing,
-      lifecycle_events: []
+      lifecycle_events: [],
+      heartbeat_count: 0
     }
 
     # Register a Fabric bridge session so lifecycle events are queue-visible
@@ -310,7 +324,13 @@ defmodule AgentFabricOrchestrator.CodexRunner do
       apply(state.provider_mod, :stop, [state.provider_pid, timeout_ms])
     end
 
-    state = record_event(state, "command_stopping", "Stop requested", %{timeout_ms: timeout_ms})
+    state =
+      record_event(state, "command_stopping", "Stop requested", %{
+        timeout_ms: timeout_ms,
+        cancelReason: "operator_stop",
+        commandDurationMs: command_duration_ms(state)
+      })
+
     send_lifecycle_event(state, "command_stopping")
     state = cancel_timers(state)
     finish_fabric_task(state, "canceled", "Runner stopped by request")
@@ -334,6 +354,7 @@ defmodule AgentFabricOrchestrator.CodexRunner do
   def handle_info(:heartbeat, state) do
     if state.status == :running do
       Logger.debug("Heartbeat from runner #{state.id}")
+      state = %{state | heartbeat_count: state.heartbeat_count + 1}
       send_lifecycle_event(state, "heartbeat")
 
       timer = Process.send_after(self(), :heartbeat, state.heartbeat_interval_ms)
@@ -388,13 +409,19 @@ defmodule AgentFabricOrchestrator.CodexRunner do
 
       state =
         record_event(state, "command_failed", "Runtime timeout exceeded", %{
-          timeout_ms: state.timeout_ms
+          timeout_ms: state.timeout_ms,
+          timeoutReason: "runtime_timeout",
+          commandDurationMs: command_duration_ms(state)
         })
 
       send_lifecycle_event(state, "command_failed")
 
       state =
-        record_event(state, "failed", "Runtime timeout exceeded", %{timeout_ms: state.timeout_ms})
+        record_event(state, "failed", "Runtime timeout exceeded", %{
+          timeout_ms: state.timeout_ms,
+          timeoutReason: "runtime_timeout",
+          commandDurationMs: command_duration_ms(state)
+        })
 
       send_lifecycle_event(state, "failed")
       finish_fabric_task(state, "failed", "Runtime timeout exceeded")
@@ -498,7 +525,7 @@ defmodule AgentFabricOrchestrator.CodexRunner do
       metadata: metadata
     }
 
-    %{state | lifecycle_events: [event | state.lifecycle_events]}
+    %{state | lifecycle_events: [event | state.lifecycle_events], last_event: event}
   end
 
   defp cancel_timers(state) do
@@ -643,7 +670,10 @@ defmodule AgentFabricOrchestrator.CodexRunner do
         heartbeatIntervalMs: state.heartbeat_interval_ms,
         maxRuntimeMs: state.timeout_ms,
         command: state.command,
-        workspace: state.workspace
+        workspace: state.workspace,
+        workspaceMode: state.workspace_mode,
+        workspaceSourceProject: state.workspace_source_project,
+        verificationHints: state.verification_hints || %{}
       }
     }
 
@@ -700,13 +730,24 @@ defmodule AgentFabricOrchestrator.CodexRunner do
       queueTaskId: state.queue_task_id,
       runnerPid: inspect(self()),
       workspace: state.workspace,
+      workspaceMode: state.workspace_mode,
+      workspaceSourceProject: state.workspace_source_project,
       command: state.command,
       status: Atom.to_string(state.status),
       heartbeatIntervalMs: state.heartbeat_interval_ms,
+      heartbeatCount: state.heartbeat_count,
       maxRuntimeMs: state.timeout_ms,
+      commandDurationMs: command_duration_ms(state),
+      verificationHints: state.verification_hints || %{},
       timestamp: DateTime.utc_now() |> DateTime.to_iso8601(),
       lifecycleEventCount: length(state.lifecycle_events)
     }
+  end
+
+  defp command_duration_ms(%{started_at: nil}), do: nil
+
+  defp command_duration_ms(state) do
+    DateTime.diff(DateTime.utc_now(), state.started_at, :millisecond)
   end
 
   defp json_safe(value) when is_map(value) do
@@ -747,8 +788,23 @@ defmodule AgentFabricOrchestrator.CodexRunner do
       lifecycle_event_count: length(state.lifecycle_events),
       queue_id: state.queue_id,
       queue_task_id: state.queue_task_id,
+      workspace_mode: state.workspace_mode,
+      workspace_source_project: state.workspace_source_project,
       heartbeat_interval_ms: state.heartbeat_interval_ms,
+      heartbeat_count: state.heartbeat_count,
+      command_duration_ms: command_duration_ms(state),
+      last_event: last_event_summary(state.last_event),
       timeout_ms: state.timeout_ms
+    }
+  end
+
+  defp last_event_summary(nil), do: nil
+
+  defp last_event_summary(event) do
+    %{
+      kind: event.kind,
+      timestamp: event.timestamp,
+      body: event.body
     }
   end
 

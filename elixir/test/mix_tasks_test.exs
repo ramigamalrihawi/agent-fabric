@@ -38,6 +38,16 @@ defmodule AgentFabricOrchestrator.MixTasksTest do
     assert parsed["queue"]["cleanup"]["error"] =~ "--cleanup-dry-run requires"
   end
 
+  test "af.status stale dry-run requires a queue before daemon calls" do
+    Mix.Task.reenable("af.status")
+
+    Mix.Tasks.Af.Status.run(["--stale-dry-run", "--json"])
+
+    assert_receive {:mix_shell, :info, [json]}
+    assert {:ok, parsed} = Jason.decode(json)
+    assert parsed["queue"]["stale"]["error"] =~ "--stale-dry-run requires --queue"
+  end
+
   defp write_workflow do
     root = Path.join(System.tmp_dir!(), "af-mix-task-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)

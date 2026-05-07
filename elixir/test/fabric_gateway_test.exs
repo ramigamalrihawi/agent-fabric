@@ -142,6 +142,14 @@ defmodule AgentFabricOrchestrator.FabricGatewayTest do
                  opts
                )
 
+      assert {:ok, %{"ok" => true}} =
+               FabricGateway.Uds.recover_stale(
+                 "/tmp/fake.sock",
+                 @session,
+                 %{"dryRun" => false, queueId: "pqueue_1", staleAfterMinutes: 15},
+                 opts
+               )
+
       assert_received {:tool_call, "project_queue_status", %{"queueId" => "pqueue_1"}}
 
       assert_received {:tool_call, "project_queue_progress_report", %{"queueId" => "pqueue_1"}}
@@ -160,6 +168,13 @@ defmodule AgentFabricOrchestrator.FabricGatewayTest do
                          "queueId" => "pqueue_1",
                          "olderThanDays" => 0,
                          "limit" => 5,
+                         "dryRun" => true
+                       }}
+
+      assert_received {:tool_call, "project_queue_recover_stale",
+                       %{
+                         "queueId" => "pqueue_1",
+                         "staleAfterMinutes" => 15,
                          "dryRun" => true
                        }}
     end

@@ -50,6 +50,16 @@ expected files, required context refs, acceptance criteria, and parallel-safety
 metadata. This borrows Symphony's "manage work, not sessions" posture while
 keeping all durable queue state and patch review inside Agent Fabric.
 
+Workspace preparation is also an Elixir-owned runtime seam. The workflow contract
+can request legacy `directory` workspaces or isolated `git_worktree` workspaces
+created from `workspace.source_project`; the latter is preferred for mutating
+Codex App Server runners because each issue gets a deterministic checkout and
+invalid existing paths fail closed. After-create hooks support argv execution
+without shell interpolation, while legacy shell strings remain visibly marked as
+shell-backed metadata. Queue cleanup and stale running-lane recovery stay on the
+TypeScript side; Elixir only exposes dry-run previews through public Agent Fabric
+tools.
+
 High-scale Senior queues are organized around lightweight orchestration labels rather than raw transcript replay. Queue tasks can carry `managerId`, `parentManagerId`, `parentQueueId`, `phase`, `workstream`, `costCenter`, and `escalationTarget`; worker runs inherit those labels for card projection and reporting. `fabric_list_agents` paginates and groups cards, `project_queue_progress_report` returns a bounded `managerSummary`, and cost summaries separate senior, manager, and worker spend where worker events report cost data. These projections let Codex, Claude Code, desktop views, and future plugin surfaces supervise hundreds of lanes without forcing the senior model to read every raw worker log.
 
 ## Major Surfaces

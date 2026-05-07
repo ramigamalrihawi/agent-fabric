@@ -380,6 +380,38 @@ defmodule AgentFabricOrchestrator.WorkflowTest do
     end
   end
 
+  describe "workspace helpers" do
+    test "workspace mode defaults to directory and aliases local sandbox to directory" do
+      assert Workflow.workspace_mode(%{}) == "directory"
+      assert Workflow.workspace_mode(%{"workspace" => %{}}) == "directory"
+      assert Workflow.workspace_mode(%{"workspace" => %{"mode" => "local"}}) == "directory"
+      assert Workflow.workspace_mode(%{"workspace" => %{"mode" => "sandbox"}}) == "directory"
+
+      assert Workflow.workspace_mode(%{"workspace" => %{"mode" => "git_worktree"}}) ==
+               "git_worktree"
+    end
+
+    test "workspace source project expands env paths and after_create is returned raw" do
+      workflow = %Workflow{
+        path: nil,
+        prompt_template: "",
+        config: %{
+          "workspace" => %{
+            "source_project" => "$ROOT/project",
+            "after_create" => ["npm", "install"]
+          }
+        }
+      }
+
+      assert Workflow.workspace_source_project(workflow, %{"ROOT" => "/tmp/agent-fabric"}) ==
+               "/tmp/agent-fabric/project"
+
+      assert Workflow.workspace_after_create(workflow) == ["npm", "install"]
+      assert Workflow.workspace_source_project(%{"workspace" => %{}}) == nil
+      assert Workflow.workspace_after_create(%{"workspace" => %{}}) == nil
+    end
+  end
+
   # ─── Prompt Rendering Tests ──────────────────────────────────────────
 
   describe "render_prompt/2" do

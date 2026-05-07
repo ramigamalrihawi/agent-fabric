@@ -377,6 +377,60 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
       cleanup_runner("ENG-55")
     end
 
+    test "uses workflow git_worktree mode and source project for workspace and worker metadata" do
+      owner_name = :orchestrator_fake_gateway_owner
+
+      if Process.whereis(owner_name), do: Process.unregister(owner_name)
+      Process.register(self(), owner_name)
+
+      on_exit(fn ->
+        if Process.whereis(owner_name) == self(), do: Process.unregister(owner_name)
+      end)
+
+      source_project = create_git_repo!()
+
+      workflow_path =
+        write_queue_workflow(
+          workspace_extra: """
+            mode: git_worktree
+            source_project: #{source_project}
+          """
+        )
+
+      issue = sample_issue(identifier: "ENG-55", state: "Todo")
+      cleanup_runner("ENG-55")
+
+      {:ok, pid} =
+        Orchestrator.start_link(
+          workflow_path: workflow_path,
+          socket_path: "/tmp/fake-agent-fabric.sock",
+          gateway: AgentFabricOrchestrator.OrchestratorTest.FakeGateway,
+          tracker: fn _config -> {:ok, [issue]} end,
+          concurrency: 1,
+          start_execution: true,
+          name: nil
+        )
+
+      {:ok, status} = Orchestrator.poll_once(pid)
+      mapping = status.issue_mapping["ENG-55"]
+
+      assert mapping.workspace_mode == "git_worktree"
+      assert mapping.workspace_source_project == source_project
+      assert File.exists?(Path.join(mapping.workspace_path, ".git"))
+
+      assert_receive {:gateway_start_worker,
+                      %{
+                        workspaceMode: "git_worktree",
+                        metadata: %{
+                          workspaceMode: "git_worktree",
+                          workspaceSourceProject: ^source_project
+                        }
+                      }}
+
+      GenServer.stop(pid)
+      cleanup_runner("ENG-55")
+    end
+
     test "persists queue task mapping immediately after task creation" do
       workflow_path = write_queue_workflow()
       {:ok, workflow} = Workflow.load(workflow_path)
@@ -941,6 +995,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
     path = Path.join(root, "WORKFLOW.md")
     after_cursor = Keyword.get(opts, :after_cursor)
     after_cursor_line = if after_cursor, do: "  after_cursor: #{after_cursor}\n", else: ""
+    workspace_extra = Keyword.get(opts, :workspace_extra, "")
     agent_fabric_extra = Keyword.get(opts, :agent_fabric_extra, "")
 
     File.write!(path, """
@@ -951,6 +1006,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
       terminal_states: ["Done"]
     #{after_cursor_line}workspace:
       root: #{root}
+    #{workspace_extra}
     codex:
       command: sleep
       args: ["1"]
@@ -969,6 +1025,26 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
     """)
 
     path
+  end
+
+  defp create_git_repo! do
+    root = Path.join(System.tmp_dir!(), "af-orch-source-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+    git!(root, ["init"])
+    git!(root, ["config", "user.email", "test@example.com"])
+    git!(root, ["config", "user.name", "Agent Fabric Test"])
+    File.write!(Path.join(root, "README.md"), "# Test\n")
+    git!(root, ["add", "README.md"])
+    git!(root, ["commit", "-m", "initial"])
+    root
+  end
+
+  defp git!(cwd, args) do
+    case System.cmd("git", ["-C", cwd | args], stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> flunk("git #{Enum.join(args, " ")} failed with #{status}: #{output}")
+    end
   end
 end
 
@@ -1032,12 +1108,21 @@ defmodule AgentFabricOrchestrator.OrchestratorTest.FakeGateway do
 
   def start_worker(socket_path, session, input, opts \\ [])
 
-  def start_worker(_socket_path, _session, %{metadata: %{issueIdentifier: issue}}, _opts) do
+  def start_worker(_socket_path, _session, %{metadata: %{issueIdentifier: issue}} = input, _opts) do
+    if owner = Process.whereis(:orchestrator_fake_gateway_owner) do
+      send(owner, {:gateway_start_worker, input})
+    end
+
     {:ok, %{"workerRunId" => "wrun_#{issue}"}}
   end
 
-  def start_worker(_socket_path, _session, _input, _opts),
-    do: {:ok, %{"workerRunId" => "wrun_fake"}}
+  def start_worker(_socket_path, _session, input, _opts) do
+    if owner = Process.whereis(:orchestrator_fake_gateway_owner) do
+      send(owner, {:gateway_start_worker, input})
+    end
+
+    {:ok, %{"workerRunId" => "wrun_fake"}}
+  end
 
   def event(_socket_path, _session, _input, _opts \\ []), do: {:ok, %{}}
   def heartbeat(_socket_path, _session, _input, _opts \\ []), do: {:ok, %{}}

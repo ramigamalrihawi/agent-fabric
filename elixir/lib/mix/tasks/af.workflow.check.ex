@@ -79,6 +79,7 @@ defmodule Mix.Tasks.Af.Workflow.Check do
     |> validate_required_config(config)
     |> validate_project_path(workflow)
     |> validate_workspace_root(config)
+    |> validate_workspace_mode(workflow)
     |> validate_codex_command(config)
     |> validate_linear_config(config)
   end
@@ -123,6 +124,40 @@ defmodule Mix.Tasks.Af.Workflow.Check do
 
       true ->
         add_warning(report, "workspace.root does not exist yet: #{root}")
+    end
+  end
+
+  defp validate_workspace_mode(report, workflow) do
+    mode = Workflow.workspace_mode(workflow)
+
+    report = put_in(report, [:checks, :workspace_mode], mode)
+
+    case mode do
+      "directory" ->
+        report
+
+      "git_worktree" ->
+        source_project = Workflow.workspace_source_project(workflow)
+
+        cond do
+          source_project in [nil, ""] ->
+            add_error(
+              report,
+              "workspace.source_project is required when workspace.mode is git_worktree"
+            )
+
+          git_repo?(source_project) ->
+            put_in(report, [:checks, :workspace_source_project], source_project)
+
+          true ->
+            add_error(
+              report,
+              "workspace.source_project is not a git repository: #{source_project}"
+            )
+        end
+
+      other ->
+        add_error(report, "unsupported workspace.mode: #{other}")
     end
   end
 
@@ -219,6 +254,16 @@ defmodule Mix.Tasks.Af.Workflow.Check do
   defp executable_available?(""), do: false
   defp executable_available?(path = "/" <> _), do: File.exists?(path) and File.regular?(path)
   defp executable_available?(command), do: System.find_executable(command) != nil
+
+  defp git_repo?(path) do
+    case System.cmd("git", ["-C", path, "rev-parse", "--is-inside-work-tree"],
+           stderr_to_stdout: true
+         ) do
+      {"true\n", 0} -> true
+      {output, 0} -> String.trim(output) == "true"
+      _ -> false
+    end
+  end
 
   defp env_or_config(env, key, default) do
     System.get_env(env) || Application.get_env(:agent_fabric_orchestrator, key, default)

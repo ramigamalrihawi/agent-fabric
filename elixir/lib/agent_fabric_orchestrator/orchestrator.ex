@@ -48,6 +48,8 @@ defmodule AgentFabricOrchestrator.Orchestrator do
       :worker_run_id,
       :runner_pid,
       :workspace_path,
+      :workspace_mode,
+      :workspace_source_project,
       :failure_count,
       :last_failure_at,
       :backoff_until,
@@ -63,6 +65,8 @@ defmodule AgentFabricOrchestrator.Orchestrator do
             worker_run_id: String.t() | nil,
             runner_pid: pid() | nil,
             workspace_path: String.t() | nil,
+            workspace_mode: String.t() | nil,
+            workspace_source_project: String.t() | nil,
             failure_count: non_neg_integer(),
             last_failure_at: DateTime.t() | nil,
             backoff_until: DateTime.t() | nil,
@@ -474,7 +478,7 @@ defmodule AgentFabricOrchestrator.Orchestrator do
       taskId: fabric_task_id,
       worker: "codex-app-server",
       projectPath: project_path,
-      workspaceMode: "git_worktree",
+      workspaceMode: workspace[:mode] || "git_worktree",
       workspacePath: workspace.path,
       modelProfile:
         get_in(state.workflow.config, ["codex", "model_profile"]) || "codex-app-server",
@@ -491,6 +495,8 @@ defmodule AgentFabricOrchestrator.Orchestrator do
         command: command,
         args: args,
         workspace: workspace.path,
+        workspaceMode: workspace[:mode] || "git_worktree",
+        workspaceSourceProject: workspace[:source_project],
         heartbeatIntervalMs: Workflow.heartbeat_ms(state.workflow),
         maxRuntimeMinutes: max_runtime
       }
@@ -636,13 +642,18 @@ defmodule AgentFabricOrchestrator.Orchestrator do
 
   defp handle_new_issues(state, new_issues, config) do
     workspace_root = Workflow.expand_path(get_in(config, ["workspace", "root"]))
+    workspace_mode = Workflow.workspace_mode(state.workflow)
+    workspace_source_project = Workflow.workspace_source_project(state.workflow)
+    after_create = Workflow.workspace_after_create(state.workflow)
 
     Enum.reduce(new_issues, state, fn {issue, _nil}, acc ->
       prompt = Workflow.render_prompt(acc.workflow, issue)
 
       with {:ok, workspace} <-
              Workspace.ensure_workspace(workspace_root, issue,
-               after_create: get_in(config, ["workspace", "after_create"])
+               mode: workspace_mode,
+               source_project: workspace_source_project,
+               after_create: after_create
              ),
            {:ok, fabric_task_id, queue_task_id} <- create_queue_task(acc, issue, prompt) do
         rec = %IssueRecord{
@@ -651,6 +662,8 @@ defmodule AgentFabricOrchestrator.Orchestrator do
           queue_task_id: queue_task_id,
           queue_id: acc.queue_id,
           workspace_path: workspace.path,
+          workspace_mode: workspace.mode,
+          workspace_source_project: workspace.source_project,
           status: :queued
         }
 
@@ -747,7 +760,11 @@ defmodule AgentFabricOrchestrator.Orchestrator do
 
   defp start_single_runner(state, issue_id, rec, config) do
     with {:ok, worker_run_id} <-
-           start_worker_run(state, rec.issue, rec.fabric_task_id, %{path: rec.workspace_path}),
+           start_worker_run(state, rec.issue, rec.fabric_task_id, %{
+             path: rec.workspace_path,
+             mode: rec.workspace_mode,
+             source_project: rec.workspace_source_project
+           }),
          :ok <- assign_claimed_worker(state, rec.queue_task_id, worker_run_id),
          {:ok, runner_pid} <-
            start_runner(state, rec, worker_run_id, config) do
@@ -819,9 +836,12 @@ defmodule AgentFabricOrchestrator.Orchestrator do
       queue_id: state.queue_id,
       queue_task_id: rec.queue_task_id,
       project_path: Workflow.project_path(state.workflow),
+      workspace_mode: rec.workspace_mode || "git_worktree",
+      workspace_source_project: rec.workspace_source_project,
       model_profile: get_in(config, ["codex", "model_profile"]) || "codex-app-server",
       workflow_path: state.workflow.path,
       issue_identifier: rec.issue.identifier,
+      verification_hints: runner_verification_hints(state.workflow),
       heartbeat_interval_ms: Workflow.heartbeat_ms(state.workflow),
       timeout_ms: (get_in(config, ["codex", "max_runtime_minutes"]) || 30) * 60 * 1000
     ]
@@ -908,6 +928,13 @@ defmodule AgentFabricOrchestrator.Orchestrator do
   defp register_payload(state) do
     root = Workflow.project_path(state.workflow) || File.cwd!()
     put_in(FabricClient.default_register_payload(), [:workspace, :root], root)
+  end
+
+  defp runner_verification_hints(workflow) do
+    %{
+      taskDefaults: Workflow.task_defaults(workflow),
+      workflowPath: workflow.path
+    }
   end
 
   defp terminal_finish_status(issue) do
@@ -1020,6 +1047,8 @@ defmodule AgentFabricOrchestrator.Orchestrator do
       "queue_id" => rec.queue_id,
       "worker_run_id" => rec.worker_run_id,
       "workspace_path" => rec.workspace_path,
+      "workspace_mode" => rec.workspace_mode,
+      "workspace_source_project" => rec.workspace_source_project,
       "failure_count" => rec.failure_count || 0,
       "last_failure_at" => date_to_iso(rec.last_failure_at),
       "backoff_until" => date_to_iso(rec.backoff_until),
@@ -1098,6 +1127,8 @@ defmodule AgentFabricOrchestrator.Orchestrator do
       queue_id: rec["queue_id"],
       worker_run_id: if(recovered_running?, do: nil, else: rec["worker_run_id"]),
       workspace_path: rec["workspace_path"],
+      workspace_mode: rec["workspace_mode"],
+      workspace_source_project: rec["workspace_source_project"],
       failure_count: rec["failure_count"] || 0,
       last_failure_at: parse_datetime(rec["last_failure_at"]),
       backoff_until: parse_datetime(rec["backoff_until"]),
@@ -1133,6 +1164,8 @@ defmodule AgentFabricOrchestrator.Orchestrator do
              worker_run_id: rec.worker_run_id,
              queue_task_id: rec.queue_task_id,
              workspace_path: rec.workspace_path,
+             workspace_mode: rec.workspace_mode,
+             workspace_source_project: rec.workspace_source_project,
              status: rec.status
            }}
         end)
@@ -1171,6 +1204,8 @@ defmodule AgentFabricOrchestrator.Orchestrator do
          queue_id: rec.queue_id,
          worker_run_id: rec.worker_run_id,
          workspace_path: rec.workspace_path,
+         workspace_mode: rec.workspace_mode,
+         workspace_source_project: rec.workspace_source_project,
          status: rec.status,
          updated_at: rec.issue.updated_at
        }}
@@ -1426,6 +1461,7 @@ defmodule AgentFabricOrchestrator.Orchestrator do
         fabric_task_id: "test_task_#{issue.identifier}",
         queue_id: state.queue_id || "test_queue",
         workspace_path: "/tmp/test_ws/#{issue.identifier}",
+        workspace_mode: "directory",
         status: :queued
       }
 

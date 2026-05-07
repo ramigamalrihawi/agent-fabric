@@ -5,6 +5,7 @@ defmodule Mix.Tasks.Af.Status do
       mix af.status
       mix af.status --queue pqueue_123 --json
       mix af.status --queue pqueue_123 --project /path/to/project --json
+      mix af.status --queue pqueue_123 --stale-dry-run --stale-after-minutes 30 --json
       mix af.status --queue pqueue_123 --cleanup-dry-run --json
   """
 
@@ -27,7 +28,9 @@ defmodule Mix.Tasks.Af.Status do
           json: :boolean,
           cleanup_dry_run: :boolean,
           cleanup_older_than_days: :integer,
-          cleanup_limit: :integer
+          cleanup_limit: :integer,
+          stale_dry_run: :boolean,
+          stale_after_minutes: :integer
         ],
         aliases: [q: :queue]
       )
@@ -78,8 +81,15 @@ defmodule Mix.Tasks.Af.Status do
         end
       end
 
-    if opts[:cleanup_dry_run] do
-      Map.put(base, :cleanup, cleanup_preview(opts))
+    base =
+      if opts[:cleanup_dry_run] do
+        Map.put(base, :cleanup, cleanup_preview(opts))
+      else
+        base
+      end
+
+    if opts[:stale_dry_run] do
+      Map.put(base, :stale, stale_preview(opts))
     else
       base
     end
@@ -106,6 +116,30 @@ defmodule Mix.Tasks.Af.Status do
       with {:ok, result} <-
              with_fabric_session(opts, fn socket_path, session, call_opts ->
                FabricGateway.Uds.cleanup_queues(socket_path, session, input, call_opts)
+             end) do
+        %{requested: true, dry_run: true, result: result}
+      else
+        {:error, reason} ->
+          %{requested: true, dry_run: true, error: inspect(reason)}
+      end
+    end
+  end
+
+  defp stale_preview(opts) do
+    queue_id = opts[:queue]
+
+    if queue_id in [nil, ""] do
+      %{requested: true, error: "--stale-dry-run requires --queue"}
+    else
+      input = %{
+        dryRun: true,
+        queueId: queue_id,
+        staleAfterMinutes: stale_after_minutes(opts)
+      }
+
+      with {:ok, result} <-
+             with_fabric_session(opts, fn socket_path, session, call_opts ->
+               FabricGateway.Uds.recover_stale(socket_path, session, input, call_opts)
              end) do
         %{requested: true, dry_run: true, result: result}
       else
@@ -172,6 +206,10 @@ defmodule Mix.Tasks.Af.Status do
     if cleanup = queue[:cleanup] do
       emit_cleanup(cleanup)
     end
+
+    if stale = queue[:stale] do
+      emit_stale(stale)
+    end
   end
 
   defp emit_cleanup(%{error: error}), do: Mix.shell().error("cleanup_error: #{error}")
@@ -189,6 +227,20 @@ defmodule Mix.Tasks.Af.Status do
   end
 
   defp emit_cleanup(_cleanup), do: :ok
+
+  defp emit_stale(%{error: error}), do: Mix.shell().error("stale_error: #{error}")
+
+  defp emit_stale(%{result: result}) do
+    Mix.shell().info("stale_dry_run: true")
+
+    Mix.shell().info(
+      "stale_after_minutes: #{result["staleAfterMinutes"] || result[:staleAfterMinutes] || 30}"
+    )
+
+    Mix.shell().info("stale_matches: #{result["count"] || result[:count] || 0}")
+  end
+
+  defp emit_stale(_stale), do: :ok
 
   defp socket_path(opts) do
     opts[:socket] ||
@@ -231,6 +283,16 @@ defmodule Mix.Tasks.Af.Status do
       value
     else
       Mix.raise("--cleanup-limit must be a positive integer")
+    end
+  end
+
+  defp stale_after_minutes(opts) do
+    value = opts[:stale_after_minutes] || 30
+
+    if is_integer(value) and value >= 1 and value <= 1440 do
+      value
+    else
+      Mix.raise("--stale-after-minutes must be an integer between 1 and 1440")
     end
   end
 
