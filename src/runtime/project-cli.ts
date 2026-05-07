@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, type WriteStream } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -227,6 +227,7 @@ export type ProjectCliCommand =
       maxOutputChars: number;
       approveToolContext: boolean;
       rememberToolContext: boolean;
+      artifactIgnore?: string[];
     }
   | {
       command: "run-ready";
@@ -255,6 +256,7 @@ export type ProjectCliCommand =
       adaptiveRateLimit?: boolean;
       minParallel?: number;
       allowConcurrentRunner?: boolean;
+      artifactIgnore?: string[];
     }
   | {
       command: "factory-run";
@@ -1299,7 +1301,8 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       successStatus: parseSuccessStatus(flags.successStatus ?? "patch_ready"),
       maxOutputChars: flags.maxOutputChars ?? 8_000,
       approveToolContext: flags.approveToolContext,
-      rememberToolContext: flags.rememberToolContext
+      rememberToolContext: flags.rememberToolContext,
+      artifactIgnore: flags.artifactIgnore
     };
   }
 
@@ -1335,7 +1338,8 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       continueOnFailure: flags.continueOnFailure,
       adaptiveRateLimit: flags.adaptiveRateLimit,
       minParallel: flags.minParallel ?? 1,
-      allowConcurrentRunner: flags.allowConcurrentRunner
+      allowConcurrentRunner: flags.allowConcurrentRunner,
+      artifactIgnore: flags.artifactIgnore
     };
   }
 
@@ -2126,8 +2130,8 @@ export function projectHelp(): string {
     "  agent-fabric-project review-patches --queue <id> [--accept-task <queueTaskId>] [--apply-patch] [--apply-cwd <path>] [--json]",
     "  agent-fabric-project write-task-packets --queue <id> --out-dir <dir> [--format json|markdown] [--ready-only] [--json]",
     "  agent-fabric-project resume-task --queue <id> --queue-task <queueTaskId> [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--output-file <file>] [--format json|markdown] [--json]",
-    "  agent-fabric-project run-task --queue <id> --queue-task <queueTaskId> --command <cmd> [--cwd <path>] [--cwd-prep auto|none|mkdir] [--task-packet <path>] [--task-packet-format json|markdown] [--approval-token <token>] [--approve-tool-context] [--remember-tool-context] [--success-status patch_ready|completed] [--json]",
-    "  agent-fabric-project run-ready --queue <id> [--project <path>] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--adaptive-rate-limit] [--command-template <cmd>] [--cwd-template <path>] [--cwd-prep auto|none|mkdir] [--task-packet-dir <dir>] [--task-packet-format json|markdown] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--approval-token <token>] [--approve-tool-context] [--allow-concurrent-runner] [--continue-on-failure] [--json]",
+    "  agent-fabric-project run-task --queue <id> --queue-task <queueTaskId> --command <cmd> [--cwd <path>] [--cwd-prep auto|none|mkdir] [--task-packet <path>] [--task-packet-format json|markdown] [--approval-token <token>] [--approve-tool-context] [--remember-tool-context] [--artifact-ignore <glob>] [--success-status patch_ready|completed] [--json]",
+    "  agent-fabric-project run-ready --queue <id> [--project <path>] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--adaptive-rate-limit] [--command-template <cmd>] [--cwd-template <path>] [--cwd-prep auto|none|mkdir] [--task-packet-dir <dir>] [--task-packet-format json|markdown] [--artifact-ignore <glob>] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--approval-token <token>] [--approve-tool-context] [--allow-concurrent-runner] [--continue-on-failure] [--json]",
     "  agent-fabric-project factory-run --queue <id> [--start-execution] [--dry-run] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--task-packet-dir <dir>] [--cwd-template <path>] [--deepseek-worker-command <cmd>] [--deepseek-role auto|implementer|reviewer|risk-reviewer|adjudicator|planner] [--sensitive-context-mode basic|strict|off] [--patch-mode report|write] [--approval-token <token>|--approve-model-calls] [--approve-tool-context] [--allow-sensitive-context] [--allow-concurrent-runner] [--continue-on-failure] [--no-adaptive-rate-limit] [--json]",
     "  agent-fabric-project launch-plan --queue <id> [--limit <n>] [--json]",
     "  agent-fabric-project status --queue <id> [--json]",
@@ -3006,8 +3010,10 @@ function structuredResultFromCheckpointSummary(summary: Record<string, unknown> 
 
 function resolveReviewPatchFile(patchFile: string, cwd: string): string {
   const resolved = isAbsolute(patchFile) ? resolve(patchFile) : resolve(cwd, patchFile);
-  if (!isPathInside(resolved, cwd)) {
-    throw new FabricError("PATCH_NOT_APPLYABLE", `Reviewed patch file must be inside apply cwd: ${resolved}`, false);
+  const relativePatch = relative(resolve(cwd), resolved);
+  const patchSegments = relativePatch.split(/[\\/]+/).filter(Boolean);
+  if (!isPathInside(resolved, cwd) || patchSegments.includes(".git")) {
+    throw new FabricError("PATCH_NOT_APPLYABLE", `Reviewed patch file must be inside apply cwd and outside .git: ${resolved}`, false);
   }
   return resolved;
 }
@@ -3145,7 +3151,8 @@ async function runTask(
     });
   }
 
-  const before = snapshotFiles(cwd);
+  const artifactIgnoreGlobs = resolveArtifactIgnoreGlobs(command.artifactIgnore);
+  const before = snapshotFiles(cwd, artifactIgnoreGlobs);
   await call("fabric_task_event", {
     taskId: task.fabricTaskId,
     workerRunId,
@@ -3177,7 +3184,8 @@ async function runTask(
           }
         }).catch(() => undefined);
       }
-    }
+    },
+    `${task.queueTaskId}-${workerRunId}`
   ).finally(stopHeartbeat);
   const durationMs = Date.now() - startedAt;
   await call("fabric_task_event", {
@@ -3193,7 +3201,9 @@ async function runTask(
       timedOut: result.timedOut,
       durationMs,
       stdoutTail: tailText(result.stdout, command.maxOutputChars),
-      stderrTail: tailText(result.stderr, command.maxOutputChars)
+      stderrTail: tailText(result.stderr, command.maxOutputChars),
+      stdoutLogPath: result.stdoutLogPath,
+      stderrLogPath: result.stderrLogPath
     }
   });
   if (looksLikeTestCommand(command.commandLine)) {
@@ -3206,7 +3216,7 @@ async function runTask(
     });
   }
 
-  const changedFiles = diffSnapshots(before, snapshotFiles(cwd));
+  const changedFiles = diffSnapshots(before, snapshotFiles(cwd, artifactIgnoreGlobs));
   const structuredResult = loadStructuredWorkerResult(cwd, result.stdout, changedFiles);
   const structuredStatus = structuredResult?.status;
   const structuredSummary = structuredResult?.summary;
@@ -3277,7 +3287,9 @@ async function runTask(
       structuredResult,
       testsSuggested: suggestedTests,
       stdoutTail: tailText(result.stdout, command.maxOutputChars),
-      stderrTail: tailText(result.stderr, command.maxOutputChars)
+      stderrTail: tailText(result.stderr, command.maxOutputChars),
+      stdoutLogPath: result.stdoutLogPath,
+      stderrLogPath: result.stderrLogPath
     }
   });
   await call("fabric_task_event", {
@@ -3310,6 +3322,8 @@ async function runTask(
       structuredResult,
       stdoutTail: tailText(result.stdout, command.maxOutputChars),
       stderrTail: tailText(result.stderr, command.maxOutputChars),
+      stdoutLogPath: result.stdoutLogPath,
+      stderrLogPath: result.stderrLogPath,
       ...taskPacketMetadata(command.taskPacketPath, command.taskPacketFormat, command.taskContextPath)
     }
   };
@@ -3361,7 +3375,8 @@ async function runReady(
             successStatus: command.successStatus,
             maxOutputChars: command.maxOutputChars,
             approveToolContext: command.approveToolContext,
-            rememberToolContext: command.rememberToolContext
+            rememberToolContext: command.rememberToolContext,
+            artifactIgnore: command.artifactIgnore
           },
           call
         );
@@ -3938,10 +3953,16 @@ async function importTasks(
     modelAlias: "task.writer",
     outputSummary: `Imported ${payload.tasks.length} task(s) from ${command.tasksFile}.`
   });
-  const added = await call<Record<string, unknown>>("project_queue_add_tasks", {
-    queueId: command.queueId,
-    tasks: payload.tasks
-  });
+  const added = payload.defaults
+    ? await call<Record<string, unknown>>("project_queue_add_task_batch", {
+        queueId: command.queueId,
+        defaults: payload.defaults,
+        tasks: payload.tasks
+      })
+    : await call<Record<string, unknown>>("project_queue_add_tasks", {
+        queueId: command.queueId,
+        tasks: payload.tasks
+      });
   await call("project_queue_record_stage", {
     queueId: command.queueId,
     stage: "queue_shaping",
@@ -4095,8 +4116,11 @@ async function mergeWorkerDryRun(
     includeEvents: true,
     includeCheckpoints: true
   });
-  const candidate = resolveReviewedPatchCandidate(task, fabricStatus);
+  const candidate = resolveReviewedPatchCandidate(task, fabricStatus, { requireWorkerRun: false });
   const cwd = command.applyCwd ?? candidate.workspacePath ?? fabricStatus.projectPath ?? status.queue.projectPath;
+  if (!existsSync(cwd)) {
+    throw new FabricError("MERGE_WORKER_CWD_MISSING", `Workspace cwd does not exist: ${cwd}`, false);
+  }
   const patchFile = resolveReviewPatchFile(candidate.patchFile, cwd);
   if (!existsSync(patchFile)) {
     throw new FabricError("PATCH_ARTIFACT_MISSING", `PATCH_ARTIFACT_MISSING: Patch artifact not found: ${patchFile}`, false);
@@ -4243,7 +4267,7 @@ async function mergeWorker(
     const reviewSummary = command.reviewSummary as string;
 
     if (conflictMessage) {
-      throw new FabricError("MERGE_WORKER_CONFLICTS", conflictMessage, false);
+      throw new FabricError("MERGE_WORKER_CONFLICTS", `MERGE_WORKER_CONFLICTS: ${conflictMessage}`, false);
     }
 
     if (testResults && !testResults.allPassed) {
@@ -4264,7 +4288,13 @@ async function mergeWorker(
       };
     }
 
-    const patchApply = await applyPatchWithSystemPatch(patch, cwd);
+    let patchApply: Record<string, unknown>;
+    try {
+      patchApply = await applyPatchWithSystemPatch(patch, cwd);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new FabricError("MERGE_WORKER_CONFLICTS", `MERGE_WORKER_CONFLICTS: ${message}`, false);
+    }
 
     let acceptResult: Record<string, unknown> = {};
     try {
@@ -4341,11 +4371,15 @@ async function mergeWorker(
   };
 }
 
-function parseTasksFile(path: string): { tasks: unknown[] } {
+function parseTasksFile(path: string): { tasks: unknown[]; defaults?: Record<string, unknown> } {
   const parsed = JSON.parse(readFile(path)) as unknown;
   if (Array.isArray(parsed)) return { tasks: parsed };
   if (parsed && typeof parsed === "object" && Array.isArray((parsed as { tasks?: unknown }).tasks)) {
-    return { tasks: (parsed as { tasks: unknown[] }).tasks };
+    const record = parsed as { tasks: unknown[]; defaults?: unknown };
+    const defaults = record.defaults && typeof record.defaults === "object" && !Array.isArray(record.defaults)
+      ? (record.defaults as Record<string, unknown>)
+      : undefined;
+    return { tasks: record.tasks, defaults };
   }
   throw new FabricError("INVALID_INPUT", "tasks file must be a JSON array or an object with a tasks array", false);
 }
@@ -5662,10 +5696,15 @@ function resolveTaskContextPath(projectPath: string, ref: string): string | unde
 }
 
 function secretLikeContextPath(path: string): boolean {
-  const name = basename(path).toLowerCase();
+  const normalized = path.replaceAll("\\", "/");
+  const name = basename(normalized).toLowerCase();
   if (name === ".env" || name.endsWith(".env") || name === "agent-fabric.local.env" || name === "cost-ingest-token") return true;
   if (/\.(pem|key|p12|pfx)$/.test(name)) return true;
-  return /(^|[._-])(secret|secrets|credential|credentials|api-key|private-key|access-token|refresh-token|auth-token)([._-]|$)/.test(name);
+  if (/(^|[._-])(secret|secrets|credential|credentials|api-key|private-key|access-token|refresh-token|auth-token)([._-]|$)/.test(name)) return true;
+  if (normalized.includes("/decisions/") || normalized.startsWith("decisions/") || normalized === "decisions") return true;
+  if (normalized.includes("/.agent-fabric-local/") || normalized.startsWith(".agent-fabric-local/") || normalized === ".agent-fabric-local") return true;
+  if (normalized.includes("/artifacts/") || normalized.startsWith("artifacts/") || normalized === "artifacts") return true;
+  return false;
 }
 
 function formatTaskPacketMarkdown(packet: Record<string, unknown>): string {
@@ -5810,6 +5849,8 @@ type ShellResult = {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  stdoutLogPath?: string;
+  stderrLogPath?: string;
 };
 
 type StructuredWorkerResult = {
@@ -5832,9 +5873,11 @@ async function runShellCommand(
   maxOutputChars: number,
   maxRuntimeMinutes?: number,
   envOverrides: Record<string, string> = {},
-  lifecycle: { onSpawn?: (pid: number) => void } = {}
+  lifecycle: { onSpawn?: (pid: number) => void } = {},
+  logPrefix?: string
 ): Promise<ShellResult> {
   return new Promise((resolve, reject) => {
+    const logs = createShellLogSink(cwd, logPrefix);
     const child = spawn(command, {
       cwd,
       shell: "/bin/bash",
@@ -5866,16 +5909,103 @@ async function runShellCommand(
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
+      logs.writeStdout(chunk);
       stdout = tailText(stdout + chunk, maxOutputChars);
     });
     child.stderr.on("data", (chunk) => {
+      logs.writeStderr(chunk);
       stderr = tailText(stderr + chunk, maxOutputChars);
     });
-    child.on("error", reject);
+    child.on("error", (error) => {
+      void logs.close().finally(() => reject(error));
+    });
     child.on("close", (code, signal) => {
       if (timeout) clearTimeout(timeout);
-      resolve({ exitCode: timedOut ? 124 : (code ?? 1), signal, stdout, stderr, timedOut });
+      void logs.close().finally(() => {
+        resolve({
+          exitCode: timedOut ? 124 : (code ?? 1),
+          signal,
+          stdout,
+          stderr,
+          timedOut,
+          stdoutLogPath: logs.stdoutLogPath,
+          stderrLogPath: logs.stderrLogPath
+        });
+      });
     });
+  });
+}
+
+type ShellLogSink = {
+  stdoutLogPath?: string;
+  stderrLogPath?: string;
+  writeStdout(chunk: string): void;
+  writeStderr(chunk: string): void;
+  close(): Promise<void>;
+};
+
+function createShellLogSink(cwd: string, logPrefix?: string): ShellLogSink {
+  if (!logPrefix) return emptyShellLogSink();
+  const safeStem = logPrefix.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "worker-run";
+  try {
+    const logDir = join(cwd, ".agent-fabric", "logs");
+    mkdirSync(logDir, { recursive: true });
+    const stdoutLogPath = join(logDir, `${safeStem}-stdout.log`);
+    const stderrLogPath = join(logDir, `${safeStem}-stderr.log`);
+    const sink: ShellLogSink = {
+      stdoutLogPath,
+      stderrLogPath,
+      writeStdout: () => undefined,
+      writeStderr: () => undefined,
+      close: async () => undefined
+    };
+    const stdout = createWriteStream(stdoutLogPath, { flags: "w" });
+    const stderr = createWriteStream(stderrLogPath, { flags: "w" });
+    stdout.on("error", () => {
+      sink.stdoutLogPath = undefined;
+    });
+    stderr.on("error", () => {
+      sink.stderrLogPath = undefined;
+    });
+    sink.writeStdout = (chunk) => {
+      if (sink.stdoutLogPath && !stdout.destroyed) stdout.write(chunk);
+    };
+    sink.writeStderr = (chunk) => {
+      if (sink.stderrLogPath && !stderr.destroyed) stderr.write(chunk);
+    };
+    sink.close = async () => {
+      await Promise.all([closeWriteStream(stdout), closeWriteStream(stderr)]);
+    };
+    return sink;
+  } catch {
+    return emptyShellLogSink();
+  }
+}
+
+function emptyShellLogSink(): ShellLogSink {
+  return {
+    writeStdout: () => undefined,
+    writeStderr: () => undefined,
+    close: async () => undefined
+  };
+}
+
+function closeWriteStream(stream: WriteStream): Promise<void> {
+  return new Promise((resolveClose) => {
+    const done = () => {
+      stream.off("error", done);
+      stream.off("finish", done);
+      stream.off("close", done);
+      resolveClose();
+    };
+    stream.once("error", done);
+    stream.once("finish", done);
+    stream.once("close", done);
+    if (stream.writableEnded || stream.destroyed) {
+      done();
+    } else {
+      stream.end();
+    }
   });
 }
 
@@ -5922,13 +6052,72 @@ const SNAPSHOT_SKIP_NAMES = new Set([
   "build",
   "coverage",
   ".cache",
-  ".agent-fabric"
+  ".agent-fabric",
+  "__pycache__"
 ]);
 
-function snapshotFiles(root: string): FileSnapshot {
+const SNAPSHOT_FILE_IGNORE_PATTERNS: readonly string[] = [
+  "*.log",
+  "*.tsbuildinfo",
+  "*.pyc",
+  ".DS_Store",
+  "Thumbs.db"
+];
+
+const ARTIFACT_IGNORE_GLOBS_ENV = "AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS";
+
+export function resolveArtifactIgnoreGlobs(cliGlobs?: string[]): string[] {
+  const merged: string[] = [...SNAPSHOT_FILE_IGNORE_PATTERNS];
+  const envRaw = process.env[ARTIFACT_IGNORE_GLOBS_ENV];
+  if (envRaw) {
+    merged.push(...envRaw.split(/[;,: \t\r\n]+/).map((glob) => glob.trim()).filter(Boolean));
+  }
+  merged.push(...(cliGlobs ?? []).map((glob) => glob.trim()).filter(Boolean));
+  return uniqueStrings(merged);
+}
+
+export function matchesGlob(value: string, pattern: string): boolean {
+  const normalizedValue = value.replaceAll("\\", "/");
+  const normalizedPattern = pattern.trim().replaceAll("\\", "/");
+  if (!normalizedValue || !normalizedPattern) return false;
+  if (!normalizedPattern.includes("*") && !normalizedPattern.includes("?")) {
+    return (
+      normalizedValue === normalizedPattern ||
+      basename(normalizedValue) === normalizedPattern ||
+      normalizedValue.startsWith(`${normalizedPattern}/`)
+    );
+  }
+  const regex = new RegExp(`^${normalizedPattern.split("").map(globCharToRegex).join("")}$`);
+  return regex.test(normalizedValue) || (!normalizedPattern.includes("/") && regex.test(basename(normalizedValue)));
+}
+
+function globCharToRegex(char: string): string {
+  if (char === "*") return ".*";
+  if (char === "?") return ".";
+  return regexEscape(char);
+}
+
+function regexEscape(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function snapshotFiles(root: string, fileIgnoreGlobs: readonly string[] = resolveArtifactIgnoreGlobs()): FileSnapshot {
   const entries = new Map<string, SnapshotEntry>();
   let truncated = false;
   const maxFiles = 10_000;
+  const ignoreCache = new Map<string, boolean>();
+  const ignored = (ref: string): boolean => {
+    for (const glob of fileIgnoreGlobs) {
+      const key = `${glob}\0${ref}`;
+      let cached = ignoreCache.get(key);
+      if (cached === undefined) {
+        cached = matchesGlob(ref, glob);
+        ignoreCache.set(key, cached);
+      }
+      if (cached) return true;
+    }
+    return false;
+  };
   const visit = (dir: string): void => {
     if (entries.size >= maxFiles) {
       truncated = true;
@@ -5943,6 +6132,8 @@ function snapshotFiles(root: string): FileSnapshot {
     for (const name of names) {
       if (SNAPSHOT_SKIP_NAMES.has(name)) continue;
       const path = join(dir, name);
+      const ref = relative(root, path);
+      if (ignored(ref)) continue;
       let stat;
       try {
         stat = statSync(path);
@@ -5952,7 +6143,6 @@ function snapshotFiles(root: string): FileSnapshot {
       if (stat.isDirectory()) {
         visit(path);
       } else if (stat.isFile()) {
-        const ref = relative(root, path);
         entries.set(ref, { size: stat.size, mtimeMs: stat.mtimeMs });
       }
       if (entries.size >= maxFiles) {
@@ -6439,6 +6629,7 @@ type ParsedFlags = {
   reason?: string;
   note?: string;
   rewriteContextRefs?: string[];
+  artifactIgnore?: string[];
 };
 
 function parseFlags(args: string[]): ParsedFlags {
@@ -6575,6 +6766,7 @@ function parseFlags(args: string[]): ParsedFlags {
     else if (arg === "--keep-outputs") flags.keepOutputs = true;
     else if (arg === "--reason") flags.reason = requiredValue(args, ++i, arg);
     else if (arg === "--rewrite-context-ref") flags.rewriteContextRefs = [...(flags.rewriteContextRefs ?? []), requiredValue(args, ++i, arg)];
+    else if (arg === "--artifact-ignore") flags.artifactIgnore = [...(flags.artifactIgnore ?? []), requiredValue(args, ++i, arg)];
     else if (arg === "--remember") flags.remember = true;
     else if (arg === "--note") flags.note = requiredValue(args, ++i, arg);
     else if (arg === "--run-tests") flags.runTests = true;

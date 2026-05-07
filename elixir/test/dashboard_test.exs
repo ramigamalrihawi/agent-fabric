@@ -303,4 +303,74 @@ defmodule AgentFabricOrchestrator.DashboardTest do
       assert cleanup["queue_task_id"] == "pqtask_t"
     end
   end
+
+  # --- UDS Bridge Proxy Endpoints ---
+
+  describe "UDS bridge proxy endpoints" do
+    test "GET /api/worker-health/:queue_id returns durable bridge envelope" do
+      {status, body} = http_get(~c"/api/worker-health/pqueue_test123")
+      assert status == 200
+      {:ok, parsed} = Jason.decode(body)
+      assert parsed["source"] == "durable"
+      assert parsed["source_api"] == "Agent Fabric daemon (UDS bridge)"
+      assert parsed["tool"] == "project_queue_worker_health"
+      assert parsed["queue_id"] == "pqueue_test123"
+      assert is_map(parsed["data"])
+    end
+
+    test "GET /api/task-tail/:queue_id/:queue_task_id returns durable bridge envelope" do
+      {status, body} = http_get(~c"/api/task-tail/pqueue_test123/pqtask_xyz")
+      assert status == 200
+      {:ok, parsed} = Jason.decode(body)
+      assert parsed["source"] == "durable"
+      assert parsed["source_api"] == "Agent Fabric daemon (UDS bridge)"
+      assert parsed["tool"] == "fabric_task_tail"
+      assert parsed["queue_id"] == "pqueue_test123"
+      assert is_map(parsed["data"])
+    end
+
+    test "GET /api/patch-review-plan/:queue_id returns durable bridge envelope" do
+      {status, body} = http_get(~c"/api/patch-review-plan/pqueue_test123")
+      assert status == 200
+      {:ok, parsed} = Jason.decode(body)
+      assert parsed["source"] == "durable"
+      assert parsed["source_api"] == "Agent Fabric daemon (UDS bridge)"
+      assert parsed["tool"] == "project_queue_patch_review_plan"
+      assert parsed["queue_id"] == "pqueue_test123"
+      assert is_map(parsed["data"])
+    end
+
+    test "GET /api/collab-summary/:queue_id returns durable bridge envelope" do
+      {status, body} = http_get(~c"/api/collab-summary/pqueue_test123")
+      assert status == 200
+      {:ok, parsed} = Jason.decode(body)
+      assert parsed["source"] == "durable"
+      assert parsed["source_api"] == "Agent Fabric daemon (UDS bridge)"
+      assert parsed["tool"] == "project_queue_collab_summary"
+      assert parsed["queue_id"] == "pqueue_test123"
+      assert is_map(parsed["data"])
+    end
+
+    test "POST on UDS bridge endpoints returns 405" do
+      for path <- [
+            "/api/worker-health/pq",
+            "/api/task-tail/pq/tk",
+            "/api/patch-review-plan/pq",
+            "/api/collab-summary/pq"
+          ] do
+        {:ok, sock} = :gen_tcp.connect({127, 0, 0, 1}, @test_port, [:binary, active: false], 2000)
+        :gen_tcp.send(sock, "POST #{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+
+        case :gen_tcp.recv(sock, 0, 2000) do
+          {:ok, data} ->
+            assert data =~ "405" or data =~ "Method Not Allowed"
+
+          {:error, _} ->
+            :ok
+        end
+
+        :gen_tcp.close(sock)
+      end
+    end
+  end
 end

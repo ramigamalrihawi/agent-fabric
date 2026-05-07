@@ -15,7 +15,8 @@ defmodule AgentFabricOrchestrator.Dashboard do
   | State Kind | Source | Endpoints |
   |---|---|---|
   | Runtime | `AgentFabricOrchestrator.Orchestrator` GenServer | `/api/status`, `/api/lanes` |
-  | Durable | Agent Fabric daemon (TypeScript, SQLite) | `/api/queue-health/:queue_id` |
+  | Durable (HTTP) | Agent Fabric daemon HTTP (TypeScript, SQLite) | `/api/queue-health/:queue_id` |
+  | Durable (UDS) | Agent Fabric daemon UDS bridge (TypeScript, SQLite) | `/api/worker-health/:id`, `/api/task-tail/:id/:qtid`, `/api/patch-review-plan/:id`, `/api/collab-summary/:id` |
   | Combined | Both sources merged per-request | `/api/progress` |
 
   ## Routes
@@ -30,7 +31,11 @@ defmodule AgentFabricOrchestrator.Dashboard do
       GET /api/failures            — recent runner/poll failures
       GET /api/workspaces          — local workspace cleanup preview
       GET /api/sync-health         — sync health: cursor, failures, terminal cleanup
-      GET /api/queue-health/:id    — proxy to daemon queue health API
+      GET /api/worker-health/:id   — UDS-bridge worker health proxy
+      GET /api/task-tail/:id/:qtid — UDS-bridge task tail proxy
+      GET /api/patch-review-plan/:id — UDS-bridge patch review plan proxy
+      GET /api/collab-summary/:id  — UDS-bridge collab summary proxy
+      GET /api/queue-health/:id    — HTTP proxy to daemon queue health API
 
   ## Legacy API (kept for Phoenix LiveView mount)
 
@@ -43,6 +48,8 @@ defmodule AgentFabricOrchestrator.Dashboard do
   require Logger
 
   @default_port 4574
+
+  alias AgentFabricOrchestrator.FabricGateway
 
   # --- Legacy Snapshot API (kept for Phoenix LiveView mount) ---
 
@@ -449,6 +456,40 @@ defmodule AgentFabricOrchestrator.Dashboard do
     {200, "application/json", json}
   end
 
+  # GET /api/worker-health/:queue_id — UDS-bridge proxy
+  defp route("GET", "/api/worker-health/" <> queue_id) do
+    gateway_proxy("project_queue_worker_health", queue_id, fn socket, session ->
+      FabricGateway.Uds.worker_health(socket, session, queue_id)
+    end)
+  end
+
+  # GET /api/task-tail/:queue_id/:queue_task_id — UDS-bridge proxy
+  defp route("GET", "/api/task-tail/" <> rest) do
+    case String.split(rest, "/", parts: 2) do
+      [queue_id, queue_task_id] ->
+        gateway_proxy("fabric_task_tail", queue_id, fn socket, session ->
+          FabricGateway.Uds.task_tail(socket, session, queue_id, queue_task_id)
+        end)
+
+      _ ->
+        {404, "application/json", Jason.encode!(%{error: "not_found", path: "/api/task-tail/#{rest}"})}
+    end
+  end
+
+  # GET /api/patch-review-plan/:queue_id — UDS-bridge proxy
+  defp route("GET", "/api/patch-review-plan/" <> queue_id) do
+    gateway_proxy("project_queue_patch_review_plan", queue_id, fn socket, session ->
+      FabricGateway.Uds.patch_review_plan(socket, session, queue_id)
+    end)
+  end
+
+  # GET /api/collab-summary/:queue_id — UDS-bridge proxy
+  defp route("GET", "/api/collab-summary/" <> queue_id) do
+    gateway_proxy("project_queue_collab_summary", queue_id, fn socket, session ->
+      FabricGateway.Uds.collab_summary(socket, session, queue_id)
+    end)
+  end
+
   # GET /api/queue-health/:queue_id - durable state from Agent Fabric daemon
   defp route("GET", path) do
     case path do
@@ -488,11 +529,23 @@ defmodule AgentFabricOrchestrator.Dashboard do
   end
 
   defp route(_method, path) do
-    case path do
-      <<"/api/queue-health/", _::binary>> ->
+    cond do
+      String.starts_with?(path, "/api/queue-health/") ->
         {405, "application/json", Jason.encode!(%{error: "method_not_allowed"})}
 
-      _ ->
+      String.starts_with?(path, "/api/worker-health/") ->
+        {405, "application/json", Jason.encode!(%{error: "method_not_allowed"})}
+
+      String.starts_with?(path, "/api/task-tail/") ->
+        {405, "application/json", Jason.encode!(%{error: "method_not_allowed"})}
+
+      String.starts_with?(path, "/api/patch-review-plan/") ->
+        {405, "application/json", Jason.encode!(%{error: "method_not_allowed"})}
+
+      String.starts_with?(path, "/api/collab-summary/") ->
+        {405, "application/json", Jason.encode!(%{error: "method_not_allowed"})}
+
+      true ->
         {404, "application/json", Jason.encode!(%{error: "not_found", path: path})}
     end
   end
@@ -640,6 +693,52 @@ defmodule AgentFabricOrchestrator.Dashboard do
       {:ok, :sys.get_state(orchestrator_name)}
     else
       :not_running
+    end
+  end
+
+  # --- UDS Bridge Proxy ---
+
+  defp gateway_proxy(tool, queue_id, fun) do
+    socket_path = gateway_socket_path()
+
+    result =
+      with {:ok, session} <- FabricGateway.Uds.register(socket_path) do
+        gateway_result = fun.(socket_path, session)
+        _ = FabricGateway.Uds.close_session(socket_path, session)
+        gateway_result
+      end
+
+    body =
+      case result do
+        {:ok, data} ->
+          Jason.encode!(%{
+            source: "durable",
+            source_api: "Agent Fabric daemon (UDS bridge)",
+            tool: tool,
+            queue_id: queue_id,
+            data: data
+          })
+
+        {:error, reason} ->
+          Jason.encode!(%{
+            source: "durable",
+            source_api: "Agent Fabric daemon (UDS bridge)",
+            tool: tool,
+            queue_id: queue_id,
+            data: %{error: "daemon_unavailable", reason: inspect(reason)}
+          })
+      end
+
+    {200, "application/json", body}
+  end
+
+  defp gateway_socket_path do
+    socket_candidate = Application.get_env(:agent_fabric_orchestrator, :socket_path)
+
+    if is_binary(socket_candidate) and socket_candidate != "" do
+      socket_candidate
+    else
+      Path.join([System.user_home!(), ".agent-fabric", "agent.sock"])
     end
   end
 
