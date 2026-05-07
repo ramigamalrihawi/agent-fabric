@@ -939,6 +939,90 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
     end
   end
 
+  describe "sync_health/1" do
+    test "exposes cursor state, failure counts, and issue breakdowns" do
+      workflow = sample_workflow()
+
+      state =
+        struct!(Orchestrator,
+          workflow: workflow,
+          socket_path: stub_socket_path(),
+          concurrency: 4,
+          queue_id: "pqueue_health",
+          state_store_path: "/tmp/health-state.json",
+          consecutive_failures: 2,
+          recent_failures: [%{subject: "poll", reason: "timeout"}],
+          poll_cursor: %{
+            after: "cursor_42",
+            has_next_page: true,
+            wrapped: false,
+            page_size: 50,
+            last_page_count: 12,
+            updated_at: "2026-01-01T00:00:00Z"
+          },
+          issues: %{
+            "ENG-1" => %Orchestrator.IssueRecord{
+              issue: sample_issue(identifier: "ENG-1", state: "Todo"),
+              fabric_task_id: "task_1",
+              queue_task_id: "pqtask_1",
+              status: :queued
+            },
+            "ENG-2" => %Orchestrator.IssueRecord{
+              issue: sample_issue(identifier: "ENG-2", state: "In Progress"),
+              fabric_task_id: "task_2",
+              queue_task_id: "pqtask_2",
+              worker_run_id: "wrun_2",
+              status: :running
+            },
+            "ENG-3" => %Orchestrator.IssueRecord{
+              issue: sample_issue(identifier: "ENG-3", state: "Done"),
+              fabric_task_id: "task_3",
+              queue_task_id: "pqtask_3",
+              workspace_path: "/tmp/ws-done",
+              status: :terminal
+            }
+          }
+        )
+
+      health = Orchestrator.sync_health(state)
+
+      assert health.cursor.after == "cursor_42"
+      assert health.cursor.has_next_page == true
+      assert health.cursor.wrapped == false
+
+      assert health.failures.consecutive == 2
+      assert health.failures.recent_count == 1
+
+      assert health.issues.total == 3
+      assert health.issues.queued == 1
+      assert health.issues.running == 1
+      assert health.issues.terminal == 1
+
+      assert length(health.terminal_cleanup) == 1
+      done = Enum.find(health.terminal_cleanup, &(&1.identifier == "ENG-3"))
+      assert done.workspace_path == "/tmp/ws-done"
+      assert done.fabric_task_id == "task_3"
+      assert done.queue_task_id == "pqtask_3"
+    end
+
+    test "sync_health reports empty terminal cleanup when no terminal issues" do
+      workflow = sample_workflow()
+
+      state =
+        struct!(Orchestrator,
+          workflow: workflow,
+          socket_path: stub_socket_path(),
+          concurrency: 4,
+          issues: %{}
+        )
+
+      health = Orchestrator.sync_health(state)
+      assert health.terminal_cleanup == []
+      assert health.issues.total == 0
+      assert health.issues.terminal == 0
+    end
+  end
+
   # ── legacy sync_once fallback ──────────────────────────────────────────────
 
   describe "sync_once with raw map state" do

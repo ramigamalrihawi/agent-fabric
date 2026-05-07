@@ -202,4 +202,105 @@ defmodule AgentFabricOrchestrator.DashboardTest do
   test "port returns configured port" do
     assert Dashboard.port() == @test_port
   end
+
+  test "GET /api/sync-health returns structured response when orchestrator is not running" do
+    # The /health, /api/status, /api/lanes, /api/progress, /api/workflow,
+    # /api/runners, /api/issues, /api/failures, and /api/workspaces endpoints
+    # return 200 with not-running payloads.  The /api/sync-health endpoint
+    # follows the same contract: it returns 200 with empty data when the
+    # orchestrator is down.
+    {status, body} = http_get(~c"/api/sync-health")
+    assert status == 200
+    {:ok, parsed} = Jason.decode(body)
+    assert parsed["source"] == "runtime"
+    assert parsed["data"]["issues"]["total"] == 0
+  end
+
+  describe "GET /api/sync-health with running orchestrator" do
+    setup do
+      if Process.whereis(AgentFabricOrchestrator.Orchestrator) do
+        flunk("test expects the orchestrator not to be autostarted")
+      end
+
+      workflow = %Workflow{
+        path: "/tmp/WORKFLOW.md",
+        config: %{
+          "agent_fabric" => %{"project_path" => "/tmp/project"},
+          "runner" => %{"concurrency" => 4}
+        },
+        prompt_template: "Work"
+      }
+
+      state = %{
+        workflow: workflow,
+        queue_id: "pqueue_sync_health",
+        concurrency: 4,
+        state_store_path: "/tmp/sync_health.json",
+        active_runners: 1,
+        consecutive_failures: 0,
+        last_error: nil,
+        recent_failures: [],
+        poll_cursor: %{
+          after: "cursor_test",
+          has_next_page: true,
+          wrapped: false,
+          page_size: 25,
+          last_page_count: 10,
+          updated_at: "2026-01-01T00:00:00Z"
+        },
+        issues: %{
+          "ENG-Q" => %{
+            issue: %{title: "Queued issue"},
+            fabric_task_id: "task_q",
+            queue_task_id: "pqtask_q",
+            worker_run_id: nil,
+            workspace_path: "/tmp/ws-q",
+            status: :queued
+          },
+          "ENG-R" => %{
+            issue: %{title: "Running issue"},
+            fabric_task_id: "task_r",
+            queue_task_id: "pqtask_r",
+            worker_run_id: "wrun_r",
+            workspace_path: "/tmp/ws-r",
+            status: :running
+          },
+          "ENG-T" => %{
+            issue: %{title: "Done issue"},
+            fabric_task_id: "task_t",
+            queue_task_id: "pqtask_t",
+            workspace_path: "/tmp/ws-t",
+            status: :terminal
+          }
+        }
+      }
+
+      {:ok, pid} = Agent.start_link(fn -> state end, name: AgentFabricOrchestrator.Orchestrator)
+      on_exit(fn -> if Process.alive?(pid), do: Agent.stop(pid) end)
+      :ok
+    end
+
+    test "returns sync health with cursor, issue counts, and terminal cleanup" do
+      {status, body} = http_get(~c"/api/sync-health")
+      assert status == 200
+      {:ok, parsed} = Jason.decode(body)
+
+      assert parsed["orchestrator_alive"] == true
+      assert parsed["orchestator_alive"] == true
+
+      data = parsed["data"]
+      assert data["cursor"]["after"] == "cursor_test"
+      assert data["cursor"]["has_next_page"] == true
+      assert data["issues"]["total"] == 3
+      assert data["issues"]["queued"] == 1
+      assert data["issues"]["running"] == 1
+      assert data["issues"]["terminal"] == 1
+
+      assert length(data["terminal_cleanup"]) == 1
+      cleanup = Enum.find(data["terminal_cleanup"], &(&1["identifier"] == "ENG-T"))
+      assert cleanup["workspace_path"] == "/tmp/ws-t"
+      assert cleanup["fabric_task_id"] == "task_t"
+      assert cleanup["queue_task_id"] == "pqtask_t"
+    end
+  end
 end

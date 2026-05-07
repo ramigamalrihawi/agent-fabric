@@ -29,6 +29,7 @@ defmodule AgentFabricOrchestrator.Dashboard do
       GET /api/issues              — issue-to-queue mapping
       GET /api/failures            — recent runner/poll failures
       GET /api/workspaces          — local workspace cleanup preview
+      GET /api/sync-health         — sync health: cursor, failures, terminal cleanup
       GET /api/queue-health/:id    — proxy to daemon queue health API
 
   ## Legacy API (kept for Phoenix LiveView mount)
@@ -416,6 +417,38 @@ defmodule AgentFabricOrchestrator.Dashboard do
     {200, "application/json", Jason.encode!(payload)}
   end
 
+  # GET /api/sync-health - sync health: cursor, issues, terminal cleanup guidance
+  defp route("GET", "/api/sync-health") do
+    json =
+      case orchestrator_state() do
+        {:ok, state} ->
+          Jason.encode!(%{
+            source: "runtime",
+            orchestrator_alive: true,
+            orchestator_alive: true,
+            data: AgentFabricOrchestrator.Orchestrator.sync_health(state)
+          })
+
+        :not_running ->
+          Jason.encode!(%{
+            source: "runtime",
+            orchestrator_alive: false,
+            orchestator_alive: false,
+            data: %{
+              cursor: nil,
+              failures: %{consecutive: 0, recent_count: 0},
+              issues: %{total: 0, queued: 0, running: 0, terminal: 0, failed: 0, pending: 0},
+              terminal_cleanup: [],
+              state_store_path: nil,
+              queue_id: nil,
+              generated_at: DateTime.utc_now() |> DateTime.to_iso8601()
+            }
+          })
+      end
+
+    {200, "application/json", json}
+  end
+
   # GET /api/queue-health/:queue_id - durable state from Agent Fabric daemon
   defp route("GET", path) do
     case path do
@@ -448,7 +481,8 @@ defmodule AgentFabricOrchestrator.Dashboard do
               "/api/runners",
               "/api/issues",
               "/api/failures",
-              "/api/workspaces"
+              "/api/workspaces",
+              "/api/sync-health"
             ] do
     {405, "application/json", Jason.encode!(%{error: "method_not_allowed"})}
   end

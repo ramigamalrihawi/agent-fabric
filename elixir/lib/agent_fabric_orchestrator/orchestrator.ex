@@ -1187,7 +1187,64 @@ defmodule AgentFabricOrchestrator.Orchestrator do
       issue_mapping: issue_mapping(state),
       issues_by_status:
         state.issues
-        |> Enum.group_by(fn {_k, v} -> v.status end, fn {_k, v} -> v.issue.identifier end)
+        |> Enum.group_by(fn {_k, v} -> v.status end, fn {_k, v} -> v.issue.identifier end),
+      sync_health: sync_health(state)
+    }
+  end
+
+  @doc """
+  Build a sync health summary exposing cursor state, failure counts,
+  terminal cleanup guidance, and persisted mapping metadata.
+
+  This summary is deterministic across restarts because it reads persisted
+  poll_cursor and issue records from the orchestrator GenServer state (which
+  was restored from the state store on init). Terminal issues retain their
+  workspace_path for operator-guided cleanup without deleting durable Agent
+  Fabric evidence.
+  """
+  @spec sync_health(map()) :: map()
+  def sync_health(state) do
+    issues = state.issues || %{}
+    status_groups =
+      Enum.group_by(issues, fn {_id, rec} -> rec.status end, fn {id, _rec} -> id end)
+
+    terminal_cleanup =
+      (status_groups[:terminal] || [])
+      |> Enum.map(fn id ->
+        rec = Map.get(issues, id)
+        %{
+          identifier: id,
+          workspace_path: rec.workspace_path,
+          fabric_task_id: rec.fabric_task_id,
+          queue_task_id: rec.queue_task_id
+        }
+      end)
+
+    %{
+      cursor: %{
+        after: state.poll_cursor && (state.poll_cursor[:after] || state.poll_cursor["after"]),
+        has_next_page: state.poll_cursor && (state.poll_cursor[:has_next_page] || state.poll_cursor["has_next_page"] || false),
+        wrapped: state.poll_cursor && (state.poll_cursor[:wrapped] || state.poll_cursor["wrapped"] || false),
+        page_size: state.poll_cursor && (state.poll_cursor[:page_size] || state.poll_cursor["page_size"]),
+        last_page_count: state.poll_cursor && (state.poll_cursor[:last_page_count] || state.poll_cursor["last_page_count"] || 0),
+        updated_at: state.poll_cursor && (state.poll_cursor[:updated_at] || state.poll_cursor["updated_at"])
+      },
+      failures: %{
+        consecutive: state.consecutive_failures || 0,
+        recent_count: length(state.recent_failures || [])
+      },
+      issues: %{
+        total: map_size(issues),
+        queued: length(status_groups[:queued] || []),
+        running: length(status_groups[:running] || []),
+        terminal: length(status_groups[:terminal] || []),
+        failed: length(status_groups[:failed] || []),
+        pending: length(status_groups[:pending] || [])
+      },
+      terminal_cleanup: terminal_cleanup,
+      state_store_path: state.state_store_path,
+      queue_id: state.queue_id,
+      generated_at: DateTime.utc_now() |> DateTime.to_iso8601()
     }
   end
 
