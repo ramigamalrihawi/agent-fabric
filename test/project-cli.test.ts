@@ -271,6 +271,12 @@ describe("project CLI runner", () => {
       worker: "jcode-deepseek",
       taskPacketDir: "/tmp/packets"
     });
+    expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1", "--worker", "codex-app-server", "--command-template", "codex app-server run"])).toMatchObject({
+      command: "run-ready",
+      queueId: "pqueue_1",
+      worker: "codex-app-server",
+      commandTemplate: "codex app-server run"
+    });
     expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1", "--parallel", "20"])).toMatchObject({
       command: "run-ready",
       queueId: "pqueue_1",
@@ -626,6 +632,9 @@ describe("project CLI runner", () => {
     process.env.AGENT_FABRIC_SENIOR_MODE = "permissive";
 
     expect(() => parseProjectCliArgs(["run-ready", "--queue", "pqueue_1", "--worker", "local-cli"])).toThrow(
+      "must use Agent Fabric queue-backed DeepSeek workers"
+    );
+    expect(() => parseProjectCliArgs(["run-ready", "--queue", "pqueue_1", "--worker", "codex-app-server"])).toThrow(
       "must use Agent Fabric queue-backed DeepSeek workers"
     );
     expect(() =>

@@ -256,6 +256,39 @@ describe("worker/task substrate", () => {
     expect(resume.data).toMatchObject({ workspacePath: "/tmp/workspace", modelProfile: "research.cheap", contextPolicy: "read_only_project_mining" });
     daemon.close();
   });
+
+  it("accepts codex-app-server as a queue-visible worker type", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createTask(daemon, session, "task-codex-app-server-create");
+    if (!created.ok) throw new Error("task create failed");
+
+    const started = daemon.callTool(
+      "fabric_task_start_worker",
+      {
+        taskId: created.data.taskId,
+        worker: "codex-app-server",
+        projectPath: "/tmp/workspace",
+        workspaceMode: "git_worktree",
+        workspacePath: "/tmp/worktrees/codex-app-server",
+        modelProfile: "codex.app-server",
+        contextPolicy: "workflow:linear",
+        command: ["codex", "app-server", "run", "--fabric-task", created.data.taskId],
+        metadata: { runner: "elixir-orchestrator" }
+      },
+      contextFor(session, "task-codex-app-server-start")
+    );
+
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("codex-app-server worker start failed");
+    expect(started.data).toMatchObject({ taskId: created.data.taskId, status: "running", workspacePath: "/tmp/worktrees/codex-app-server" });
+
+    const resume = daemon.callTool("fabric_task_resume", { taskId: created.data.taskId, preferredWorker: "codex-app-server" }, contextFor(session));
+    expect(resume.ok).toBe(true);
+    if (!resume.ok) throw new Error("codex-app-server resume failed");
+    expect(resume.data).toMatchObject({ workspacePath: "/tmp/worktrees/codex-app-server", modelProfile: "codex.app-server", contextPolicy: "workflow:linear" });
+    daemon.close();
+  });
 });
 
 function createTask(daemon: FabricDaemon, session: { sessionId: string; sessionToken: string }, idempotencyKey: string) {

@@ -14,6 +14,7 @@ Agent Fabric is currently an early local-first control plane. The implemented ba
 - Typed memory review, confirmation, invalidation, and outcome hooks.
 - Local command center over daemon APIs.
 - Optional DeepSeek-direct worker lanes with task-packet scanning.
+- Additive Elixir orchestration preview with `WORKFLOW.md` parsing, Linear issue normalization, deterministic workspace setup, Codex App Server runner lifecycle glue, and read-only dashboard projection.
 - Tests for the current daemon, CLI, queue, worker, cost, memory, collab, and desktop surfaces.
 
 ## Near-Term
@@ -24,6 +25,7 @@ Agent Fabric is currently an early local-first control plane. The implemented ba
 - Connection limits and metrics for live fan-out.
 - More queue recipes for common implementation/review workflows.
 - Patch-review UX improvements.
+- Harden the Elixir orchestrator into a full runtime: real Linear sync state, supervised runner pools, Phoenix LiveView monitoring, and queue-visible Codex App Server launch recipes.
 - First-class manager-run lifecycle entities if task labels and worker-run metadata stop being enough for phase managers.
 
 ## Later

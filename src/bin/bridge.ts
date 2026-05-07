@@ -406,21 +406,21 @@ proxyTool("project_queue_task_detail", "Read one queue task drawer/detail model 
   queueId: z.string(),
   queueTaskId: z.string(),
   includeResume: z.boolean().optional(),
-  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional(),
+  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "codex-app-server", "deepseek-direct", "jcode-deepseek", "manual"]).optional(),
   maxEventsPerRun: z.number().int().positive().optional(),
   maxModelApprovals: z.number().int().positive().optional()
 });
 proxyTool("project_queue_resume_task", "Build a queue-level resume packet from the latest worker checkpoint.", {
   queueId: z.string(),
   queueTaskId: z.string(),
-  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional()
+  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "codex-app-server", "deepseek-direct", "jcode-deepseek", "manual"]).optional()
 });
 proxyTool("project_queue_task_packet", "Build a copyable queue task or resume packet for worker handoff.", {
   queueId: z.string(),
   queueTaskId: z.string(),
   format: z.enum(["json", "markdown"]).optional(),
   includeResume: z.boolean().optional(),
-  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional(),
+  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "codex-app-server", "deepseek-direct", "jcode-deepseek", "manual"]).optional(),
   workspaceMode: z.enum(["in_place", "git_worktree", "clone", "sandbox"]).optional(),
   workspacePath: z.string().optional(),
   modelProfile: z.string().optional(),
@@ -492,7 +492,7 @@ proxyTool("project_queue_validate_context_refs", "Validate required context refs
 proxyTool("project_queue_claim_next", "Atomically claim one dependency-free ready queue task for a worker gateway.", {
   queueId: z.string(),
   workerRunId: z.string().optional(),
-  worker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional(),
+  worker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "codex-app-server", "deepseek-direct", "jcode-deepseek", "manual"]).optional(),
   workspaceMode: z.enum(["in_place", "git_worktree", "clone", "sandbox"]).optional(),
   workspacePath: z.string().optional(),
   modelProfile: z.string().optional(),
@@ -660,7 +660,7 @@ proxyTool("fabric_task_create", "Create a durable fabric task before assigning i
 });
 proxyTool("fabric_task_start_worker", "Start or register an external worker run for a durable fabric task.", {
   taskId: z.string(),
-  worker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]),
+  worker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "codex-app-server", "deepseek-direct", "jcode-deepseek", "manual"]),
   projectPath: z.string(),
   workspaceMode: z.enum(["in_place", "git_worktree", "clone", "sandbox"]),
   modelProfile: z.string(),
@@ -677,6 +677,7 @@ proxyTool("fabric_task_event", "Append one external worker event to a durable fa
     "started",
     "thought_summary",
     "file_changed",
+    "command_spawned",
     "command_started",
     "command_finished",
     "test_result",
@@ -710,7 +711,7 @@ proxyTool("fabric_task_status", "Read durable task, worker run, event, and check
 });
 proxyTool("fabric_task_resume", "Return the smallest useful prompt/state for a worker to continue a durable task.", {
   taskId: z.string(),
-  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"]).optional()
+  preferredWorker: z.enum(["ramicode", "local-cli", "openhands", "aider", "smolagents", "codex-app-server", "deepseek-direct", "jcode-deepseek", "manual"]).optional()
 });
 proxyTool("fabric_task_finish", "Mark a durable fabric task completed, failed, or canceled.", {
   taskId: z.string(),

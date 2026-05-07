@@ -351,7 +351,7 @@ Read the task drawer/detail model for one queue task. This is the focused Deskto
   queueId: string;
   queueTaskId: string;
   includeResume?: boolean; // include a recovery packet from fabric_task_resume
-  preferredWorker?: "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "manual";
+  preferredWorker?: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "codex-app-server" | "deepseek-direct" | "jcode-deepseek" | "manual";
   maxEventsPerRun?: number; // default 10, max 50
   maxModelApprovals?: number; // default 25, max 200
 }
@@ -579,7 +579,7 @@ Build a queue-level resume packet for one task by combining queue metadata, queu
 {
   queueId: string;
   queueTaskId: string;
-  preferredWorker?: "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "manual";
+  preferredWorker?: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "codex-app-server" | "deepseek-direct" | "jcode-deepseek" | "manual";
 }
 ```
 
@@ -836,7 +836,7 @@ Use `skipQueueTaskIds` when a launcher is trying to fill multiple worker slots a
 {
   queueId: string;
   workerRunId?: string;
-  worker?: "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "manual";
+  worker?: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "codex-app-server" | "deepseek-direct" | "jcode-deepseek" | "manual";
   workspaceMode?: "in_place" | "git_worktree" | "clone" | "sandbox";
   workspacePath?: string;
   modelProfile?: string;

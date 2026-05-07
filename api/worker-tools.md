@@ -82,7 +82,7 @@ Start or register a worker run.
 ```ts
 {
   taskId: string;
-  worker: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "jcode-deepseek" | "manual";
+  worker: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "codex-app-server" | "deepseek-direct" | "jcode-deepseek" | "manual";
   projectPath: string;
   workspaceMode: "in_place" | "git_worktree" | "clone" | "sandbox";
   modelProfile: string;
@@ -249,7 +249,7 @@ Return the smallest useful state needed for a worker to continue.
 ```ts
 {
   taskId: string;
-  preferredWorker?: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "jcode-deepseek" | "manual";
+  preferredWorker?: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "codex-app-server" | "deepseek-direct" | "jcode-deepseek" | "manual";
 }
 ```
 
@@ -328,6 +328,7 @@ Status transitions are intentionally conservative:
 | OpenHands | `git_worktree` | Keep the dirty main workspace safe and review patch results before merge. |
 | Aider | `git_worktree` | Good patch worker; isolation avoids accidental dirty-state collisions. |
 | smolagents | `sandbox` or read-only `in_place` | Lightweight Python worker for project mining, context inspection, memory-candidate extraction, and explicit pending-review memory writes; no file edits unless later sandboxed. |
+| Codex App Server | `git_worktree` | External Codex App Server style runners can be supervised by the Elixir orchestrator while Agent Fabric records worker lifecycle, checkpoints, artifacts, and review state. |
 | DeepSeek direct | `sandbox` or prepared `git_worktree` | Direct API implementer/reviewer/adjudicator reports should stay isolated and evidence-backed before integration; sandbox dirs can be auto-created, while git worktrees must be prepared outside this runner. |
 
 ## Initial DeepSeek direct adapter behavior

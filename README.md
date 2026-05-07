@@ -106,6 +106,7 @@ Project CLI JSON output redacts approval/session token fields before printing. U
 - **Cost control:** model preflight, budget checks, approval tokens, context inspection, provider spend ingestion, anomaly detection, and coverage reporting.
 - **Command center:** local browser console over the same daemon APIs for queues, approvals, lanes, memory review, and patch review.
 - **DeepSeek side lanes:** optional direct DeepSeek worker adapter for high-context planning, implementation, review, risk review, and adjudication tasks, with normal-mode sensitive-context scanning and Senior-mode permissive context when enabled.
+- **Elixir orchestration preview:** additive OTP modules can parse `WORKFLOW.md`, normalize Linear issues, prepare deterministic workspaces, supervise Codex App Server style runners, and report lifecycle state back to the TypeScript daemon.
 - **MCP bridge:** stdio MCP surface so IDEs and harnesses can call Agent Fabric tools.
 
 ## Architecture
@@ -113,6 +114,7 @@ Project CLI JSON output redacts approval/session token fields before printing. U
 ```mermaid
 flowchart TD
   Supervisor["Senior harness\nCodex, Claude Code, local IDE"]
+  Elixir["Elixir orchestrator\nLinear, workspaces, Codex App Server"]
   Queue["Agent Fabric project queue\nDAG, grants, risk, status"]
   Workers["Worker lanes\nDeepSeek, OpenHands, Aider, custom CLI"]
   Reviewers["Reviewer lanes\ncode, risk, tests, docs"]
@@ -124,6 +126,8 @@ flowchart TD
   Cost["Cost preflight"]
 
   Supervisor --> Queue
+  Elixir --> Queue
+  Elixir --> Workers
   Queue --> Workers
   Workers --> Reviewers
   Reviewers --> Gate
@@ -278,6 +282,7 @@ See [docs/examples/worker-result.json](docs/examples/worker-result.json) for the
 - [Example task packet](docs/examples/task-packet.md)
 - [Example worker result](docs/examples/worker-result.json)
 - [Copy-ready team post](docs/public-feedback-post.md)
+- [Elixir OTP hybrid orchestrator](elixir/README.md) — OTP supervisory layer running alongside the TypeScript daemon
 
 Useful feedback right now:
 
@@ -296,6 +301,7 @@ Useful feedback right now:
 | `api/` | public tool surface notes |
 | `pillars/` | design notes for collaboration, memory, and cost pillars |
 | `workers/` | optional worker adapters |
+| `elixir/` | Elixir OTP hybrid orchestrator layer (supervision, lane management; TypeScript daemon is canonical) |
 
 Local ignored files may include `agent-fabric.local.env`, `decisions/`,
 `.agent-fabric-local/`, and generated `artifacts/`. Agents should read local
@@ -325,6 +331,7 @@ This is an early but working local-first implementation. The test suite covers t
 | Memory review and guarded memory injection | Working |
 | Browser command center | Working, early UI |
 | DeepSeek direct sidecar worker | Working, optional |
+| Elixir OTP hybrid orchestrator layer | Preview, early |
 | Cross-machine sync | Future |
 | Hosted multi-user service | Non-goal |
 

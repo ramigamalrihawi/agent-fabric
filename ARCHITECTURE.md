@@ -18,6 +18,7 @@ senior harness / client
 - **SQLite is canonical.** Live pushes, generated markdown views, and worker packets are projections.
 - **Durable first.** Mutations commit before best-effort fan-out or external worker activity.
 - **Runtime agnostic.** Agent Fabric tracks work; coding harnesses perform the work.
+- **Hybrid orchestration allowed.** Elixir can supervise long-lived tracker and runner processes, but it must use Agent Fabric APIs rather than writing SQLite directly.
 - **Senior model stays in judgment.** Premium supervisor lanes can coordinate cheaper parallel workers while retaining final patch and risk decisions.
 - **Idempotent mutation surface.** Session-scoped idempotency keys protect callers from retry duplication.
 - **Explicit trust gates.** Model calls, tool grants, worker patches, and memory promotion can require approval.
@@ -35,6 +36,12 @@ Agent Fabric supports a supervisor-worker pattern for high-quality work at lower
 6. The senior harness reviews the evidence, accepts or rejects findings, runs final checks, and hands off the result.
 
 This keeps expensive senior-model tokens focused on judgment while allowing liberal DeepSeek token use for breadth, adversarial review, and long-context investigation.
+
+## Elixir Orchestration Layer
+
+The `elixir/` application is an optional runtime layer inspired by Symphony-style issue automation. It loads a repo-owned `WORKFLOW.md`, normalizes Linear issues, derives per-issue workspaces, supervises Codex App Server style worker processes, and projects progress into a lightweight dashboard shape.
+
+It does not replace the TypeScript daemon, SQLite migrations, approvals, cost controls, patch review, memory, or queue scheduling. Elixir may own processes, timers, and runner supervision; Agent Fabric remains the source of truth for tasks, worker runs, lifecycle events, heartbeats, checkpoints, artifacts, and final review state.
 
 High-scale Senior queues are organized around lightweight orchestration labels rather than raw transcript replay. Queue tasks can carry `managerId`, `parentManagerId`, `parentQueueId`, `phase`, `workstream`, `costCenter`, and `escalationTarget`; worker runs inherit those labels for card projection and reporting. `fabric_list_agents` paginates and groups cards, `project_queue_progress_report` returns a bounded `managerSummary`, and cost summaries separate senior, manager, and worker spend where worker events report cost data. These projections let Codex, Claude Code, desktop views, and future plugin surfaces supervise hundreds of lanes without forcing the senior model to read every raw worker log.
 

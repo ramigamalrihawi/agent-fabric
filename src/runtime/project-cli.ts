@@ -8,7 +8,16 @@ import { formatLocalConfigDoctor, runLocalConfigDoctor } from "./local-config-do
 import { defaultMaxEventsPerLane, seniorDefaultLaneCount, seniorMaxLaneCount } from "./limits.js";
 import { applyPatchWithSystemPatch, checkPatchWithSystemPatch, validateGitStylePatch } from "./patches.js";
 
-type WorkerKind = "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "jcode-deepseek" | "manual";
+type WorkerKind =
+  | "ramicode"
+  | "local-cli"
+  | "openhands"
+  | "aider"
+  | "smolagents"
+  | "codex-app-server"
+  | "deepseek-direct"
+  | "jcode-deepseek"
+  | "manual";
 type CwdPrepMode = "auto" | "none" | "mkdir";
 type DeepSeekRole = "auto" | "implementer" | "reviewer" | "risk-reviewer" | "adjudicator" | "planner";
 type SensitiveContextMode = "basic" | "strict" | "off";
@@ -1973,7 +1982,7 @@ export function projectHelp(): string {
     "  agent-fabric-project generate-tasks --queue <id> --plan-file <file> [--model-alias <alias>] [--approval-token <token>] [--tasks-file <file>] [--approve-queue] [--json]",
     "  agent-fabric-project review-queue --queue <id> [--approve-queue] [--json]",
     "  agent-fabric-project decide-queue --queue <id> --decision accept_improved_prompt|request_prompt_revision|accept_plan|request_plan_revision|approve_queue|start_execution|pause|resume|cancel|complete [--note <text>] [--json]",
-    "  agent-fabric-project claim-next --queue <id> [--worker-run <workerRunId>] [--worker ramicode|local-cli|openhands|aider|smolagents|deepseek-direct|jcode-deepseek|manual] [--workspace-mode in_place|git_worktree|clone|sandbox] [--workspace-path <path>] [--model-profile <alias>] [--context-policy <policy>] [--command <cmd>] [--json]",
+    "  agent-fabric-project claim-next --queue <id> [--worker-run <workerRunId>] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--workspace-mode in_place|git_worktree|clone|sandbox] [--workspace-path <path>] [--model-profile <alias>] [--context-policy <policy>] [--command <cmd>] [--json]",
     "  agent-fabric-project prepare-ready --queue <id> [--limit <n>] [--json]",
     "  agent-fabric-project recover-stale --queue <id> [--stale-after-minutes <n>] [--recovery-action requeue|fail] [--dry-run] [--json]",
     "  agent-fabric-project retry-task --queue <id> --queue-task <queueTaskId> [--reason <text>] [--keep-outputs] [--json]",
@@ -1993,17 +2002,17 @@ export function projectHelp(): string {
     "  agent-fabric-project fabric-accept-patch --queue <id> [--agent <@af/handle>|--queue-task <id>] --reviewed-by <name> --review-summary <text> [--json]",
     "  agent-fabric-project dashboard --queue <id> [--include-completed] [--max-events <n>] [--json]",
     "  agent-fabric-project review-matrix --queue <id> [--limit <n>] [--json]",
-    "  agent-fabric-project task-detail --queue <id> --queue-task <queueTaskId> [--include-resume] [--worker ramicode|local-cli|openhands|aider|smolagents|deepseek-direct|jcode-deepseek|manual] [--max-events <n>] [--json]",
+    "  agent-fabric-project task-detail --queue <id> --queue-task <queueTaskId> [--include-resume] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--max-events <n>] [--json]",
     "  agent-fabric-project timeline --queue <id> [--limit <n>] [--json]",
     "  agent-fabric-project review-patches --queue <id> [--accept-task <queueTaskId>] [--apply-patch] [--apply-cwd <path>] [--json]",
     "  agent-fabric-project write-task-packets --queue <id> --out-dir <dir> [--format json|markdown] [--ready-only] [--json]",
-    "  agent-fabric-project resume-task --queue <id> --queue-task <queueTaskId> [--worker ramicode|local-cli|openhands|aider|smolagents|deepseek-direct|jcode-deepseek|manual] [--output-file <file>] [--format json|markdown] [--json]",
+    "  agent-fabric-project resume-task --queue <id> --queue-task <queueTaskId> [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--output-file <file>] [--format json|markdown] [--json]",
     "  agent-fabric-project run-task --queue <id> --queue-task <queueTaskId> --command <cmd> [--cwd <path>] [--cwd-prep auto|none|mkdir] [--task-packet <path>] [--task-packet-format json|markdown] [--approval-token <token>] [--approve-tool-context] [--remember-tool-context] [--success-status patch_ready|completed] [--json]",
-    "  agent-fabric-project run-ready --queue <id> [--project <path>] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--adaptive-rate-limit] [--command-template <cmd>] [--cwd-template <path>] [--cwd-prep auto|none|mkdir] [--task-packet-dir <dir>] [--task-packet-format json|markdown] [--worker ramicode|local-cli|openhands|aider|smolagents|deepseek-direct|jcode-deepseek|manual] [--approval-token <token>] [--approve-tool-context] [--allow-concurrent-runner] [--continue-on-failure] [--json]",
+    "  agent-fabric-project run-ready --queue <id> [--project <path>] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--adaptive-rate-limit] [--command-template <cmd>] [--cwd-template <path>] [--cwd-prep auto|none|mkdir] [--task-packet-dir <dir>] [--task-packet-format json|markdown] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--approval-token <token>] [--approve-tool-context] [--allow-concurrent-runner] [--continue-on-failure] [--json]",
     "  agent-fabric-project factory-run --queue <id> [--start-execution] [--dry-run] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--task-packet-dir <dir>] [--cwd-template <path>] [--deepseek-worker-command <cmd>] [--deepseek-role auto|implementer|reviewer|risk-reviewer|adjudicator|planner] [--sensitive-context-mode basic|strict|off] [--patch-mode report|write] [--approval-token <token>|--approve-model-calls] [--approve-tool-context] [--allow-sensitive-context] [--allow-concurrent-runner] [--continue-on-failure] [--no-adaptive-rate-limit] [--json]",
     "  agent-fabric-project launch-plan --queue <id> [--limit <n>] [--json]",
     "  agent-fabric-project status --queue <id> [--json]",
-    "  agent-fabric-project launch --queue <id> [--limit <n>] [--worker ramicode|local-cli|openhands|aider|smolagents|deepseek-direct|jcode-deepseek|manual] [--workspace-mode in_place|git_worktree|clone|sandbox] [--model-profile <alias>] [--workspace-path <path>] [--max-runtime-minutes <n>] [--json]",
+    "  agent-fabric-project launch --queue <id> [--limit <n>] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--workspace-mode in_place|git_worktree|clone|sandbox] [--model-profile <alias>] [--workspace-path <path>] [--max-runtime-minutes <n>] [--json]",
     "  agent-fabric-project approve-tool <proposalId> [--remember] [--note <text>] [--json]",
     "  agent-fabric-project decide-tool <proposalId> --decision approve|reject|revise [--remember] [--note <text>] [--json]",
     "  agent-fabric-project set-tool-policy --project <path> --kind mcp_server|tool|memory|context --value <value> --status approved|rejected [--json]",
@@ -6104,8 +6113,14 @@ function parseOutputFormat(value: string): "markdown" | "adr" {
 }
 
 function parseWorker(value: string): WorkerKind {
-  if (["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"].includes(value)) return value as WorkerKind;
-  throw new FabricError("INVALID_INPUT", "worker must be ramicode, local-cli, openhands, aider, smolagents, deepseek-direct, jcode-deepseek, or manual", false);
+  if (["ramicode", "local-cli", "openhands", "aider", "smolagents", "codex-app-server", "deepseek-direct", "jcode-deepseek", "manual"].includes(value)) {
+    return value as WorkerKind;
+  }
+  throw new FabricError(
+    "INVALID_INPUT",
+    "worker must be ramicode, local-cli, openhands, aider, smolagents, codex-app-server, deepseek-direct, jcode-deepseek, or manual",
+    false
+  );
 }
 
 function parseCodexBridgeWorker(value: string): "deepseek-direct" | "jcode-deepseek" {

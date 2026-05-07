@@ -45,6 +45,7 @@ Cards must be process-evidence based. Native projections should show `planned`, 
 - Native Codex or Claude helper agents do not count as DeepSeek workers unless registered as Agent Fabric worker runs.
 - Mutating workers use `git_worktree`; report-only planner/reviewer workers may use `sandbox`.
 - DeepSeek Senior execution workers are `deepseek-direct` or `jcode-deepseek`.
+- `codex-app-server` is a generic worker kind for externally supervised Codex App Server style runners. It can be recorded in worker lifecycle APIs, but it is not a DeepSeek Senior lane and does not satisfy requested DeepSeek worker counts.
 - Use `research-planner` for report-only DeepSeek planner/reviewer routing; pair it with `sandbox` when the target project is not a Git checkout.
 - Local operator preference may set `AGENT_FABRIC_SENIOR_DEFAULT_WORKER=jcode-deepseek` so broad implementation lanes use Jcode by default; use `--worker deepseek-direct` explicitly for cheaper one-shot planning/review lanes.
 - Patch-ready output must stay pending until a senior review records `reviewedBy` and `reviewSummary`.

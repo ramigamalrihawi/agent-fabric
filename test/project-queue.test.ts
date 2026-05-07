@@ -1380,6 +1380,21 @@ describe("project queue substrate", () => {
       requiredMcpServers: ["github"]
     });
 
+    const codexPacket = daemon.callTool(
+      "project_queue_task_packet",
+      {
+        queueId: created.data.queueId,
+        queueTaskId: bridgeTask.queueTaskId,
+        preferredWorker: "codex-app-server",
+        workspaceMode: "git_worktree",
+        modelProfile: "codex.app-server"
+      },
+      contextFor(session, "task-packet-codex-app-server")
+    );
+    expect(codexPacket.ok).toBe(true);
+    if (!codexPacket.ok) throw new Error("codex app server task packet failed");
+    expect(codexPacket.data.handoff.commands[1].command).toContain("--worker codex-app-server");
+
     const patchReady = daemon.callTool(
       "project_queue_update_task",
       {

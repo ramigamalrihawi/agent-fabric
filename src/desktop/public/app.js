@@ -477,7 +477,9 @@ function normalizeClaimDefaults(defaults = {}) {
   const maxRuntime = Number(defaults.maxRuntimeMinutes);
   const batchLimit = Number(defaults.batchLimit);
   return {
-    worker: ["ramicode", "local-cli", "openhands", "aider", "smolagents", "deepseek-direct", "jcode-deepseek", "manual"].includes(defaults.worker) ? defaults.worker : SENIOR_CLAIM_DEFAULTS.worker,
+    worker: ["ramicode", "local-cli", "openhands", "aider", "smolagents", "codex-app-server", "deepseek-direct", "jcode-deepseek", "manual"].includes(defaults.worker)
+      ? defaults.worker
+      : SENIOR_CLAIM_DEFAULTS.worker,
     workspaceMode: ["git_worktree", "in_place", "clone", "sandbox"].includes(defaults.workspaceMode) ? defaults.workspaceMode : SENIOR_CLAIM_DEFAULTS.workspaceMode,
     workspacePath: typeof defaults.workspacePath === "string" ? defaults.workspacePath : "",
     modelProfile: typeof defaults.modelProfile === "string" && defaults.modelProfile.trim() ? defaults.modelProfile.trim() : SENIOR_CLAIM_DEFAULTS.modelProfile,
@@ -580,6 +582,7 @@ function claimWorkerOptionsHtml(current) {
     ["openhands", "OpenHands"],
     ["aider", "Aider"],
     ["smolagents", "smolagents"],
+    ["codex-app-server", "Codex App Server"],
     ["deepseek-direct", "DeepSeek direct"],
     ["jcode-deepseek", "Jcode DeepSeek"],
     ["manual", "Manual"]
