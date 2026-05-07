@@ -25,6 +25,7 @@ defmodule AgentFabricOrchestrator.IssueTaskPlanner do
     defaults = Workflow.task_defaults(config)
     labels = issue.labels || []
     parsed = parse_description(issue.description)
+    manager_id = manager(defaults, labels)
 
     expected_files =
       unique_strings(
@@ -45,6 +46,7 @@ defmodule AgentFabricOrchestrator.IssueTaskPlanner do
       unique_strings(
         list_default(defaults, "acceptance_criteria") ++
           parsed.acceptance_criteria ++
+          Enum.map(parsed.verification_hints, &"Verification: #{&1}") ++
           quality_acceptance(prompt)
       )
 
@@ -65,28 +67,32 @@ defmodule AgentFabricOrchestrator.IssueTaskPlanner do
       requiredMcpServers: list_default(defaults, "required_mcp_servers"),
       requiredMemories: list_default(defaults, "required_memories"),
       requiredContextRefs: context_refs,
-      dependsOn: []
+      dependsOn: parsed.dependencies
     }
+    |> put_optional(:managerId, manager_id)
   end
 
   @doc """
   Extract worker-facing hints from issue Markdown.
 
   Supported headings are intentionally small and predictable:
-  `Expected files`, `Context refs`, and `Acceptance criteria`.
+  `Expected files`, `Context refs`, `Dependencies`, `Verification hints`, and
+  `Acceptance criteria`.
   """
   @spec parse_description(String.t() | nil) :: %{
           expected_files: [String.t()],
           context_refs: [String.t()],
-          acceptance_criteria: [String.t()]
+          acceptance_criteria: [String.t()],
+          dependencies: [String.t()],
+          verification_hints: [String.t()]
         }
-  def parse_description(nil), do: %{expected_files: [], context_refs: [], acceptance_criteria: []}
+  def parse_description(nil), do: empty_parsed_description()
 
   def parse_description(description) when is_binary(description) do
     description
     |> String.split(~r/\R/)
     |> Enum.reduce(
-      {nil, %{expected_files: [], context_refs: [], acceptance_criteria: []}},
+      {nil, empty_parsed_description()},
       fn line, {section, acc} ->
         trimmed = String.trim(line)
 
@@ -107,6 +113,12 @@ defmodule AgentFabricOrchestrator.IssueTaskPlanner do
 
               {:acceptance_criteria, value} ->
                 {section, update_in(acc.acceptance_criteria, &[value | &1])}
+
+              {:dependencies, value} ->
+                {section, update_in(acc.dependencies, &[value | &1])}
+
+              {:verification_hints, value} ->
+                {section, update_in(acc.verification_hints, &[value | &1])}
             end
 
           next_section ->
@@ -168,6 +180,12 @@ defmodule AgentFabricOrchestrator.IssueTaskPlanner do
   defp category(defaults, labels) do
     label_value(labels, ["category", "type", "kind"]) ||
       string_default(defaults, "category", "implementation")
+  end
+
+  defp manager(defaults, labels) do
+    label_value(labels, ["manager", "manager-id", "manager_id"]) ||
+      string_default(defaults, "manager_id", nil) ||
+      string_default(defaults, "manager", nil)
   end
 
   defp workstream(defaults, labels, issue) do
@@ -267,6 +285,12 @@ defmodule AgentFabricOrchestrator.IssueTaskPlanner do
       line in ["acceptance criteria", "acceptance", "done when", "definition of done"] ->
         :acceptance_criteria
 
+      line in ["dependencies", "depends on", "deps", "blocked by"] ->
+        :dependencies
+
+      line in ["verification", "verification hints", "test hints", "validation"] ->
+        :verification_hints
+
       true ->
         nil
     end
@@ -321,4 +345,18 @@ defmodule AgentFabricOrchestrator.IssueTaskPlanner do
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
   end
+
+  defp empty_parsed_description do
+    %{
+      expected_files: [],
+      context_refs: [],
+      acceptance_criteria: [],
+      dependencies: [],
+      verification_hints: []
+    }
+  end
+
+  defp put_optional(task, _key, nil), do: task
+  defp put_optional(task, _key, ""), do: task
+  defp put_optional(task, key, value), do: Map.put(task, key, value)
 end

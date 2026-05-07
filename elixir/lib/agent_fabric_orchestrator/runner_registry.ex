@@ -23,6 +23,7 @@ defmodule AgentFabricOrchestrator.RunnerRegistry do
   def register(issue_identifier, pid) do
     ensure_table()
     :ets.insert(@table_name, {issue_identifier, pid})
+    :ok
   end
 
   @doc "Look up a runner pid by issue identifier."
@@ -45,5 +46,11 @@ defmodule AgentFabricOrchestrator.RunnerRegistry do
   def list do
     ensure_table()
     :ets.select(@table_name, [{{:"$1", :_}, [], [:"$1"]}])
+  end
+
+  @doc "Return all registered issue identifiers with their runner pids."
+  def entries do
+    ensure_table()
+    :ets.tab2list(@table_name)
   end
 end

@@ -435,8 +435,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
       workflow_path = write_queue_workflow()
       {:ok, workflow} = Workflow.load(workflow_path)
 
-      state_store_path =
-        Path.join(System.tmp_dir!(), "af-state-#{System.unique_integer([:positive])}.json")
+      state_store_path = tmp_file("af-state", ".json")
 
       issue = sample_issue(identifier: "ENG-77", state: "Todo")
       tracker = fn _config -> {:ok, [issue]} end
@@ -544,8 +543,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
       workflow_path = write_queue_workflow()
       {:ok, workflow} = Workflow.load(workflow_path)
 
-      state_store_path =
-        Path.join(System.tmp_dir!(), "af-state-#{System.unique_integer([:positive])}.json")
+      state_store_path = tmp_file("af-state", ".json")
 
       issue = sample_issue(identifier: "ENG-110", state: "Todo")
       tracker = fn _config -> {:ok, [issue]} end
@@ -578,8 +576,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
     test "restored running issue is restart-safe and not linked to a stale local worker" do
       workflow_path = write_queue_workflow()
 
-      state_store_path =
-        Path.join(System.tmp_dir!(), "af-state-#{System.unique_integer([:positive])}.json")
+      state_store_path = tmp_file("af-state", ".json")
 
       issue = sample_issue(identifier: "ENG-88", state: "Todo")
 
@@ -630,8 +627,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
 
       workflow_path = write_queue_workflow()
 
-      state_store_path =
-        Path.join(System.tmp_dir!(), "af-state-#{System.unique_integer([:positive])}.json")
+      state_store_path = tmp_file("af-state", ".json")
 
       issue = sample_issue(identifier: "ENG-99", state: "Todo")
 
@@ -699,8 +695,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
       owner = self()
       workflow_path = write_queue_workflow()
 
-      state_store_path =
-        Path.join(System.tmp_dir!(), "af-state-#{System.unique_integer([:positive])}.json")
+      state_store_path = tmp_file("af-state", ".json")
 
       first_issue = sample_issue(identifier: "ENG-101", state: "Todo")
       second_issue = sample_issue(identifier: "ENG-102", state: "Todo")
@@ -771,8 +766,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
     test "does not advance persisted cursor after a failed poll" do
       workflow_path = write_queue_workflow()
 
-      state_store_path =
-        Path.join(System.tmp_dir!(), "af-state-#{System.unique_integer([:positive])}.json")
+      state_store_path = tmp_file("af-state", ".json")
 
       state_doc =
         StateStore.empty()
@@ -811,8 +805,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
     test "restored wrapped cursor nil does not fall back to configured after_cursor" do
       workflow_path = write_queue_workflow(after_cursor: "configured_cursor")
 
-      state_store_path =
-        Path.join(System.tmp_dir!(), "af-state-#{System.unique_integer([:positive])}.json")
+      state_store_path = tmp_file("af-state", ".json")
 
       state_doc =
         StateStore.empty()
@@ -849,8 +842,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
     test "keeps current cursor when Linear reports hasNextPage without endCursor" do
       workflow_path = write_queue_workflow()
 
-      state_store_path =
-        Path.join(System.tmp_dir!(), "af-state-#{System.unique_integer([:positive])}.json")
+      state_store_path = tmp_file("af-state", ".json")
 
       state_doc =
         StateStore.empty()
@@ -966,7 +958,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
   # ── helpers ─────────────────────────────────────────────────────────────────
 
   defp stub_socket_path do
-    Path.join(System.tmp_dir!(), "af-orch-test-#{System.unique_integer([:positive])}.sock")
+    tmp_file("af-orch-test", ".sock")
   end
 
   defp in_backoff?(rec) do
@@ -990,7 +982,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
   end
 
   defp write_queue_workflow(opts \\ []) do
-    root = Path.join(System.tmp_dir!(), "af-orch-#{System.unique_integer([:positive])}")
+    root = tmp_dir("af-orch")
     File.mkdir_p!(root)
     path = Path.join(root, "WORKFLOW.md")
     after_cursor = Keyword.get(opts, :after_cursor)
@@ -1028,7 +1020,7 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
   end
 
   defp create_git_repo! do
-    root = Path.join(System.tmp_dir!(), "af-orch-source-#{System.unique_integer([:positive])}")
+    root = tmp_dir("af-orch-source")
     File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf(root) end)
     git!(root, ["init"])
@@ -1045,6 +1037,23 @@ defmodule AgentFabricOrchestrator.OrchestratorTest do
       {_output, 0} -> :ok
       {output, status} -> flunk("git #{Enum.join(args, " ")} failed with #{status}: #{output}")
     end
+  end
+
+  defp tmp_dir(prefix) do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "#{prefix}-#{System.os_time(:nanosecond)}-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(path) end)
+    path
+  end
+
+  defp tmp_file(prefix, suffix) do
+    path = tmp_dir(prefix) <> suffix
+    on_exit(fn -> File.rm_rf(path) end)
+    path
   end
 end
 

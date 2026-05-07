@@ -180,6 +180,24 @@ defmodule AgentFabricOrchestrator.WorkspaceTest do
              )
   end
 
+  test "previews cleanup candidates without deleting protected workspaces" do
+    tmp_root = tmp_root("af-workspace-cleanup")
+    protected = Workspace.path(tmp_root, %{identifier: "ENG-90", title: "Protected"})
+    stale = Path.join(tmp_root, "stale-unmapped")
+    File.mkdir_p!(protected)
+    File.mkdir_p!(stale)
+
+    preview = Workspace.cleanup_preview(tmp_root, [], active_paths: [protected])
+
+    assert preview.dry_run == true
+    assert preview.candidate_count == 1
+    assert preview.protected_count == 1
+    assert [%{path: ^stale, reason: "unmapped_stale_workspace"}] = preview.candidates
+    assert [%{path: ^protected, reason: "active_mapping"}] = preview.protected
+    assert File.dir?(stale)
+    assert File.dir?(protected)
+  end
+
   defp create_git_repo! do
     repo = tmp_root("af-workspace-source")
     File.mkdir_p!(repo)

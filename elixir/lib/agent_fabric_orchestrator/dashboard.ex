@@ -28,6 +28,7 @@ defmodule AgentFabricOrchestrator.Dashboard do
       GET /api/runners             — runner pool state
       GET /api/issues              — issue-to-queue mapping
       GET /api/failures            — recent runner/poll failures
+      GET /api/workspaces          — local workspace cleanup preview
       GET /api/queue-health/:id    — proxy to daemon queue health API
 
   ## Legacy API (kept for Phoenix LiveView mount)
@@ -378,6 +379,43 @@ defmodule AgentFabricOrchestrator.Dashboard do
     {200, "application/json", Jason.encode!(payload)}
   end
 
+  # GET /api/workspaces - local workspace lifecycle preview
+  defp route("GET", "/api/workspaces") do
+    payload =
+      case orchestrator_state() do
+        {:ok, state} ->
+          workflow = Map.get(state, :workflow)
+          root = workflow_workspace_root(workflow)
+
+          preview =
+            if root do
+              AgentFabricOrchestrator.Workspace.cleanup_preview(root, [],
+                active_paths: active_workspace_paths(state)
+              )
+            else
+              %{dry_run: true, error: "workflow workspace.root is unavailable"}
+            end
+
+          %{
+            source: "runtime",
+            orchestrator_alive: true,
+            orchestator_alive: true,
+            queue_id: Map.get(state, :queue_id),
+            workspace_cleanup: preview
+          }
+
+        :not_running ->
+          %{
+            source: "runtime",
+            orchestrator_alive: false,
+            orchestator_alive: false,
+            workspace_cleanup: %{dry_run: true, candidates: [], protected: []}
+          }
+      end
+
+    {200, "application/json", Jason.encode!(payload)}
+  end
+
   # GET /api/queue-health/:queue_id - durable state from Agent Fabric daemon
   defp route("GET", path) do
     case path do
@@ -409,7 +447,8 @@ defmodule AgentFabricOrchestrator.Dashboard do
               "/api/workflow",
               "/api/runners",
               "/api/issues",
-              "/api/failures"
+              "/api/failures",
+              "/api/workspaces"
             ] do
     {405, "application/json", Jason.encode!(%{error: "method_not_allowed"})}
   end
@@ -529,6 +568,24 @@ defmodule AgentFabricOrchestrator.Dashboard do
            }}
         end)
     }
+  end
+
+  defp workflow_workspace_root(nil), do: nil
+
+  defp workflow_workspace_root(%{config: config}) do
+    config
+    |> get_in(["workspace", "root"])
+    |> case do
+      nil -> nil
+      root -> AgentFabricOrchestrator.Workflow.expand_path(root)
+    end
+  end
+
+  defp active_workspace_paths(state) do
+    state
+    |> state_issues()
+    |> Enum.map(fn {_id, rec} -> rec[:workspace_path] || rec["workspace_path"] end)
+    |> Enum.reject(&(&1 in [nil, ""]))
   end
 
   defp issue_to_map(%_{} = issue), do: Map.from_struct(issue)

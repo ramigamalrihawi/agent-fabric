@@ -121,4 +121,45 @@ defmodule AgentFabricOrchestrator.IssueTaskPlannerTest do
     assert task.risk == "low"
     assert task.workstream == "queue"
   end
+
+  test "parses dependency and verification sections into queue-compatible task fields" do
+    issue = %Linear.Issue{
+      identifier: "ENG-12",
+      title: "Add roadmap dependencies",
+      description: """
+      ## Dependencies
+      - ENG-10
+      - ENG-11
+
+      ## Verification hints
+      - Run mix test
+      - Check queue card evidence
+      """,
+      state: "Todo",
+      team_key: "ENG",
+      labels: []
+    }
+
+    task = IssueTaskPlanner.build_task(%{}, issue, "Work on ENG-12")
+
+    assert task.dependsOn == ["ENG-10", "ENG-11"]
+    assert "Verification: Run mix test" in task.acceptanceCriteria
+    assert "Verification: Check queue card evidence" in task.acceptanceCriteria
+  end
+
+  test "adds manager metadata from labels and omits it when absent" do
+    issue = %Linear.Issue{
+      identifier: "ENG-13",
+      title: "Manager-owned slice",
+      description: "Coordinate the slice.",
+      state: "Todo",
+      team_key: "ENG",
+      labels: ["manager:roadmap-phase-a"]
+    }
+
+    assert IssueTaskPlanner.build_task(%{}, issue, "Work").managerId == "roadmap-phase-a"
+
+    task_without_manager = IssueTaskPlanner.build_task(%{}, %{issue | labels: []}, "Work")
+    refute Map.has_key?(task_without_manager, :managerId)
+  end
 end

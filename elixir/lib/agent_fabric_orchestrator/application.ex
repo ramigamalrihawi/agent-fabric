@@ -9,7 +9,8 @@ defmodule AgentFabricOrchestrator.Application do
 
     # Always start the shared infrastructure
     shared_children = [
-      {AgentFabricOrchestrator.RunnerSupervisor, name: AgentFabricOrchestrator.RunnerSupervisor}
+      {AgentFabricOrchestrator.RunnerSupervisor, name: AgentFabricOrchestrator.RunnerSupervisor},
+      {AgentFabricOrchestrator.RunnerPool, []}
     ]
 
     dashboard_children =

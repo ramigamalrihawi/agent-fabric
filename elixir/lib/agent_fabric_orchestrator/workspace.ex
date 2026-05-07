@@ -121,6 +121,49 @@ defmodule AgentFabricOrchestrator.Workspace do
     root |> path(issue) |> File.dir?()
   end
 
+  @doc """
+  Preview local workspace cleanup candidates without deleting anything.
+
+  `active` may contain issue structs/maps/identifiers. Prefer passing
+  `active_paths: [...]` when the orchestrator has exact workspace mappings,
+  because issue titles can change while workspace paths remain stable.
+  """
+  @spec cleanup_preview(Path.t(), [Issue.t() | map() | String.t()], keyword()) :: map()
+  def cleanup_preview(root, active \\ [], opts \\ []) do
+    expanded_root = Path.expand(root)
+    active_paths = MapSet.new(Enum.map(opts[:active_paths] || [], &Path.expand/1))
+    protected_keys = MapSet.new(Enum.map(active, &key/1))
+    stale_after_ms = stale_after_ms(opts)
+
+    base = %{
+      root: expanded_root,
+      exists: File.dir?(expanded_root),
+      dry_run: true,
+      stale_after_ms: stale_after_ms,
+      candidates: [],
+      protected: [],
+      candidate_count: 0,
+      protected_count: 0
+    }
+
+    if File.dir?(expanded_root) do
+      expanded_root
+      |> child_directories()
+      |> Enum.reduce(base, fn workspace_path, acc ->
+        entry = workspace_entry(workspace_path, protected_keys, active_paths, stale_after_ms)
+
+        if entry.protected do
+          %{acc | protected: [entry | acc.protected], protected_count: acc.protected_count + 1}
+        else
+          %{acc | candidates: [entry | acc.candidates], candidate_count: acc.candidate_count + 1}
+        end
+      end)
+      |> sort_preview()
+    else
+      base
+    end
+  end
+
   # ── Private Helpers ─────────────────────────────────────────────────
 
   defp sanitize_and_cap(raw) do
@@ -300,5 +343,78 @@ defmodule AgentFabricOrchestrator.Workspace do
     catch
       kind, value -> {:error, {:hook_threw, kind, value}}
     end
+  end
+
+  defp child_directories(root) do
+    root
+    |> File.ls!()
+    |> Enum.map(&Path.join(root, &1))
+    |> Enum.filter(&File.dir?/1)
+  rescue
+    _ -> []
+  end
+
+  defp workspace_entry(workspace_path, protected_keys, active_paths, stale_after_ms) do
+    basename = Path.basename(workspace_path)
+    modified_at = modified_at(workspace_path)
+    age_ms = age_ms(modified_at)
+    stale = is_nil(stale_after_ms) or (is_integer(age_ms) and age_ms >= stale_after_ms)
+
+    protected =
+      MapSet.member?(protected_keys, basename) or
+        MapSet.member?(active_paths, Path.expand(workspace_path))
+
+    %{
+      path: workspace_path,
+      key: basename,
+      modified_at: modified_at && DateTime.to_iso8601(modified_at),
+      age_ms: age_ms,
+      stale: stale,
+      protected: protected,
+      reason: cleanup_reason(protected, stale)
+    }
+  end
+
+  defp cleanup_reason(true, _stale), do: "active_mapping"
+  defp cleanup_reason(false, true), do: "unmapped_stale_workspace"
+  defp cleanup_reason(false, false), do: "unmapped_recent_workspace"
+
+  defp stale_after_ms(opts) do
+    cond do
+      is_integer(opts[:stale_after_ms]) and opts[:stale_after_ms] >= 0 ->
+        opts[:stale_after_ms]
+
+      is_integer(opts[:stale_after_minutes]) and opts[:stale_after_minutes] >= 0 ->
+        opts[:stale_after_minutes] * 60 * 1000
+
+      true ->
+        nil
+    end
+  end
+
+  defp modified_at(path) do
+    case File.stat(path, time: :posix) do
+      {:ok, stat} ->
+        case DateTime.from_unix(stat.mtime) do
+          {:ok, datetime} -> datetime
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp age_ms(nil), do: nil
+
+  defp age_ms(%DateTime{} = modified_at),
+    do: DateTime.diff(DateTime.utc_now(), modified_at, :millisecond)
+
+  defp sort_preview(preview) do
+    %{
+      preview
+      | candidates: Enum.sort_by(preview.candidates, & &1.path),
+        protected: Enum.sort_by(preview.protected, & &1.path)
+    }
   end
 end

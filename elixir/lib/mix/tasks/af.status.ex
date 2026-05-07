@@ -11,7 +11,7 @@ defmodule Mix.Tasks.Af.Status do
 
   use Mix.Task
 
-  alias AgentFabricOrchestrator.{FabricClient, FabricGateway}
+  alias AgentFabricOrchestrator.{FabricClient, FabricGateway, Workspace}
 
   @shortdoc "Show Agent Fabric Elixir runtime and queue status"
 
@@ -30,15 +30,20 @@ defmodule Mix.Tasks.Af.Status do
           cleanup_older_than_days: :integer,
           cleanup_limit: :integer,
           stale_dry_run: :boolean,
-          stale_after_minutes: :integer
+          stale_after_minutes: :integer,
+          workspace_cleanup_dry_run: :boolean,
+          workspace_root: :string,
+          workspace_stale_minutes: :integer
         ],
         aliases: [q: :queue]
       )
 
     reject_invalid!(invalid)
 
+    runtime = runtime_status()
+
     payload = %{
-      runtime: runtime_status(),
+      runtime: maybe_put_workspace_cleanup(runtime, opts),
       queue: queue_status(opts)
     }
 
@@ -149,6 +154,55 @@ defmodule Mix.Tasks.Af.Status do
     end
   end
 
+  defp maybe_put_workspace_cleanup(runtime, opts) do
+    if opts[:workspace_cleanup_dry_run] do
+      Map.put(runtime, :workspace_cleanup, workspace_cleanup_preview(runtime, opts))
+    else
+      runtime
+    end
+  end
+
+  defp workspace_cleanup_preview(runtime, opts) do
+    root =
+      opts[:workspace_root] ||
+        runtime[:workspace_root] ||
+        runtime["workspace_root"] ||
+        infer_workspace_root(runtime)
+
+    if root in [nil, ""] do
+      %{
+        requested: true,
+        error: "--workspace-cleanup-dry-run requires --workspace-root or a running orchestrator"
+      }
+    else
+      Workspace.cleanup_preview(root, [],
+        active_paths: active_workspace_paths(runtime),
+        stale_after_minutes: opts[:workspace_stale_minutes]
+      )
+      |> Map.put(:requested, true)
+    end
+  end
+
+  defp infer_workspace_root(runtime) do
+    runtime
+    |> active_workspace_paths()
+    |> List.first()
+    |> case do
+      nil -> nil
+      path -> Path.dirname(path)
+    end
+  end
+
+  defp active_workspace_paths(runtime) do
+    issue_mapping = runtime[:issue_mapping] || runtime["issue_mapping"] || %{}
+
+    issue_mapping
+    |> Enum.map(fn {_id, record} ->
+      record[:workspace_path] || record["workspace_path"]
+    end)
+    |> Enum.reject(&(&1 in [nil, ""]))
+  end
+
   defp with_fabric_session(opts, fun) do
     socket_path = socket_path(opts)
     project_root = project_root(opts)
@@ -210,6 +264,10 @@ defmodule Mix.Tasks.Af.Status do
     if stale = queue[:stale] do
       emit_stale(stale)
     end
+
+    if cleanup = runtime[:workspace_cleanup] || runtime["workspace_cleanup"] do
+      emit_workspace_cleanup(cleanup)
+    end
   end
 
   defp emit_cleanup(%{error: error}), do: Mix.shell().error("cleanup_error: #{error}")
@@ -241,6 +299,22 @@ defmodule Mix.Tasks.Af.Status do
   end
 
   defp emit_stale(_stale), do: :ok
+
+  defp emit_workspace_cleanup(%{error: error}),
+    do: Mix.shell().error("workspace_cleanup_error: #{error}")
+
+  defp emit_workspace_cleanup(cleanup) do
+    Mix.shell().info("workspace_cleanup_dry_run: true")
+    Mix.shell().info("workspace_cleanup_root: #{cleanup[:root] || cleanup["root"]}")
+
+    Mix.shell().info(
+      "workspace_cleanup_candidates: #{cleanup[:candidate_count] || cleanup["candidate_count"] || 0}"
+    )
+
+    Mix.shell().info(
+      "workspace_cleanup_protected: #{cleanup[:protected_count] || cleanup["protected_count"] || 0}"
+    )
+  end
 
   defp socket_path(opts) do
     opts[:socket] ||

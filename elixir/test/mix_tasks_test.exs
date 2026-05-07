@@ -48,6 +48,28 @@ defmodule AgentFabricOrchestrator.MixTasksTest do
     assert parsed["queue"]["stale"]["error"] =~ "--stale-dry-run requires --queue"
   end
 
+  test "af.status previews local workspace cleanup without daemon calls" do
+    root =
+      Path.join(System.tmp_dir!(), "af-status-workspaces-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(root, "old-workspace"))
+    Mix.Task.reenable("af.status")
+
+    Mix.Tasks.Af.Status.run([
+      "--workspace-cleanup-dry-run",
+      "--workspace-root",
+      root,
+      "--json"
+    ])
+
+    assert_receive {:mix_shell, :info, [json]}
+    assert {:ok, parsed} = Jason.decode(json)
+    assert parsed["runtime"]["workspace_cleanup"]["root"] == root
+    assert parsed["runtime"]["workspace_cleanup"]["candidate_count"] == 1
+
+    File.rm_rf!(root)
+  end
+
   defp write_workflow do
     root = Path.join(System.tmp_dir!(), "af-mix-task-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)

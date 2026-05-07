@@ -154,7 +154,13 @@ defmodule AgentFabricOrchestrator.DashboardTest do
   end
 
   test "GET runtime usability endpoints return JSON when orchestrator is not running" do
-    for path <- [~c"/api/workflow", ~c"/api/runners", ~c"/api/issues", ~c"/api/failures"] do
+    for path <- [
+          ~c"/api/workflow",
+          ~c"/api/runners",
+          ~c"/api/issues",
+          ~c"/api/failures",
+          ~c"/api/workspaces"
+        ] do
       {status, body} = http_get(path)
       assert status == 200
       assert {:ok, parsed} = Jason.decode(body)

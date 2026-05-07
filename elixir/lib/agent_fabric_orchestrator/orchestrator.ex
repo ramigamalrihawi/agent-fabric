@@ -25,6 +25,7 @@ defmodule AgentFabricOrchestrator.Orchestrator do
     FabricGateway,
     IssueTaskPlanner,
     Linear,
+    RunnerPool,
     StateStore,
     Workflow,
     Workspace
@@ -589,16 +590,7 @@ defmodule AgentFabricOrchestrator.Orchestrator do
       acc =
         if rec.runner_pid && Process.alive?(rec.runner_pid) do
           Logger.info("Stopping runner for #{issue.identifier}")
-          AgentFabricOrchestrator.RunnerRegistry.unregister(issue.identifier)
-
-          try do
-            DynamicSupervisor.terminate_child(
-              AgentFabricOrchestrator.RunnerSupervisor,
-              rec.runner_pid
-            )
-          rescue
-            _ -> :ok
-          end
+          _ = RunnerPool.stop_runner(issue.identifier)
 
           %{acc | active_runners: max(0, acc.active_runners - 1)}
         else
@@ -846,17 +838,7 @@ defmodule AgentFabricOrchestrator.Orchestrator do
       timeout_ms: (get_in(config, ["codex", "max_runtime_minutes"]) || 30) * 60 * 1000
     ]
 
-    case DynamicSupervisor.start_child(
-           AgentFabricOrchestrator.RunnerSupervisor,
-           {state.runner, runner_args}
-         ) do
-      {:ok, pid} = ok ->
-        AgentFabricOrchestrator.RunnerRegistry.register(issue_identifier(rec), pid)
-        ok
-
-      other ->
-        other
-    end
+    RunnerPool.start_runner(issue_identifier(rec), state.runner, runner_args)
   end
 
   # ── Session Management ──────────────────────────────────────────────────────
@@ -1151,9 +1133,23 @@ defmodule AgentFabricOrchestrator.Orchestrator do
   defp restore_status(_), do: :pending
 
   defp runner_pool_state(state) do
+    pool_status = RunnerPool.status()
+
     %{
       active: state.active_runners,
       concurrency: state.concurrency,
+      pool_alive: pool_status.alive,
+      pool_active: pool_status.active,
+      pool_max_runners: pool_status.max_runners,
+      pool_runners:
+        Enum.map(pool_status.runners, fn runner ->
+          %{
+            issue_identifier: runner.issue_identifier,
+            pid: inspect(runner.pid),
+            alive: runner.alive,
+            started_at: runner.started_at && DateTime.to_iso8601(runner.started_at)
+          }
+        end),
       runners:
         state.issues
         |> Enum.filter(fn {_id, rec} -> rec.runner_pid != nil end)

@@ -37,6 +37,7 @@ mix af.orchestrator.run --workflow ../WORKFLOW.example.md --watch --concurrency 
 mix af.status --queue pqueue_123
 mix af.status --queue pqueue_123 --project .. --stale-dry-run --stale-after-minutes 30
 mix af.status --queue pqueue_123 --project .. --cleanup-dry-run --cleanup-older-than-days 7
+mix af.status --workspace-cleanup-dry-run --workspace-root ~/.agent-fabric/workspaces
 ```
 
 A typical operator sequence is:
@@ -48,6 +49,7 @@ A typical operator sequence is:
 5. Monitor runtime and queue health: `mix af.status --queue <pqueue_id> --project ..`
 6. Preview stale running-lane recovery: `mix af.status --queue <pqueue_id> --project .. --stale-dry-run --stale-after-minutes 30`
 7. Preview completed/canceled queue cleanup before deleting anything: `mix af.status --queue <pqueue_id> --project .. --cleanup-dry-run`
+8. Preview local workspace cleanup without deleting worktrees: `mix af.status --workspace-cleanup-dry-run --workspace-root <workspace-root>`
 
 Cleanup and stale recovery remain daemon-owned. The Elixir status task only calls
 the public `project_queue_cleanup` and `project_queue_recover_stale` tools in
@@ -55,6 +57,10 @@ dry-run mode so operators can spot queue buildup, stale runners, and row-count
 impact without deleting or rewriting Agent Fabric evidence from Elixir. Pass
 `--project` when running from `elixir/` so Agent Fabric namespace checks use the
 repository root rather than the Elixir subdirectory.
+
+Local workspace cleanup previews are Elixir-owned and also dry-run only. They
+list unmapped workspace directories and protect active orchestrator mappings;
+actual deletion remains a separate gated operation outside this pass.
 
 ## Source Parity
 
@@ -143,11 +149,17 @@ drive `priority`, `risk`, `category`, `workstream`, and `parallelSafe` values,
 while issue Markdown sections can provide worker context:
 
 ```markdown
+Dependencies:
+- ENG-10
+
 Expected files:
 - elixir/lib/agent_fabric_orchestrator/orchestrator.ex
 
 Context refs:
 - elixir/README.md
+
+Verification hints:
+- Run the focused Elixir tests.
 
 Acceptance criteria:
 - Run the focused Elixir tests.
@@ -155,7 +167,10 @@ Acceptance criteria:
 ```
 
 Supported label forms include `priority:urgent`, `risk:high`, `type:docs`,
-`area:elixir`, `file:path/to/file`, `context:path/to/file`, and `serial`.
+`area:elixir`, `manager:phase-lead`, `file:path/to/file`,
+`context:path/to/file`, and `serial`. `Dependencies` populate queue
+`dependsOn`, and `Verification hints` are folded into acceptance criteria so the
+daemon contract stays compatible.
 The optional `agent_fabric.task_defaults` block supplies conservative defaults
 for every issue, so workers receive useful queue metadata and proof requirements
 without requiring humans to supervise every session directly.
@@ -201,6 +216,7 @@ JSON endpoints:
 | `GET /api/runners` | Runtime | Runner pool state and active worker mappings |
 | `GET /api/issues` | Runtime | Linear issue to queue/fabric task mapping |
 | `GET /api/failures` | Runtime | Recent poll, claim, launch, and runner failures |
+| `GET /api/workspaces` | Runtime | Dry-run local workspace cleanup preview |
 | `GET /api/queue-health/:id` | Durable | Proxy to TypeScript daemon queue health API |
 
 Runtime state comes from the `AgentFabricOrchestrator.Orchestrator` GenServer.
