@@ -418,6 +418,181 @@ describe("project queue substrate", () => {
     daemon.close();
   });
 
+
+
+  it("adds tasks via batch with shared defaults plus per-task overrides", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "batch-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+
+    const batch = daemon.callTool(
+      "project_queue_add_task_batch",
+      {
+        queueId: created.data.queueId,
+        defaults: {
+          phase: "batch-phase",
+          risk: "medium",
+          priority: "high",
+          expectedFiles: ["src/shared.ts"],
+          acceptanceCriteria: ["Shared acceptance"]
+        },
+        tasks: [
+          {
+            clientKey: "batch-a",
+            title: "Batch task A",
+            goal: "First batch task.",
+            expectedFiles: ["src/task-a.ts"],
+            acceptanceCriteria: ["Task A specific"],
+            dependsOn: ["batch-b"]
+          },
+          {
+            clientKey: "batch-b",
+            title: "Batch task B",
+            goal: "Second batch task.",
+            risk: "low",
+            expectedFiles: ["src/task-b.ts"]
+          },
+          {
+            clientKey: "batch-c",
+            title: "Batch task C",
+            goal: "Third batch task.",
+            priority: "normal"
+          }
+        ]
+      },
+      contextFor(session, "batch-add")
+    );
+    expect(batch.ok).toBe(true);
+    if (!batch.ok) throw new Error("batch add failed");
+    expect(batch.data.created).toHaveLength(3);
+    expect(batch.data.reused).toHaveLength(0);
+
+    const tasks = batch.data.created as Array<Record<string, unknown>>;
+    const taskA = tasks.find((t) => t.clientKey === "batch-a")!;
+    const taskB = tasks.find((t) => t.clientKey === "batch-b")!;
+    const taskC = tasks.find((t) => t.clientKey === "batch-c")!;
+
+    // Task A: phase/risk inherited from defaults, expectedFiles concatenated, dependsOn resolved
+    const status = daemon.callTool("project_queue_status", { queueId: created.data.queueId }, contextFor(session));
+    expect(status.ok).toBe(true);
+    if (!status.ok) throw new Error("queue status failed");
+    const taskADetail = (status.data.tasks as Array<Record<string, unknown>>).find(
+      (t) => t.queueTaskId === taskA.queueTaskId
+    );
+    expect(taskADetail).toMatchObject({
+      queueTaskId: taskA.queueTaskId,
+      title: "Batch task A",
+      goal: "First batch task.",
+      phase: "batch-phase",
+      risk: "medium",
+      priority: "high"
+    });
+    const taskBFiles = (status.data.tasks as Array<Record<string, unknown>>).find(
+      (t) => t.queueTaskId === taskB.queueTaskId
+    );
+    // Task B overrode risk to low, inherited phase, concatenated expectedFiles
+    expect(taskBFiles).toMatchObject({
+      title: "Batch task B",
+      phase: "batch-phase",
+      risk: "low",
+      priority: "high"
+    });
+    // Task C inherited phase/risk/priority/expectedFiles/acceptanceCriteria from defaults
+    const taskCDetail = (status.data.tasks as Array<Record<string, unknown>>).find(
+      (t) => t.queueTaskId === taskC.queueTaskId
+    );
+    expect(taskCDetail).toMatchObject({
+      title: "Batch task C",
+      phase: "batch-phase",
+      risk: "medium",
+      priority: "normal"
+    });
+    daemon.close();
+  });
+
+  it("reports which task failed in a batch when per-task data is invalid", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "batch-invalid-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+
+    const batch = daemon.callTool(
+      "project_queue_add_task_batch",
+      {
+        queueId: created.data.queueId,
+        defaults: { phase: "test" },
+        tasks: [
+          { clientKey: "valid", title: "Valid", goal: "OK." },
+          { clientKey: "bad", title: "", goal: "No title." }
+        ]
+      },
+      contextFor(session, "batch-invalid-add")
+    );
+    expect(batch.ok).toBe(false);
+    expect(batch.message).toContain("Task at index 1");
+    expect(batch.message).toContain("string field");
+    daemon.close();
+  });
+
+  it("resolves clientKey dependency references within a batch", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "batch-deps-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+
+    const batch = daemon.callTool(
+      "project_queue_add_task_batch",
+      {
+        queueId: created.data.queueId,
+        defaults: { phase: "batch-phase", risk: "medium" },
+        tasks: [
+          {
+            clientKey: "root",
+            title: "Root task",
+            goal: "No deps."
+          },
+          {
+            clientKey: "child",
+            title: "Child task",
+            goal: "Depends on root.",
+            dependsOn: ["root"]
+          }
+        ]
+      },
+      contextFor(session, "batch-deps-add")
+    );
+    expect(batch.ok).toBe(true);
+    if (!batch.ok) throw new Error("batch deps add failed");
+    expect(batch.data.created).toHaveLength(2);
+
+    const status = daemon.callTool("project_queue_status", { queueId: created.data.queueId }, contextFor(session));
+    expect(status.ok).toBe(true);
+    if (!status.ok) throw new Error("queue status failed");
+    const childTask = (status.data.tasks as Array<Record<string, unknown>>).find(
+      (t) => (t as Record<string, unknown>).title === "Child task"
+    );
+    expect(childTask).toBeDefined();
+    // Child should depend on root's real queueTaskId, not the clientKey
+    const dependsOn = (childTask as Record<string, unknown>).dependsOn as string[];
+    const rootTask = (status.data.tasks as Array<Record<string, unknown>>).find(
+      (t) => (t as Record<string, unknown>).title === "Root task"
+    );
+    expect(dependsOn).toContain((rootTask as Record<string, unknown>).queueTaskId);
+
+    // Verify next_ready: root is ready (no deps), child is blocked
+    const nextReady = daemon.callTool("project_queue_next_ready", { queueId: created.data.queueId }, contextFor(session));
+    expect(nextReady.ok).toBe(true);
+    if (!nextReady.ok) throw new Error("next ready failed");
+    const readyTasks = nextReady.data.ready as Array<Record<string, unknown>>;
+    expect(readyTasks).toHaveLength(1);
+    expect(readyTasks[0].title).toBe("Root task");
+    daemon.close();
+  });
+
   it("adds dependency-aware tasks and returns only ready work", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload());
@@ -1882,6 +2057,366 @@ describe("project queue substrate", () => {
       nextActions: expect.any(Array),
       verificationChecklist: expect.arrayContaining(["Review every patch-ready task before acceptance."])
     });
+    daemon.close();
+  });
+
+  it("groups collab asks, replies, decisions, path claims, and handoff notes by queue task", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "collab-summary-queue");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+    const queueId = created.data.queueId;
+
+    const added = addThreeTasks(daemon, session, queueId);
+    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error("add tasks failed");
+
+    // Get the task IDs so we can reference them
+    const status = daemon.callTool("project_queue_status", { queueId }, contextFor(session, "collab-status"));
+    expect(status.ok).toBe(true);
+    if (!status.ok) throw new Error("queue status failed");
+    const taskIds: string[] = (status.data.tasks as Array<Record<string, unknown>>).map((t) => String(t.queueTaskId));
+    expect(taskIds.length).toBeGreaterThanOrEqual(1);
+    const firstTaskId = taskIds[0];
+
+    // Send an ask scoped to a specific queue task
+    const ask = daemon.callTool("collab_ask", {
+      to: "other-agent",
+      kind: "review",
+      question: "Please review this task implementation.",
+      refs: [`project_queue:${queueId}`, `project_queue_task:${firstTaskId}`],
+      urgency: "normal"
+    }, contextFor(session, "collab-ask"));
+    expect(ask.ok).toBe(true);
+    if (!ask.ok) throw new Error("collab ask failed");
+
+    const legacyAsk = daemon.callTool("collab_ask", {
+      to: "other-agent",
+      kind: "review",
+      question: "Please review this worker card message.",
+      refs: [`queue:${queueId}`, `queueTask:${firstTaskId}`],
+      urgency: "normal"
+    }, contextFor(session, "collab-legacy-ask"));
+    expect(legacyAsk.ok).toBe(true);
+    if (!legacyAsk.ok) throw new Error("legacy collab ask failed");
+
+    // Send a message scoped to a task
+    const message = daemon.callTool("collab_send", {
+      to: "other-agent",
+      body: "Handoff note for task.",
+      refs: [`project_queue:${queueId}`, `project_queue_task:${firstTaskId}`],
+      kind: "dm"
+    }, contextFor(session, "collab-message"));
+    expect(message.ok).toBe(true);
+
+    // Record a collab decision
+    const decision = daemon.callTool("collab_decision", {
+      title: "Approach decision",
+      decided: "Use streaming for collab fan-out.",
+      participants: ["codex", "claude"]
+    }, contextFor(session, "collab-decision"));
+    expect(decision.ok).toBe(true);
+
+    // Claim a path
+    const claim = daemon.callTool("claim_path", {
+      paths: ["src/surfaces/collab.ts"],
+      note: "Working on collab summary feature."
+    }, contextFor(session, "collab-claim"));
+    expect(claim.ok).toBe(true);
+
+    // Now query the collab summary
+    const summary = daemon.callTool("project_queue_collab_summary", { queueId }, contextFor(session, "collab-summary"));
+    expect(summary.ok).toBe(true);
+    if (!summary.ok) throw new Error("collab summary failed");
+    expect(summary.data).toMatchObject({
+      schema: "agent-fabric.project-queue-collab-summary.v1",
+      queue: { queueId }
+    });
+
+    const groups = summary.data.groups as Array<Record<string, unknown>>;
+    // Should have at least one group for the task with the ask
+    const taskGroup = groups.find((g) => String(g?.queueTask?.queueTaskId) === firstTaskId);
+    expect(taskGroup).toBeDefined();
+    if (!taskGroup) throw new Error("task group not found");
+
+    const openAsks = taskGroup.openAsks as Array<Record<string, unknown>>;
+    expect(openAsks.length).toBeGreaterThanOrEqual(1);
+    expect(openAsks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          question: "Please review this task implementation.",
+          kind: "review"
+        }),
+        expect.objectContaining({
+          question: "Please review this worker card message.",
+          kind: "review"
+        })
+      ])
+    );
+
+    // Unlinked should have decisions and path claims
+    const unlinked = summary.data.unlinked as Record<string, unknown>;
+    const unlinkedDecisions = unlinked.decisions as Array<Record<string, unknown>>;
+    expect(unlinkedDecisions.length).toBeGreaterThanOrEqual(1);
+    expect(unlinkedDecisions[0]).toMatchObject({
+      title: "Approach decision",
+      decided: "Use streaming for collab fan-out."
+    });
+
+    const unlinkedClaims = unlinked.pathClaims as Array<Record<string, unknown>>;
+    expect(unlinkedClaims.length).toBeGreaterThanOrEqual(1);
+
+    // Verify task packets include collab refs
+    const packet = daemon.callTool("project_queue_task_packet", {
+      queueId,
+      queueTaskId: firstTaskId,
+      format: "json"
+    }, contextFor(session, "collab-packet"));
+    expect(packet.ok).toBe(true);
+    if (!packet.ok) throw new Error("packet failed");
+
+    const pktCollab = (packet.data as Record<string, unknown>).packet as Record<string, unknown> | undefined;
+    expect(pktCollab).toBeDefined();
+    expect(pktCollab?.collab).toBeDefined();
+    const collab = pktCollab?.collab as Record<string, unknown> | undefined;
+    expect(collab?.queueRef).toBe(`project_queue:${queueId}`);
+    expect(collab?.taskRef).toBe(`project_queue_task:${firstTaskId}`);
+    expect(Array.isArray(collab?.instructions)).toBe(true);
+
+    daemon.close();
+  });
+
+  it("returns empty groups for a queue with no tasks", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "empty-collab");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+
+    const summary = daemon.callTool(
+      "project_queue_collab_summary",
+      { queueId: created.data.queueId },
+      contextFor(session, "empty-collab-summary")
+    );
+    expect(summary.ok).toBe(true);
+    if (!summary.ok) throw new Error("empty collab summary failed");
+    expect(summary.data).toMatchObject({
+      schema: "agent-fabric.project-queue-collab-summary.v1",
+      groups: []
+    });
+
+    daemon.close();
+  });
+
+  it("returns a read-only patch review plan for patch-ready tasks with patch refs, worker worktree refs, risk notes, and CLI commands", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "patch-review-plan-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+    const queueId = created.data.queueId;
+
+    const added = addThreeTasks(daemon, session, queueId);
+    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error("add tasks failed");
+
+    const started = startExecution(daemon, session, queueId, "patch-exec");
+    const status = daemon.callTool("project_queue_status", { queueId }, contextFor(session, "patch-status"));
+    expect(status.ok).toBe(true);
+    if (!status.ok) throw new Error("queue status failed");
+    const tasks = status.data.tasks as Array<Record<string, unknown>>;
+    expect(tasks.length).toBeGreaterThanOrEqual(1);
+
+    // Set first task to patch_ready with patch refs and start a worker
+    const firstTask = tasks[0];
+    const worker = startWorkerForQueueTask(
+      daemon,
+      session,
+      { fabricTaskId: String(firstTask.fabricTaskId), queueTaskId: String(firstTask.queueTaskId) },
+      "patch-review-plan-worker"
+    );
+    daemon.callTool(
+      "fabric_task_event",
+      {
+        taskId: firstTask.fabricTaskId,
+        workerRunId: worker.workerRunId,
+        kind: "file_changed",
+        refs: ["src/index.ts", "src/utils.ts"],
+        metadata: { cwd: "/tmp/workspace/app" }
+      },
+      contextFor(session, "patch-event-files")
+    );
+    daemon.callTool(
+      "fabric_task_checkpoint",
+      {
+        taskId: firstTask.fabricTaskId,
+        workerRunId: worker.workerRunId,
+        summary: {
+          currentGoal: String(firstTask.goal),
+          filesTouched: ["src/index.ts", "src/utils.ts", "src/patch.diff"],
+          commandsRun: ["npm test"],
+          testsRun: ["npm test"],
+          failingTests: ["src/index.test.ts"],
+          blockers: [],
+          summary: "Implementation done, one test failing.",
+          nextAction: "Review patch-ready output.",
+          testsSuggested: ["npm test -- src/index.test.ts"]
+        }
+      },
+      contextFor(session, "patch-checkpoint")
+    );
+    daemon.callTool(
+      "project_queue_update_task",
+      {
+        queueId,
+        queueTaskId: firstTask.queueTaskId,
+        status: "patch_ready",
+        workerRunId: worker.workerRunId,
+        summary: "Task complete, patch ready for review.",
+        patchRefs: ["src/patch.diff"],
+        testRefs: ["npm test"]
+      },
+      contextFor(session, "patch-update-task")
+    );
+
+    // Set a second task to failed with an artifact
+    const secondTask = tasks[1];
+    if (secondTask) {
+      daemon.callTool(
+        "project_queue_update_task",
+        {
+          queueId,
+          queueTaskId: secondTask.queueTaskId,
+          status: "failed",
+          summary: "Worker ran into an unexpected error.",
+          patchRefs: ["partial-output.diff"],
+          testRefs: []
+        },
+        contextFor(session, "patch-failed-task")
+      );
+    }
+
+    const plan = daemon.callTool(
+      "project_queue_patch_review_plan",
+      { queueId },
+      contextFor(session, "patch-review-plan")
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) throw new Error("patch review plan failed");
+    expect(plan.data).toMatchObject({
+      schema: "agent-fabric.project-queue-patch-review-plan.v1",
+      queue: { queueId },
+      summary: expect.objectContaining({
+        patchReadyCount: 1,
+        failedWithArtifactCount: 1,
+        skippedCount: expect.any(Number)
+      })
+    });
+
+    const entries = plan.data.entries as Array<Record<string, unknown>>;
+    const patchReadyEntry = entries.find((entry) => entry.patchReady === true);
+    expect(patchReadyEntry).toBeDefined();
+    if (patchReadyEntry) {
+      expect(patchReadyEntry).toMatchObject({
+        status: "patch_ready",
+        hasArtifact: true,
+        patchRefs: ["src/patch.diff"]
+      });
+      expect(patchReadyEntry.workerRun).toBeDefined();
+      expect(patchReadyEntry.worktreePath).toBeDefined();
+      expect(patchReadyEntry.failingTests).toContain("src/index.test.ts");
+      expect(patchReadyEntry.suggestedTests).toContain("npm test -- src/index.test.ts");
+      expect(patchReadyEntry.riskNotes).toContain("1 failing test(s)");
+      const commands = patchReadyEntry.commands as Record<string, unknown> | undefined;
+      expect(commands?.reviewPatches).toContain("review-patches");
+      expect(commands?.applyPatch).toContain("--apply-patch");
+    }
+
+    const failedEntry = entries.find((entry) => entry.status === "failed");
+    expect(failedEntry).toBeDefined();
+    if (failedEntry) {
+      expect(failedEntry.patchReady).toBe(false);
+      expect(failedEntry.hasArtifact).toBe(true);
+    }
+
+    expect(Array.isArray(plan.data.skipped)).toBe(true);
+
+    daemon.close();
+  });
+
+  it("returns explicit reasons and no patch commands for no-artifact tasks", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "no-artifact-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+    const queueId = created.data.queueId;
+
+    const added = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId,
+        tasks: [
+          { title: "Unstarted queued item", goal: "A task still in queued state.", risk: "low" }
+        ]
+      },
+      contextFor(session, "no-artifact-add")
+    );
+    expect(added.ok).toBe(true);
+
+    const plan = daemon.callTool(
+      "project_queue_patch_review_plan",
+      { queueId },
+      contextFor(session, "no-artifact-plan")
+    );
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) throw new Error("no-artifact review plan failed");
+    expect(plan.data.summary).toMatchObject({
+      patchReadyCount: 0,
+      failedWithArtifactCount: 0,
+      completedCount: 0,
+      skippedCount: 1
+    });
+    expect(plan.data.entries).toHaveLength(0);
+    expect(plan.data.skipped).toHaveLength(1);
+    expect(plan.data.skipped[0]).toMatchObject({
+      reason: expect.stringContaining("is not patch-ready, failed, or completed")
+    });
+
+    daemon.close();
+  });
+
+  it("is read-only and does not mutate queue state", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "ro-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+    const queueId = created.data.queueId;
+
+    const added = addThreeTasks(daemon, session, queueId);
+    expect(added.ok).toBe(true);
+
+    const statusBefore = daemon.callTool("project_queue_status", { queueId }, contextFor(session, "ro-status-before"));
+    expect(statusBefore.ok).toBe(true);
+    if (!statusBefore.ok) throw new Error("status before failed");
+    const tasksBefore = statusBefore.data.tasks as Array<Record<string, unknown>>;
+
+    const plan = daemon.callTool(
+      "project_queue_patch_review_plan",
+      { queueId },
+      contextFor(session, "ro-plan")
+    );
+    expect(plan.ok).toBe(true);
+
+    const statusAfter = daemon.callTool("project_queue_status", { queueId }, contextFor(session, "ro-status-after"));
+    expect(statusAfter.ok).toBe(true);
+    if (!statusAfter.ok) throw new Error("status after failed");
+    const tasksAfter = statusAfter.data.tasks as Array<Record<string, unknown>>;
+
+    expect(tasksAfter).toEqual(tasksBefore);
+
     daemon.close();
   });
 });

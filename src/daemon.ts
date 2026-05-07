@@ -28,6 +28,7 @@ import type {
   FabricDiagnostic,
   FabricDoctor,
   FabricSessionSummary,
+  FabricStarterKit,
   FabricStatus,
   ResultEnvelope
 } from "./types.js";
@@ -120,6 +121,7 @@ import {
   planChainStatus
 } from "./surfaces/plan.js";
 import {
+  projectQueueAddTaskBatch,
   projectQueueAddTasks,
   projectQueueAgentLanes,
   projectQueueApproveModelCalls,
@@ -127,12 +129,14 @@ import {
   projectQueueAssignWorker,
   projectQueueClaimNext,
   projectQueueCleanup,
+  projectQueueCollabSummary,
   projectQueueCreate,
   projectQueueDashboard,
   projectQueueDecide,
   projectQueueList,
   projectQueueLaunchPlan,
   projectQueueNextReady,
+  projectQueuePatchReviewPlan,
   projectQueuePrepareReady,
   projectQueueProgressReport,
   projectQueueRecordStage,
@@ -149,6 +153,7 @@ import {
   projectQueueUpdateTaskMetadata,
   projectQueueValidateContextRefs,
   projectQueueValidateLinks,
+  projectQueueWorkerHealth,
   toolContextDecide,
   toolContextPending,
   toolContextPolicySet,
@@ -187,6 +192,7 @@ const SUPPORTED_TOOLS = new Set([
   "fabric_status",
   "fabric_session_close",
   "fabric_doctor",
+  "fabric_starter_kit",
   "fabric_explain_session",
   "fabric_explain_memory",
   "fabric_trace",
@@ -244,6 +250,7 @@ const SUPPORTED_TOOLS = new Set([
   "project_queue_resume_task",
   "project_queue_task_packet",
   "project_queue_record_stage",
+  "project_queue_add_task_batch",
   "project_queue_add_tasks",
   "project_queue_next_ready",
   "project_queue_write_ready_packets",
@@ -256,6 +263,7 @@ const SUPPORTED_TOOLS = new Set([
   "project_queue_launch_plan",
   "project_queue_validate_links",
   "project_queue_validate_context_refs",
+  "project_queue_worker_health",
   "project_queue_claim_next",
   "project_queue_recover_stale",
   "project_queue_retry_task",
@@ -269,6 +277,7 @@ const SUPPORTED_TOOLS = new Set([
   "project_queue_edit_task_metadata",
   "project_queue_review_patches",
   "project_queue_accept_patch",
+  "project_queue_patch_review_plan",
   "project_queue_approvals",
   "project_queue_timeline",
   "fabric_task_create",
@@ -290,6 +299,7 @@ export type DaemonOptions = {
 
 type FabricStatusOptions = {
   includeSessions?: boolean;
+  verbose?: boolean;
   sessionLimit?: number;
   sessionOffset?: number;
   dedupeWarnings?: boolean;
@@ -436,6 +446,9 @@ export class FabricDaemon {
       }
       if (tool === "fabric_doctor") {
         return { ok: true, tool, data: this.fabricDoctor() as T };
+      }
+      if (tool === "fabric_starter_kit") {
+        return { ok: true, tool, data: this.fabricStarterKit() as T };
       }
       if (tool === "fabric_explain_session") {
         const sessionId = getString(input, "sessionId");
@@ -638,6 +651,9 @@ export class FabricDaemon {
       if (tool === "project_queue_record_stage") {
         return { ok: true, tool, data: projectQueueRecordStage(this, input, context) as T };
       }
+      if (tool === "project_queue_add_task_batch") {
+        return { ok: true, tool, data: projectQueueAddTaskBatch(this, input, context) as T };
+      }
       if (tool === "project_queue_add_tasks") {
         return { ok: true, tool, data: projectQueueAddTasks(this, input, context) as T };
       }
@@ -655,6 +671,9 @@ export class FabricDaemon {
       }
       if (tool === "project_queue_validate_context_refs") {
         return { ok: true, tool, data: projectQueueValidateContextRefs(this, input, context) as T };
+      }
+      if (tool === "project_queue_worker_health") {
+        return { ok: true, tool, data: projectQueueWorkerHealth(this, input, context) as T };
       }
       if (tool === "project_queue_claim_next") {
         return { ok: true, tool, data: projectQueueClaimNext(this, input, context) as T };
@@ -674,6 +693,9 @@ export class FabricDaemon {
       if (tool === "project_queue_progress_report") {
         return { ok: true, tool, data: projectQueueProgressReport(this, input, context) as T };
       }
+      if (tool === "project_queue_collab_summary") {
+        return { ok: true, tool, data: projectQueueCollabSummary(this, input, context) as T };
+      }
       if (tool === "project_queue_approval_inbox") {
         return { ok: true, tool, data: projectQueueApprovalInbox(this, input, context) as T };
       }
@@ -688,6 +710,9 @@ export class FabricDaemon {
       }
       if (tool === "project_queue_decide") {
         return { ok: true, tool, data: projectQueueDecide(this, input, context) as T };
+      }
+      if (tool === "project_queue_patch_review_plan") {
+        return { ok: true, tool, data: projectQueuePatchReviewPlan(this, input, context) as T };
       }
       if (tool === "tool_context_propose") {
         return { ok: true, tool, data: toolContextPropose(this, input, context) as T };
@@ -790,7 +815,8 @@ export class FabricDaemon {
       .all() as SessionRow[]).filter((row) => !row.expires_at || Date.parse(row.expires_at) > this.now().getTime());
     const sessionOffset = normalizeStatusOffset(options.sessionOffset);
     const sessionLimit = normalizeStatusLimit(options.sessionLimit);
-    const includeSessions = options.includeSessions ?? true;
+    const verbose = options.verbose ?? false;
+    const includeSessions = verbose ? true : (options.includeSessions ?? false);
     const sessions = includeSessions ? rows.slice(sessionOffset, sessionOffset + sessionLimit).map(rowToSessionSummary) : [];
     const allSessions = rows.map(rowToSessionSummary);
     const recentCostRows = this.db.db
@@ -807,9 +833,10 @@ export class FabricDaemon {
       .get() as { count: number };
     const oldest = this.db.db.prepare("SELECT MIN(ts) AS ts FROM events").get() as { ts: string | null };
     const lastBilling = this.db.db.prepare("SELECT MAX(ts_polled) AS ts FROM cost_billing").get() as { ts: string | null };
-    const warnings = options.dedupeWarnings === false
-      ? this.statusWarnings(allSessions, lastBilling.ts, observedRouteableAgents)
-      : uniqueStrings(this.statusWarnings(allSessions, lastBilling.ts, observedRouteableAgents));
+    const dedupeWarnings = verbose ? false : (options.dedupeWarnings ?? true);
+    const warnings = dedupeWarnings
+      ? uniqueStrings(this.statusWarnings(allSessions, lastBilling.ts, observedRouteableAgents))
+      : this.statusWarnings(allSessions, lastBilling.ts, observedRouteableAgents);
     const missingSeniorRequired = SENIOR_REQUIRED_TOOLS.filter((tool) => !SUPPORTED_TOOLS.has(tool));
 
     return {
@@ -820,7 +847,7 @@ export class FabricDaemon {
         dbPath: this.db.path,
         schemaVersion: this.db.schemaVersion(),
         originPeerId: this.originPeerId,
-        runtime: daemonRuntimeInfo(),
+        runtime: includeSessions ? daemonRuntimeInfo() : undefined,
         tools: {
           seniorRequired: SENIOR_REQUIRED_TOOLS,
           missingSeniorRequired
@@ -897,6 +924,171 @@ export class FabricDaemon {
       });
     }
     return { status, diagnostics };
+  }
+
+  /** Read-only happy-path tool discovery for Codex and Claude bridge callers. */
+  fabricStarterKit(): FabricStarterKit {
+    return {
+      kit: "agent-fabric",
+      essentialTools: [
+        {
+          tool: "fabric_status",
+          description: "Fast bounded daemon health, bridge sessions, coverage, and billing status.",
+          readOnly: true,
+          guidance: "Call fabric_status({}) for compact health; use verbose:true for full session dumps and non-deduped warnings."
+        },
+        {
+          tool: "fabric_doctor",
+          description: "Status plus actionable diagnostics with safe next-step commands.",
+          readOnly: true,
+          guidance: "Call fabric_doctor({}) when status shows warnings or degraded health."
+        },
+        {
+          tool: "fabric_senior_start",
+          description: "Start or attach to a Senior-mode queue and return Codex-like worker cards/progress.",
+          readOnly: false,
+          guidance: "Use with --project <path> when you have a plan and need to fan out DeepSeek workers."
+        },
+        {
+          tool: "fabric_senior_status",
+          description: "Return Senior-mode worker cards and resumable progress for a queue.",
+          readOnly: true,
+          guidance: "Call with {queueId} to check queue health and lane statuses."
+        },
+        {
+          tool: "fabric_senior_resume",
+          description: "Return the next Senior-mode command and progress snapshot for resuming.",
+          readOnly: true,
+          guidance: "Call with {queueId} after reconnecting to see where the queue left off."
+        },
+        {
+          tool: "fabric_spawn_agents",
+          description: "Spawn queue-visible worker lanes for Codex-style background work.",
+          readOnly: false,
+          guidance: "Spawns planned cards; use run-ready to launch real shell runners after spawn."
+        },
+        {
+          tool: "fabric_list_agents",
+          description: "Return Codex-style @af/<name> worker cards for a project queue.",
+          readOnly: true,
+          guidance: "Use page/pageSize/groupBy for high-scale queues; maxEventsPerLane keeps cards compact."
+        },
+        {
+          tool: "fabric_open_agent",
+          description: "Open one worker card with transcript, checkpoints, task detail, and artifacts.",
+          readOnly: true,
+          guidance: "Pass the @af/<name> handle from fabric_list_agents to the agent parameter."
+        },
+        {
+          tool: "fabric_message_agent",
+          description: "Send a durable message or ask to an @af/<name> worker handle.",
+          readOnly: false,
+          guidance: "Use a concise body and optional kind for intent; workers see messages on next poll."
+        },
+        {
+          tool: "fabric_wait_agents",
+          description: "Non-blocking wait snapshot for worker cards.",
+          readOnly: true,
+          guidance: "Use targetStatuses to wait for patch_ready/completed/failed; returns current state immediately."
+        },
+        {
+          tool: "fabric_accept_patch",
+          description: "Accept a patch-ready worker result without applying files locally.",
+          readOnly: false,
+          guidance: "Requires reviewedBy and reviewSummary; blocked without review metadata."
+        },
+        {
+          tool: "project_queue_create",
+          description: "Create a durable project-scoped queue for the prompt pipeline.",
+          readOnly: false,
+          guidance: "Start here for new work; use pipelineProfile to control model depth."
+        },
+        {
+          tool: "project_queue_status",
+          description: "Read project queue stages, tasks, decisions, and project policies.",
+          readOnly: true,
+          guidance: "Good entry point to inspect a queue without pulling the full dashboard."
+        },
+        {
+          tool: "project_queue_dashboard",
+          description: "Combined queue board, approvals, and agent lanes view model.",
+          readOnly: true,
+          guidance: "Use for full queue overview with lanes and approval state."
+        },
+        {
+          tool: "project_queue_progress_report",
+          description: "Resumable Senior-mode queue progress with worker cards, blockers, and next commands.",
+          readOnly: true,
+          guidance: "Best starting point after reconnecting to check what happened and what's next."
+        },
+        {
+          tool: "project_queue_task_detail",
+          description: "One queue task drawer/detail model with graph links and worker history.",
+          readOnly: true,
+          guidance: "Use includeResume:true for a worker handoff packet."
+        },
+        {
+          tool: "project_queue_task_packet",
+          description: "Build a copyable queue task or resume packet for worker handoff.",
+          readOnly: true,
+          guidance: "Generate a concrete task packet for DeepSeek or Jcode worker launch."
+        },
+        {
+          tool: "project_queue_claim_next",
+          description: "Atomically claim one dependency-free ready queue task for a worker gateway.",
+          readOnly: false,
+          guidance: "Worker gateway entry point; returns taskId, workerRunId, and workspace path."
+        },
+        {
+          tool: "project_queue_add_task_batch",
+          description: "Add dependency-aware coding tasks with shared defaults plus per-task overrides.",
+          readOnly: false,
+          guidance: "Use when many tasks share the same phase, risk, manager, or tool/context bundle."
+        },
+        {
+          tool: "project_queue_add_tasks",
+          description: "Add dependency-aware coding tasks to a project queue.",
+          readOnly: false,
+          guidance: "Use after plan approval to populate the queue with parallel-safe work items."
+        },
+        {
+          tool: "project_queue_update_task",
+          description: "Update queue-task status, worker link, summary, and patch/test refs.",
+          readOnly: false,
+          guidance: "Use to mark tasks patch_ready, completed, or failed from worker lanes."
+        },
+        {
+          tool: "project_queue_approve_model_calls",
+          description: "Issue one audited queue-scoped model approval token for Senior DeepSeek worker calls.",
+          readOnly: false,
+          guidance: "Call before spawning workers to pre-approve their model calls for the session."
+        },
+        {
+          tool: "fabric_task_status",
+          description: "Read durable task, worker run, event, and checkpoint state.",
+          readOnly: true,
+          guidance: "Use includeEvents:true and includeCheckpoints:true for full task history."
+        },
+        {
+          tool: "fabric_task_event",
+          description: "Append one external worker event to a durable fabric task.",
+          readOnly: false,
+          guidance: "Use kind 'checkpoint' for resumable milestones and kind 'patch_ready' when delivering results."
+        },
+        {
+          tool: "collab_send",
+          description: "Append a durable collaboration message with best-effort live fan-out.",
+          readOnly: false,
+          guidance: "Message is committed before fan-out; inbox remains source of truth for offline recipients."
+        },
+        {
+          tool: "collab_inbox",
+          description: "Read messages and open asks for this bridge session.",
+          readOnly: true,
+          guidance: "Use since to avoid re-reading previously consumed messages."
+        }
+      ]
+    };
   }
 
   ingestLiteLlmSpendLogs(input: unknown): CostIngestResult {
@@ -1376,6 +1568,7 @@ export class FabricDaemon {
 
 function fabricStatusOptions(input: unknown): FabricStatusOptions {
   return {
+    verbose: getOptionalBoolean(input, "verbose"),
     includeSessions: getOptionalBoolean(input, "includeSessions"),
     sessionLimit: getOptionalNumber(input, "sessionLimit"),
     sessionOffset: getOptionalNumber(input, "sessionOffset"),

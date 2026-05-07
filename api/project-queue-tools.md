@@ -33,6 +33,14 @@ npm run dev:project -- senior-run --project <path> --tasks-file .agent-fabric/ta
 
 Run `senior-doctor --project <path> [--queue <id>]` before launch. It checks daemon/source parity, required Senior bridge tools, DeepSeek auth, queue visibility, and whether the project can support mutating `git_worktree` lanes. A queue created from another harness workspace remains accessible when the caller's workspace root is the queue `projectPath`; use `agent-fabric-project --project <path> --queue <id>` for cross-harness resumes.
 
+Run `watch-workers --queue <id>` during long-running Senior runs to monitor worker health without mutating state:
+
+```bash
+npm run dev:project -- watch-workers --queue <queueId>
+```
+
+It presents compact stale/blocked/failed/patch-ready summaries with exact next commands by default. Pass `--stale-after-minutes <n>` for a non-default threshold (default 30) or `--mark-stale` to safely trigger `recover-stale --action requeue` on stale running workers. Use `--json` for machine-readable output with schema `agent-fabric.watch-workers.v1`.
+
 For non-git folders, report-only planner/reviewer work should use `sandbox` and the `research-planner` alias. Mutating implementation work still requires `git_worktree`.
 
 The lower-level terminal shortcut for this control-plane flow is `factory-run`. It performs the queue preview reads (`review-matrix`, `prepare-ready`, `launch-plan`), optionally records `start_execution`, writes task packets, runs ready DeepSeek lanes in git worktrees, and defaults to adaptive rate-limit backoff:
@@ -42,6 +50,24 @@ npm run dev:project -- factory-run --queue <queueId> --start-execution --paralle
 ```
 
 Use `--dry-run` to inspect the factory plan without launching workers, `--no-adaptive-rate-limit` to keep fixed parallelism, `--sensitive-context-mode strict` for high-entropy packet scanning, `--allow-sensitive-context` to explicitly pass the DeepSeek worker's sensitive-context override, `--deepseek-role <role>` to force a homogeneous lane role, and `--deepseek-worker-command "<cmd>"` when the global worker binary is not installed.
+
+## Artifact Ignore for Patch Harvesting
+
+Worker diff snapshots (`snapshotFiles`/`diffSnapshots`) filter generated locally-artifact directories and files to keep patch review clean. The built-in default list covers `.git`, `.hg`, `.svn`, `node_modules`, `.next`, `.nuxt`, `.turbo`, `dist`, `build`, `coverage`, `.cache`, `.agent-fabric`, `*.log`, `*.tsbuildinfo`, `*.pyc`, `__pycache__`, `.DS_Store`, and `Thumbs.db`.
+
+Set `AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS` to a colon, comma, space, or semicolon-separated list of additional globs. Pass `--artifact-ignore <glob>` (repeatable) to `run-task` and `run-ready` for per-invocation additions. All globs merge: exact directory/file basenames are matched as-is; patterns containing `*` or `?` are treated as simple globs against each directory entry's name during recursive walks. Source code and intentional patch targets remain visible in changed-file output.
+
+Example:
+
+```bash
+# Exclude generated docs output from patch diffs
+AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS="*.generated.md,priv/static" \
+  npm run dev:project -- run-task --queue <queueId> --queue-task <qt> --command "make test" \
+  --artifact-ignore "tmp"
+
+npm run dev:project -- run-ready --queue <queueId> --parallel 4 \
+  --artifact-ignore "*.generated.md" --artifact-ignore "priv/static"
+```
 
 CLI JSON output redacts approval/session token fields before printing. Approval tokens remain process-local plumbing between `--approve-model-calls` and the worker preflight, not operator-facing handoff material.
 
@@ -715,6 +741,49 @@ Tool/context requirements are separated so approval policy can make precise deci
 ```
 
 Returns generated `queueTaskId` and linked `fabricTaskId` per task.
+
+## `project_queue_add_task_batch`
+
+Add tasks with shared defaults plus per-task overrides. Each per-task field overrides the corresponding default; array fields (`expectedFiles`, `acceptanceCriteria`, `requiredTools`, `requiredMcpServers`, `requiredMemories`, `requiredContextRefs`, `dependsOn`) are concatenated. `clientKey` dependency references resolve within the same batch.
+
+Validation reports the index of the first failing task.
+
+```ts
+{
+  queueId: string;
+  defaults?: {
+    phase?: string;
+    manager?: string;
+    managerId?: string;
+    parentManagerId?: string;
+    parentQueueId?: string;
+    workstream?: string;
+    costCenter?: string;
+    escalationTarget?: string;
+    category?: string;
+    status?: "queued" | "ready" | "running" | "blocked" | "review" | "patch_ready" | "completed" | "failed" | "canceled" | "accepted" | "done";
+    priority?: "low" | "normal" | "high" | "urgent";
+    parallelGroup?: string;
+    parallelSafe?: boolean;
+    risk?: "low" | "medium" | "high" | "breakglass";
+    expectedFiles?: string[];
+    acceptanceCriteria?: string[];
+    requiredTools?: string[];
+    requiredMcpServers?: string[];
+    requiredMemories?: string[];
+    requiredContextRefs?: string[];
+    dependsOn?: string[];
+  };
+  tasks: Array<{
+    clientKey?: string;
+    title: string;
+    goal: string;
+    // ... all per-task fields same as project_queue_add_tasks
+  }>;
+}
+```
+
+Returns the same shape as `project_queue_add_tasks`: `{ queueId, created, reused }`.
 
 ## `project_queue_next_ready`
 

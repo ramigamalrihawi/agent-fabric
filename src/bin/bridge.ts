@@ -18,6 +18,7 @@ const server = new McpServer({
 
 proxyTool("fabric_status", "Report bounded agent-fabric daemon health, bridge sessions, coverage, and billing/storage status.", {
   includeSessions: z.boolean().optional(),
+  verbose: z.boolean().optional(),
   sessionLimit: z.number().int().nonnegative().optional(),
   sessionOffset: z.number().int().nonnegative().optional(),
   dedupeWarnings: z.boolean().optional()
@@ -26,6 +27,7 @@ proxyTool("fabric_session_close", "Close this Agent Fabric bridge session so sta
 proxyTool("fabric_doctor", "Report agent-fabric diagnostics and actionable safe next steps.", {
   includeActions: z.boolean().optional()
 });
+proxyTool("fabric_starter_kit", "Return a concise read-only discovery surface with the essential happy-path queue tools for Codex and Claude bridge callers.", {});
 proxyTool("fabric_explain_session", "Explain what an agent-fabric session did across pillars.", {
   sessionId: z.string()
 });
@@ -446,6 +448,60 @@ proxyTool("project_queue_record_stage", "Record one prompt, planning, phasing, t
   artifacts: z.array(z.unknown()).optional(),
   warnings: z.array(z.string()).optional()
 });
+proxyTool("project_queue_add_task_batch", "Add dependency-aware coding tasks with shared defaults plus per-lane variants, validated through the same queue task schema as project_queue_add_tasks.", {
+  queueId: z.string(),
+  defaults: z.object({
+    phase: z.string().optional(),
+    manager: z.string().optional(),
+    managerId: z.string().optional(),
+    parentManagerId: z.string().optional(),
+    parentQueueId: z.string().optional(),
+    workstream: z.string().optional(),
+    costCenter: z.string().optional(),
+    escalationTarget: z.string().optional(),
+    category: z.string().optional(),
+    status: z.enum(["queued", "ready", "running", "blocked", "review", "patch_ready", "completed", "failed", "canceled", "accepted", "done"]).optional(),
+    priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
+    parallelGroup: z.string().optional(),
+    parallelSafe: z.boolean().optional(),
+    risk: z.enum(["low", "medium", "high", "breakglass"]).optional(),
+    expectedFiles: z.array(z.string()).optional(),
+    acceptanceCriteria: z.array(z.string()).optional(),
+    requiredTools: z.array(z.string()).optional(),
+    requiredMcpServers: z.array(z.string()).optional(),
+    requiredMemories: z.array(z.string()).optional(),
+    requiredContextRefs: z.array(z.string()).optional(),
+    dependsOn: z.array(z.string()).optional()
+  }).optional(),
+  tasks: z.array(
+    z.object({
+      clientKey: z.string().optional(),
+      title: z.string(),
+      goal: z.string(),
+      phase: z.string().optional(),
+      manager: z.string().optional(),
+      managerId: z.string().optional(),
+      parentManagerId: z.string().optional(),
+      parentQueueId: z.string().optional(),
+      workstream: z.string().optional(),
+      costCenter: z.string().optional(),
+      escalationTarget: z.string().optional(),
+      category: z.string().optional(),
+      status: z.enum(["queued", "ready", "running", "blocked", "review", "patch_ready", "completed", "failed", "canceled", "accepted", "done"]).optional(),
+      priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
+      parallelGroup: z.string().optional(),
+      parallelSafe: z.boolean().optional(),
+      risk: z.enum(["low", "medium", "high", "breakglass"]).optional(),
+      expectedFiles: z.array(z.string()).optional(),
+      acceptanceCriteria: z.array(z.string()).optional(),
+      requiredTools: z.array(z.string()).optional(),
+      requiredMcpServers: z.array(z.string()).optional(),
+      requiredMemories: z.array(z.string()).optional(),
+      requiredContextRefs: z.array(z.string()).optional(),
+      dependsOn: z.array(z.string()).optional()
+    })
+  )
+});
 proxyTool("project_queue_add_tasks", "Add dependency-aware coding tasks to a project queue and link each one to a fabric task.", {
   queueId: z.string(),
   tasks: z.array(
@@ -517,6 +573,10 @@ proxyTool("project_queue_recover_stale", "Dry-run or recover stale running queue
   action: z.enum(["requeue", "fail"]).optional(),
   dryRun: z.boolean().optional()
 });
+proxyTool("project_queue_worker_health", "Read-only health classification for every queue worker using durable Agent Fabric evidence: process metadata, heartbeat/checkpoint recency, output/log metadata, patch refs, failure events, stale/quiet/running/completed states, and recommended non-destructive next actions.", {
+  queueId: z.string(),
+  staleAfterMinutes: z.number().int().positive().optional()
+});
 proxyTool("project_queue_retry_task", "Return one failed, canceled, blocked, review, or patch-ready queue task to queued state for another worker attempt.", {
   queueId: z.string(),
   queueTaskId: z.string(),
@@ -544,6 +604,9 @@ proxyTool("project_queue_progress_report", "Return a resumable Senior-mode queue
   queueId: z.string(),
   maxEventsPerLane: z.number().int().positive().optional(),
   managerSummaryLimit: z.number().int().positive().max(100).optional()
+});
+proxyTool("project_queue_collab_summary", "Return a queue-scoped collab summary grouping open asks, replies, decisions, path claims, and worker handoff notes by queue task.", {
+  queueId: z.string()
 });
 proxyTool("project_queue_approval_inbox", "Read queue-scoped tool/context and model-call approvals.", {
   queueId: z.string(),
@@ -624,6 +687,9 @@ proxyTool("project_queue_decide", "Record a human queue gate decision such as ac
   ]),
   note: z.string().optional(),
   metadata: z.record(z.string(), z.unknown()).optional()
+});
+proxyTool("project_queue_patch_review_plan", "Read-only review plan for patch-ready, failed-with-artifact, completed, and no-artifact queue tasks with changed files, patch refs, worker worktree/log refs, risk notes, suggested tests, and exact CLI dry-run/apply commands. Does not apply patches.", {
+  queueId: z.string()
 });
 proxyTool("tool_context_propose", "Propose least-necessary tools, MCP servers, memories, context, and model alias for a queue task.", {
   queueId: z.string(),

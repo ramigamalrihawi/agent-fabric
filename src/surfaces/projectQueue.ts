@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { basename, isAbsolute, resolve } from "node:path";
 import { newId, stableHash } from "../ids.js";
 import { FabricError } from "../runtime/errors.js";
-import { formatMemory } from "../runtime/format.js";
+import { formatAsk, formatClaim, formatMemory, formatMessage } from "../runtime/format.js";
 import {
   asRecord,
   expandIntentString,
@@ -780,6 +780,7 @@ export function projectQueueTaskDetail(host: SurfaceHost, input: unknown, contex
         )
       : undefined;
   const resumePacket = resume ? buildQueueResumePacket(queue, task, resume) : undefined;
+  const cost = task.fabric_task_id ? taskCostAttributions(host, task.fabric_task_id) : undefined;
 
   return {
     queue: formatQueue(queue),
@@ -790,6 +791,16 @@ export function projectQueueTaskDetail(host: SurfaceHost, input: unknown, contex
     },
     readiness: queueTaskReadiness(queue, task, tasks),
     workerRuns: runs.map((run) => formatTaskWorkerRunDetail(host, task, run, maxEventsPerRun)),
+    cost: cost
+      ? {
+          sourceLabel: cost.sourceLabel,
+          totalCostUsd: cost.totalCostUsd,
+          byRole: cost.byRole,
+          eventCount: cost.eventCount,
+          eventsWithCost: cost.eventsWithCost,
+          coverageWarning: cost.coverageWarning
+        }
+      : undefined,
     toolContextProposals: toolContextProposalRowsForTask(host, queue.id, task).map(formatProposal),
     modelApprovals: taskModelApprovalRows(host, queue, task, session.workspace_root, maxModelApprovals).map((row) => formatModelApproval(row, nowIso)),
     memorySuggestions: taskMemorySuggestions(host, session.workspace_root, task, 5),
@@ -1025,167 +1036,228 @@ export function projectQueueAddTasks(host: SurfaceHost, input: unknown, context:
 
   return host.recordMutation("project_queue_add_tasks", input, context, (session) => {
     const queue = requireQueue(host, queueId, session.workspace_root);
-    const existingTasks = taskRows(host, queue.id);
-    const existingTaskIds = new Set(existingTasks.map((task) => task.id));
-    const existingByClientKey = new Map(
-      existingTasks.filter((task) => task.client_key).map((task) => [task.client_key as string, task])
-    );
     const prepared = rawTasks.map((item) => prepareTask(item));
-    const clientKeyToId = new Map<string, string>();
-    const taskIdsToCreate = new Set<string>();
-    for (const task of prepared) {
-      if (task.clientKey) {
-        const existing = existingByClientKey.get(task.clientKey);
-        if (existing) {
-          task.queueTaskId = existing.id;
-          clientKeyToId.set(task.clientKey, task.queueTaskId);
-          continue;
-        }
-        const previousPreparedId = clientKeyToId.get(task.clientKey);
-        if (previousPreparedId) {
-          task.queueTaskId = previousPreparedId;
-          continue;
-        }
-      }
-      task.queueTaskId = newId("pqtask");
-      if (task.clientKey) clientKeyToId.set(task.clientKey, task.queueTaskId);
-      taskIdsToCreate.add(task.queueTaskId);
-    }
-    const allTaskIds = new Set([...existingTaskIds, ...prepared.map((task) => task.queueTaskId)]);
-    for (const task of prepared) {
-      task.dependsOn = task.dependsOn.map((dependency) => clientKeyToId.get(dependency) ?? dependency);
-      for (const dependency of task.dependsOn) {
-        if (!allTaskIds.has(dependency)) {
-          throw new FabricError("PROJECT_QUEUE_DEPENDENCY_NOT_FOUND", `Dependency not found in queue ${queue.id}: ${dependency}`, false);
-        }
-      }
-    }
-
-    const created: ProjectQueueTaskAddResult[] = [];
-    const reused: ProjectQueueTaskAddResult[] = [];
-    const createdByQueueTaskId = new Map<string, ProjectQueueTaskAddResult>();
-    for (const task of prepared) {
-      if (!taskIdsToCreate.has(task.queueTaskId)) {
-        const existing = task.clientKey ? existingByClientKey.get(task.clientKey) : undefined;
-        if (existing) {
-          reused.push({
-            queueTaskId: existing.id,
-            fabricTaskId: existing.fabric_task_id ?? undefined,
-            clientKey: task.clientKey,
-            title: existing.title,
-            status: existing.status,
-            phase: existing.phase ?? undefined,
-            managerId: existing.manager_id ?? undefined,
-            workstream: existing.workstream ?? undefined,
-            dependsOn: safeJsonArray(existing.depends_on_json),
-            reused: true
-          });
-        }
-        continue;
-      }
-      const alreadyCreated = createdByQueueTaskId.get(task.queueTaskId);
-      if (alreadyCreated) {
-        reused.push({ ...alreadyCreated, reused: true });
-        continue;
-      }
-
-      const fabricTaskId = newId("task");
-      const correlationId = context.correlationId ?? newId("corr");
-      const refs = [`project_queue:${queue.id}`, `project_queue_task:${task.queueTaskId}`];
-      host.db.db
-        .prepare(
-          `INSERT INTO tasks (
-            id, requester_agent_id, assignee, kind, status, correlation_id,
-            refs_json, artifacts_json, workspace_root, title, goal, project_path,
-            priority, requested_by
-          ) VALUES (?, ?, 'unassigned', 'worker_task', 'created', ?, ?, '[]', ?, ?, ?, ?, ?, ?)`
-        )
-        .run(
-          fabricTaskId,
-          session.agent_id,
-          correlationId,
-          JSON.stringify(refs),
-          session.workspace_root,
-          task.title,
-          task.goal,
-          queue.project_path,
-          toWorkerPriority(task.priority),
-          "project_queue"
-        );
-      host.db.db
-        .prepare(
-          `INSERT INTO project_queue_tasks (
-            id, queue_id, fabric_task_id, client_key, title, goal, phase, manager_id,
-            parent_manager_id, parent_queue_id, workstream, cost_center,
-            escalation_target, category, status, priority, parallel_group,
-            parallel_safe, risk, expected_files_json,
-            acceptance_criteria_json, required_tools_json, required_mcp_servers_json,
-            required_memories_json, required_context_refs_json, depends_on_json,
-            session_id, agent_id, origin_peer_id, test_mode
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        )
-        .run(
-          task.queueTaskId,
-          queue.id,
-          fabricTaskId,
-          task.clientKey ?? null,
-          task.title,
-          task.goal,
-          task.phase,
-          task.managerId,
-          task.parentManagerId,
-          task.parentQueueId,
-          task.workstream,
-          task.costCenter,
-          task.escalationTarget,
-          task.category,
-          task.status,
-          task.priority,
-          task.parallelGroup,
-          task.parallelSafe ? 1 : 0,
-          task.risk,
-          JSON.stringify(task.expectedFiles),
-          JSON.stringify(task.acceptanceCriteria),
-          JSON.stringify(task.requiredTools),
-          JSON.stringify(task.requiredMcpServers),
-          JSON.stringify(task.requiredMemories),
-          JSON.stringify(task.requiredContextRefs),
-          JSON.stringify(task.dependsOn),
-          session.id,
-          session.agent_id,
-          host.originPeerId,
-          session.test_mode
-        );
-      const createdTask = {
-        queueTaskId: task.queueTaskId,
-        fabricTaskId,
-        clientKey: task.clientKey,
-        title: task.title,
-        status: task.status,
-        phase: task.phase ?? undefined,
-        managerId: task.managerId ?? undefined,
-        workstream: task.workstream ?? undefined,
-        dependsOn: task.dependsOn
-      };
-      created.push(createdTask);
-      createdByQueueTaskId.set(task.queueTaskId, createdTask);
-    }
-    host.db.db.prepare("UPDATE project_queues SET status = 'queue_review', ts_updated = CURRENT_TIMESTAMP WHERE id = ?").run(queue.id);
-    host.writeAuditAndEvent({
-      sessionId: session.id,
-      agentId: session.agent_id,
-      hostName: session.host_name,
-      workspaceRoot: session.workspace_root,
-      action: "project.queue.tasks.added",
-      sourceTable: "project_queue_tasks",
-      sourceId: queue.id,
-      eventType: "project.queue.tasks.added",
-      payload: { queueId: queue.id, count: created.length, reused: reused.length, taskIds: created.map((task) => task.queueTaskId) },
-      testMode: session.test_mode === 1,
-      context
-    });
-    return { queueId: queue.id, created, reused };
+    return addTasksCore(host, queue, session, context, prepared);
   });
+}
+
+export function projectQueueAddTaskBatch(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const queueId = getString(input, "queueId");
+  const defaults = asRecord(getField(input, "defaults")) ?? {};
+  const rawTasks = getArray(input, "tasks");
+  if (rawTasks.length === 0) {
+    throw new FabricError("INVALID_INPUT", "tasks must contain at least one task", false);
+  }
+
+  return host.recordMutation("project_queue_add_task_batch", input, context, (session) => {
+    const queue = requireQueue(host, queueId, session.workspace_root);
+    const prepared = rawTasks.map((item, index) => {
+      try {
+        return prepareTask(mergeDefaultsWithTask(defaults, asRecord(item), index));
+      } catch (error) {
+        if (error instanceof FabricError) {
+          throw new FabricError("INVALID_INPUT", `Task at index ${index}: ${error.message}`, false);
+        }
+        throw error;
+      }
+    });
+    return addTasksCore(host, queue, session, context, prepared);
+  });
+}
+
+function addTasksCore(
+  host: SurfaceHost,
+  queue: ProjectQueueRow,
+  session: { id: string; agent_id: string; host_name: string | null; test_mode: 0 | 1 },
+  context: CallContext,
+  prepared: Array<{
+    queueTaskId: string;
+    clientKey?: string;
+    title: string;
+    goal: string;
+    phase: string | null;
+    managerId: string | null;
+    parentManagerId: string | null;
+    parentQueueId: string | null;
+    workstream: string | null;
+    costCenter: string | null;
+    escalationTarget: string | null;
+    category: string;
+    status: string;
+    priority: string;
+    parallelGroup: string | null;
+    parallelSafe: boolean;
+    risk: string;
+    expectedFiles: string[];
+    acceptanceCriteria: string[];
+    requiredTools: string[];
+    requiredMcpServers: string[];
+    requiredMemories: string[];
+    requiredContextRefs: string[];
+    dependsOn: string[];
+  }>
+): Record<string, unknown> {
+  const existingTasks = taskRows(host, queue.id);
+  const existingTaskIds = new Set(existingTasks.map((task) => task.id));
+  const existingByClientKey = new Map(
+    existingTasks.filter((task) => task.client_key).map((task) => [task.client_key as string, task])
+  );
+  const clientKeyToId = new Map<string, string>();
+  const taskIdsToCreate = new Set<string>();
+  for (const task of prepared) {
+    if (task.clientKey) {
+      const existing = existingByClientKey.get(task.clientKey);
+      if (existing) {
+        task.queueTaskId = existing.id;
+        clientKeyToId.set(task.clientKey, task.queueTaskId);
+        continue;
+      }
+      const previousPreparedId = clientKeyToId.get(task.clientKey);
+      if (previousPreparedId) {
+        task.queueTaskId = previousPreparedId;
+        continue;
+      }
+    }
+    task.queueTaskId = newId("pqtask");
+    if (task.clientKey) clientKeyToId.set(task.clientKey, task.queueTaskId);
+    taskIdsToCreate.add(task.queueTaskId);
+  }
+  const allTaskIds = new Set([...existingTaskIds, ...prepared.map((task) => task.queueTaskId)]);
+  for (const task of prepared) {
+    task.dependsOn = task.dependsOn.map((dependency) => clientKeyToId.get(dependency) ?? dependency);
+    for (const dependency of task.dependsOn) {
+      if (!allTaskIds.has(dependency)) {
+        throw new FabricError("PROJECT_QUEUE_DEPENDENCY_NOT_FOUND", `Dependency not found in queue ${queue.id}: ${dependency}`, false);
+      }
+    }
+  }
+
+  const created: ProjectQueueTaskAddResult[] = [];
+  const reused: ProjectQueueTaskAddResult[] = [];
+  const allWarnings: string[] = [];
+  const createdByQueueTaskId = new Map<string, ProjectQueueTaskAddResult>();
+  for (const task of prepared) {
+    if (task.warnings.length > 0) allWarnings.push(...task.warnings);
+    if (!taskIdsToCreate.has(task.queueTaskId)) {
+      const existing = task.clientKey ? existingByClientKey.get(task.clientKey) : undefined;
+      if (existing) {
+        reused.push({
+          queueTaskId: existing.id,
+          fabricTaskId: existing.fabric_task_id ?? undefined,
+          clientKey: task.clientKey,
+          title: existing.title,
+          status: existing.status,
+          phase: existing.phase ?? undefined,
+          managerId: existing.manager_id ?? undefined,
+          workstream: existing.workstream ?? undefined,
+          dependsOn: safeJsonArray(existing.depends_on_json),
+          reused: true
+        });
+      }
+      continue;
+    }
+    const alreadyCreated = createdByQueueTaskId.get(task.queueTaskId);
+    if (alreadyCreated) {
+      reused.push({ ...alreadyCreated, reused: true });
+      continue;
+    }
+
+    const fabricTaskId = newId("task");
+    const correlationId = context.correlationId ?? newId("corr");
+    const refs = [`project_queue:${queue.id}`, `project_queue_task:${task.queueTaskId}`];
+    host.db.db
+      .prepare(
+        `INSERT INTO tasks (
+          id, requester_agent_id, assignee, kind, status, correlation_id,
+          refs_json, artifacts_json, workspace_root, title, goal, project_path,
+          priority, requested_by
+        ) VALUES (?, ?, 'unassigned', 'worker_task', 'created', ?, ?, '[]', ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        fabricTaskId,
+        session.agent_id,
+        correlationId,
+        JSON.stringify(refs),
+        session.workspace_root,
+        task.title,
+        task.goal,
+        queue.project_path,
+        toWorkerPriority(task.priority),
+        "project_queue"
+      );
+    host.db.db
+      .prepare(
+        `INSERT INTO project_queue_tasks (
+          id, queue_id, fabric_task_id, client_key, title, goal, phase, manager_id,
+          parent_manager_id, parent_queue_id, workstream, cost_center,
+          escalation_target, category, status, priority, parallel_group,
+          parallel_safe, risk, expected_files_json,
+          acceptance_criteria_json, required_tools_json, required_mcp_servers_json,
+          required_memories_json, required_context_refs_json, depends_on_json,
+          session_id, agent_id, origin_peer_id, test_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        task.queueTaskId,
+        queue.id,
+        fabricTaskId,
+        task.clientKey ?? null,
+        task.title,
+        task.goal,
+        task.phase,
+        task.managerId,
+        task.parentManagerId,
+        task.parentQueueId,
+        task.workstream,
+        task.costCenter,
+        task.escalationTarget,
+        task.category,
+        task.status,
+        task.priority,
+        task.parallelGroup,
+        task.parallelSafe ? 1 : 0,
+        task.risk,
+        JSON.stringify(task.expectedFiles),
+        JSON.stringify(task.acceptanceCriteria),
+        JSON.stringify(task.requiredTools),
+        JSON.stringify(task.requiredMcpServers),
+        JSON.stringify(task.requiredMemories),
+        JSON.stringify(task.requiredContextRefs),
+        JSON.stringify(task.dependsOn),
+        session.id,
+        session.agent_id,
+        host.originPeerId,
+        session.test_mode
+      );
+    const createdTask = {
+      queueTaskId: task.queueTaskId,
+      fabricTaskId,
+      clientKey: task.clientKey,
+      title: task.title,
+      status: task.status,
+      phase: task.phase ?? undefined,
+      managerId: task.managerId ?? undefined,
+      workstream: task.workstream ?? undefined,
+      dependsOn: task.dependsOn
+    };
+    created.push(createdTask);
+    createdByQueueTaskId.set(task.queueTaskId, createdTask);
+  }
+  host.db.db.prepare("UPDATE project_queues SET status = 'queue_review', ts_updated = CURRENT_TIMESTAMP WHERE id = ?").run(queue.id);
+  host.writeAuditAndEvent({
+    sessionId: session.id,
+    agentId: session.agent_id,
+    hostName: session.host_name,
+    workspaceRoot: session.workspace_root,
+    action: "project.queue.tasks.added",
+    sourceTable: "project_queue_tasks",
+    sourceId: queue.id,
+    eventType: "project.queue.tasks.added",
+    payload: { queueId: queue.id, count: created.length, reused: reused.length, taskIds: created.map((task) => task.queueTaskId), warnings: allWarnings.length > 0 ? allWarnings : undefined },
+    testMode: session.test_mode === 1,
+    context
+  });
+  return { queueId: queue.id, created, reused, warnings: allWarnings.length > 0 ? allWarnings : undefined };
 }
 
 export function projectQueueNextReady(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
@@ -1800,6 +1872,7 @@ export function projectQueueAgentLanes(host: SurfaceHost, input: unknown, contex
     const formattedEvents = events.map(formatWorkerEvent);
     const latestEvent = formattedEvents[0];
     const formattedCheckpoint = checkpoint ? formatWorkerCheckpoint(checkpoint) : undefined;
+    const costSummary = taskCostAttributions(host, run.task_id);
     lanes.push({
       laneId: run.id,
       queueId: queue.id,
@@ -1808,7 +1881,15 @@ export function projectQueueAgentLanes(host: SurfaceHost, input: unknown, contex
       latestEvent,
       recentEvents: formattedEvents,
       latestCheckpoint: formattedCheckpoint,
-      progress: laneProgress(task, run, latestEvent, formattedCheckpoint)
+      progress: laneProgress(task, run, latestEvent, formattedCheckpoint),
+      cost: {
+        sourceLabel: costSummary.sourceLabel,
+        totalCostUsd: costSummary.totalCostUsd,
+        byRole: costSummary.byRole,
+        eventCount: costSummary.eventCount,
+        eventsWithCost: costSummary.eventsWithCost,
+        coverageWarning: costSummary.coverageWarning
+      }
     });
   }
 
@@ -1942,12 +2023,14 @@ export function projectQueueProgressReport(host: SurfaceHost, input: unknown, co
   });
   const nextActions = nextProgressActions(queue, summary, pendingApprovalCount, patchReadyTasks.length, scheduled.ready.length);
   const laneRows = arrayRecordsFromUnknown(lanes.lanes);
+  const taskCostCoverage = queueTaskCostCoverage(tasks, laneRows);
 
   return {
     schema: "agent-fabric.project-queue-progress.v1",
     queue: formatQueue(queue),
     generatedAt: nowIso,
     summary,
+    taskCostCoverage,
     managerSummary: queueManagerSummary({
       tasks,
       lanes: laneRows,
@@ -1973,6 +2056,146 @@ export function projectQueueProgressReport(host: SurfaceHost, input: unknown, co
       "Run targeted tests or checks from each accepted worker result.",
       "Record accepted or rejected output in the queue before final handoff."
     ]
+  };
+}
+
+export function projectQueuePatchReviewPlan(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const session = host.requireSession(context);
+  const queue = requireQueue(host, getString(input, "queueId"), session.workspace_root);
+  const tasks = taskRows(host, queue.id);
+  const nowIso = host.now().toISOString();
+
+  const patchReadyStatuses = new Set(["patch_ready", "review", "accepted"]);
+  const artifactStatuses = new Set([...patchReadyStatuses, "failed", "completed"]);
+
+  const entries: Array<Record<string, unknown>> = [];
+  const skipped: Array<Record<string, unknown>> = [];
+
+  for (const task of tasks) {
+    if (!artifactStatuses.has(task.status)) {
+      skipped.push({
+        queueTaskId: task.id,
+        title: task.title,
+        status: task.status,
+        reason: `status ${task.status} is not patch-ready, failed, or completed`
+      });
+      continue;
+    }
+
+    const patchRefs = safeJsonArray(task.patch_refs_json).filter((ref): ref is string => typeof ref === "string");
+    const testRefs = safeJsonArray(task.test_refs_json).filter((ref): ref is string => typeof ref === "string");
+    const workerRuns = task.fabric_task_id ? workerRunRowsForFabricTask(host, task.fabric_task_id) : [];
+    const latestRun = workerRuns[0];
+    const events = task.fabric_task_id && latestRun
+      ? workerEventRows(host, task.fabric_task_id, latestRun.id, 20)
+      : [];
+    const checkpoint = task.fabric_task_id && latestRun
+      ? latestWorkerCheckpoint(host, task.fabric_task_id, latestRun.id)
+      : undefined;
+
+    const changedFiles = events
+      .filter((event) => event.kind === "file_changed")
+      .flatMap((event) => safeJsonArray(event.refs_json).filter((ref): ref is string => typeof ref === "string"));
+
+    const checkpointSummary = checkpoint ? safeJsonRecord(checkpoint.summary_json) : undefined;
+    const failingTests: string[] = Array.isArray(checkpointSummary?.failingTests)
+      ? checkpointSummary.failingTests.filter((item): item is string => typeof item === "string")
+      : [];
+    const suggestedTests: string[] = Array.isArray(checkpointSummary?.testsSuggested)
+      ? checkpointSummary.testsSuggested.filter((item): item is string => typeof item === "string")
+      : [];
+    const blockers: string[] = Array.isArray(checkpointSummary?.blockers)
+      ? checkpointSummary.blockers.filter((item): item is string => typeof item === "string")
+      : [];
+    const filesTouched: string[] = Array.isArray(checkpointSummary?.filesTouched)
+      ? checkpointSummary.filesTouched.filter((item): item is string => typeof item === "string")
+      : [];
+
+    const allFiles = [...new Set([...changedFiles, ...filesTouched, ...patchRefs])];
+
+    const worktreePath = latestRun?.workspace_path ?? queue.project_path;
+    const workerLogRef = latestRun?.id
+      ? `fabric_task_status(taskId=${task.fabric_task_id}, workerRunId=${latestRun.id})`
+      : undefined;
+
+    const riskNotes: string[] = [];
+    if (task.risk === "high" || task.risk === "breakglass") {
+      riskNotes.push(`high-risk task (${task.risk})`);
+    }
+    if (failingTests.length > 0) {
+      riskNotes.push(`${failingTests.length} failing test(s)`);
+    }
+    if (blockers.length > 0) {
+      riskNotes.push(`${blockers.length} blocker(s): ${blockers.join("; ")}`);
+    }
+    if (!latestRun) {
+      riskNotes.push("no worker run recorded");
+    }
+    if (patchRefs.length === 0 && task.status === "patch_ready") {
+      riskNotes.push("patch-ready but no patch refs recorded");
+    }
+
+    const isPatchReady = patchReadyStatuses.has(task.status);
+    const reviewCommand = isPatchReady
+      ? `agent-fabric-project review-patches --queue ${queue.id}`
+      : undefined;
+    const applyCommand = isPatchReady && patchRefs.length > 0 && latestRun
+      ? `agent-fabric-project review-patches --queue ${queue.id} --accept-task ${task.id} --apply-patch --apply-cwd ${worktreePath}`
+      : isPatchReady && latestRun
+        ? `agent-fabric-project review-patches --queue ${queue.id} --accept-task ${task.id} --apply-cwd ${worktreePath}`
+        : undefined;
+    const mergeWorkerCommand = latestRun?.workspace_path
+      ? `merge-worker --queue ${queue.id} --queue-task ${task.id} ${latestRun.workspace_path}`
+      : undefined;
+
+    entries.push({
+      queueTask: formatQueueTask(task),
+      status: task.status,
+      patchReady: isPatchReady,
+      hasArtifact: patchRefs.length > 0 || changedFiles.length > 0 || (checkpointSummary !== undefined),
+      patchRefs,
+      testRefs,
+      changedFiles: allFiles.slice(0, 100),
+      worktreePath,
+      workerRun: latestRun ? formatWorkerRun(latestRun) : undefined,
+      workerLogRef,
+      checkpoint: checkpoint ? formatWorkerCheckpoint(checkpoint) : undefined,
+      checkpointSummary,
+      failingTests,
+      suggestedTests,
+      blockers,
+      riskNotes,
+      commands: {
+        reviewPatches: reviewCommand,
+        applyPatch: applyCommand,
+        mergeWorker: mergeWorkerCommand,
+        dryRun: applyCommand ? `${applyCommand} --dry-run` : undefined
+      }
+    });
+  }
+
+  const patchReadyCount = entries.filter((entry) => entry.patchReady).length;
+  const failedCount = entries.filter((entry) => entry.status === "failed").length;
+  const completedCount = entries.filter((entry) => entry.status === "completed").length;
+
+  return {
+    schema: "agent-fabric.project-queue-patch-review-plan.v1",
+    queue: formatQueue(queue),
+    generatedAt: nowIso,
+    summary: {
+      totalTasks: tasks.length,
+      patchReadyCount,
+      failedWithArtifactCount: failedCount,
+      completedCount,
+      skippedCount: skipped.length
+    },
+    entries,
+    skipped,
+    nextCommand: patchReadyCount > 0
+      ? `agent-fabric-project review-patches --queue ${queue.id}`
+      : failedCount > 0
+        ? `agent-fabric-project retry-task --queue ${queue.id} --queue-task <queueTaskId>`
+        : `agent-fabric-project dashboard --queue ${queue.id}`
   };
 }
 
@@ -2136,7 +2359,10 @@ export function projectQueueUpdateTaskMetadata(host: SurfaceHost, input: unknown
   const costCenter = getOptionalString(input, "costCenter");
   const escalationTarget = getOptionalString(input, "escalationTarget");
   const category = getOptionalString(input, "category");
-  const priority = optionalNormalized(input, "priority", TASK_PRIORITIES);
+  const priorityRaw = getOptionalString(input, "priority");
+  const priorityNorm = priorityRaw !== undefined && priorityRaw !== null ? normalizePriority(priorityRaw) : null;
+  const priority = priorityNorm?.normalized;
+  const priorityWarning: string | undefined = priorityNorm?.warning;
   const parallelGroup = getOptionalString(input, "parallelGroup");
   const parallelSafe = getOptionalBoolean(input, "parallelSafe");
   const risk = optionalNormalized(input, "risk", RISKS);
@@ -2298,7 +2524,8 @@ export function projectQueueUpdateTaskMetadata(host: SurfaceHost, input: unknown
       queue: formatQueue(requireQueue(host, queue.id, session.workspace_root)),
       task: formatQueueTask(updated),
       previousTask: formatQueueTask(task),
-      staleToolContextProposalIds
+      staleToolContextProposalIds,
+      warnings: priorityWarning ? [priorityWarning] : undefined
     };
   });
 }
@@ -2336,6 +2563,118 @@ export function projectQueueDecide(host: SurfaceHost, input: unknown, context: C
     });
     return { decisionId, queueId: queue.id, decision, status: queueStatusForDecision(decision, queue.status) };
   });
+}
+
+export function projectQueueCollabSummary(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const session = host.requireSession(context);
+  const queue = requireQueue(host, getString(input, "queueId"), session.workspace_root);
+  const tasks = taskRows(host, queue.id);
+  const byQueueTaskId = new Map(tasks.map((t) => [t.id, t]));
+  const taskIds = [...byQueueTaskId.keys()];
+
+  if (taskIds.length === 0) {
+    return {
+      schema: "agent-fabric.project-queue-collab-summary.v1",
+      queue: formatQueue(queue),
+      groups: [],
+      unlinked: { openAsks: [], replies: [], decisions: [], pathClaims: [], handoffNotes: [] }
+    };
+  }
+
+  const refPatterns = [
+    `%"project_queue:${queue.id}"%`,
+    `%"queue:${queue.id}"%`,
+    ...taskIds.flatMap((id) => [`%"project_queue_task:${id}"%`, `%"queueTask:${id}"%`])
+  ];
+  const refClauses = refPatterns.map(() => "refs_json LIKE ?").join(" OR ");
+
+  const messageParams: string[] = [session.workspace_root, ...refPatterns];
+  const messages = host.db.db
+    .prepare(`SELECT * FROM messages WHERE workspace_root = ? AND (${refClauses}) ORDER BY ts ASC`)
+    .all(...messageParams) as Record<string, unknown>[];
+
+  const askParams: string[] = [session.workspace_root, ...refPatterns];
+  const asks = host.db.db
+    .prepare(`SELECT * FROM asks WHERE workspace_root = ? AND status = 'open' AND (${refClauses}) ORDER BY ts_created ASC`)
+    .all(...askParams) as Record<string, unknown>[];
+
+  const decisions = host.db.db
+    .prepare("SELECT * FROM decisions WHERE workspace_root = ? ORDER BY ts DESC LIMIT 50")
+    .all(session.workspace_root) as Record<string, unknown>[];
+
+  const claims = host.db.db
+    .prepare(`SELECT * FROM claims WHERE workspace_root = ? AND released = 0 AND (ts_expires IS NULL OR datetime(ts_expires) > CURRENT_TIMESTAMP) ORDER BY ts_created DESC`)
+    .all(session.workspace_root) as Record<string, unknown>[];
+
+  function matchingTaskIds(refsStr: unknown): string[] {
+    const refs = safeJsonArray(refsStr);
+    return refs
+      .flatMap((r) => {
+        if (typeof r !== "string") return [];
+        if (r.startsWith("project_queue_task:")) return [r.slice("project_queue_task:".length)];
+        if (r.startsWith("queueTask:")) return [r.slice("queueTask:".length)];
+        return [];
+      })
+      .filter((id) => byQueueTaskId.has(id));
+  }
+
+  const taskAsks = new Map<string, Record<string, unknown>[]>();
+  const taskReplies = new Map<string, Record<string, unknown>[]>();
+  const taskHandoffs = new Map<string, Record<string, unknown>[]>();
+  for (const tid of taskIds) {
+    taskAsks.set(tid, []);
+    taskReplies.set(tid, []);
+    taskHandoffs.set(tid, []);
+  }
+
+  for (const row of messages) {
+    const fmtd = formatMessage(row);
+    const matched = matchingTaskIds(row.refs_json);
+    const isHandoff = typeof row.kind === "string" && row.kind === "dm" && typeof row.body === "string" && (row.body.includes("handoff") || row.body.includes("checkpoint") || row.body.includes("resume"));
+    const isReply = Boolean(row.ask_id);
+    for (const tid of matched) {
+      if (isReply) taskReplies.get(tid)?.push(fmtd);
+      else if (isHandoff) taskHandoffs.get(tid)?.push(fmtd);
+    }
+  }
+
+  for (const row of asks) {
+    const fmtd = formatAsk(row);
+    for (const tid of matchingTaskIds(row.refs_json)) {
+      taskAsks.get(tid)?.push(fmtd);
+    }
+  }
+
+  const groups: Array<Record<string, unknown>> = [];
+  for (const task of tasks) {
+    const tid = task.id;
+    const a = taskAsks.get(tid) ?? [];
+    const r = taskReplies.get(tid) ?? [];
+    const h = taskHandoffs.get(tid) ?? [];
+    if (a.length === 0 && r.length === 0 && h.length === 0) continue;
+    groups.push({ queueTask: formatQueueTask(task), openAsks: a, replies: r, decisions: [], pathClaims: [], handoffNotes: h, summary: { openAskCount: a.filter((x) => x.status === "open").length, resolvedCount: r.length, hasHandoff: h.length > 0 } });
+  }
+
+  function scopeToQueue(refsStr: unknown): boolean {
+    return safeJsonArray(refsStr).some((r) => r === `project_queue:${queue.id}` || r === `queue:${queue.id}`);
+  }
+
+  const qMessages = messages.filter((r) => scopeToQueue(r.refs_json) && matchingTaskIds(r.refs_json).length === 0);
+  const qAsks = asks.filter((r) => scopeToQueue(r.refs_json) && matchingTaskIds(r.refs_json).length === 0);
+
+  return {
+    schema: "agent-fabric.project-queue-collab-summary.v1",
+    queue: formatQueue(queue),
+    generatedAt: host.now().toISOString(),
+    groups,
+    unlinked: {
+      openAsks: qAsks.map(formatAsk),
+      replies: qMessages.filter((r) => Boolean(r.ask_id)).map(formatMessage),
+      decisions: decisions.map((r) => ({ id: r.id, ts: r.ts, title: r.title, decided: r.decided, recordedBy: r.recorded_by_agent_id, participants: safeJsonArray(r.participants_json) })),
+      pathClaims: claims.map(formatClaim),
+      handoffNotes: qMessages.filter((r) => !r.ask_id && typeof r.kind === "string" && r.kind === "dm" && typeof r.body === "string" && (r.body.includes("handoff") || r.body.includes("checkpoint") || r.body.includes("resume"))).map(formatMessage)
+    }
+  };
 }
 
 export function toolContextPropose(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
@@ -2623,6 +2962,7 @@ function prepareTask(input: unknown): {
   category: string;
   status: string;
   priority: string;
+  warnings: string[];
   parallelGroup: string | null;
   parallelSafe: boolean;
   risk: string;
@@ -2641,6 +2981,7 @@ function prepareTask(input: unknown): {
   const title = stringField(record, "title");
   const goal = stringField(record, "goal");
   const status = normalizeValue(optionalStringField(record, "status") ?? "queued", TASK_STATUSES, "task.status");
+  const priorityResult = normalizePriority(optionalStringField(record, "priority") ?? "normal");
   return {
     queueTaskId: "",
     clientKey: optionalStringField(record, "clientKey"),
@@ -2655,7 +2996,8 @@ function prepareTask(input: unknown): {
     escalationTarget: optionalStringField(record, "escalationTarget") ?? null,
     category: optionalStringField(record, "category") ?? "implementation",
     status,
-    priority: normalizeValue(optionalStringField(record, "priority") ?? "normal", TASK_PRIORITIES, "task.priority"),
+    priority: priorityResult.normalized,
+    warnings: priorityResult.warning ? [priorityResult.warning] : [],
     parallelGroup: optionalStringField(record, "parallelGroup") ?? null,
     parallelSafe: optionalBooleanField(record, "parallelSafe") ?? true,
     risk: normalizeValue(optionalStringField(record, "risk") ?? "medium", RISKS, "task.risk"),
@@ -2667,6 +3009,46 @@ function prepareTask(input: unknown): {
     requiredContextRefs: stringArrayField(record, "requiredContextRefs"),
     dependsOn: stringArrayField(record, "dependsOn")
   };
+}
+
+function mergeDefaultsWithTask(defaults: Record<string, unknown>, taskRecord: Record<string, unknown> | undefined, index: number): Record<string, unknown> {
+  if (!taskRecord || Object.keys(taskRecord).length === 0) {
+    throw new FabricError("INVALID_INPUT", `Task at index ${index} must be an object`, false);
+  }
+  const merged: Record<string, unknown> = {};
+  // Copy all defaults first
+  for (const key of Object.keys(defaults)) {
+    if (defaults[key] !== undefined && defaults[key] !== null) {
+      merged[key] = defaults[key];
+    }
+  }
+  // Task-specific fields override defaults
+  for (const key of Object.keys(taskRecord)) {
+    if (taskRecord[key] !== undefined && taskRecord[key] !== null) {
+      merged[key] = taskRecord[key];
+    }
+  }
+  // Array fields from defaults and task are concatenated (defaults first, then task overrides)
+  const arrayFields = [
+    "expectedFiles",
+    "acceptanceCriteria",
+    "requiredTools",
+    "requiredMcpServers",
+    "requiredMemories",
+    "requiredContextRefs",
+    "dependsOn"
+  ];
+  for (const field of arrayFields) {
+    const defaultArr = Array.isArray(defaults[field]) ? defaults[field] as unknown[] : [];
+    const taskArr = Array.isArray(taskRecord[field]) ? taskRecord[field] as unknown[] : [];
+    if (defaultArr.length > 0 || taskArr.length > 0) {
+      merged[field] = [...new Set([...defaultArr, ...taskArr])];
+    }
+  }
+  // Ensure title and goal are always present (not inherited from defaults)
+  merged.title = taskRecord.title ?? defaults.title;
+  merged.goal = taskRecord.goal ?? defaults.goal;
+  return merged;
 }
 
 function promptSummaryFromInput(input: unknown): string {
@@ -2740,6 +3122,18 @@ function normalizeManagerSummaryLimit(value: number): number {
 function normalizeValue(value: string, allowed: Set<string>, field: string): string {
   if (allowed.has(value)) return value;
   throw new FabricError("INVALID_INPUT", `${field} must be one of: ${[...allowed].join(", ")}`, false);
+}
+
+function normalizePriority(value: string): { normalized: string; warning?: string } {
+  if (TASK_PRIORITIES.has(value)) return { normalized: value };
+  if (value === "medium") return { normalized: "normal", warning: `priority "medium" normalized to "normal"` };
+  throw new FabricError("INVALID_INPUT", `priority must be one of: ${[...TASK_PRIORITIES].join(", ")}`, false);
+}
+
+function normalizeOptionalPriority(input: unknown, field: string): string | undefined {
+  const value = getOptionalString(input, field);
+  if (value === undefined || value === null) return undefined;
+  return normalizePriority(value).normalized;
 }
 
 function optionalNormalized(input: unknown, field: string, allowed: Set<string>): string | undefined {
@@ -3044,6 +3438,64 @@ function queueWorkerCostAttributions(host: SurfaceHost, queueId: string): QueueW
     });
   }
   return attributions;
+}
+
+function taskCostAttributions(host: SurfaceHost, fabricTaskId: string): {
+  byRole: Record<string, { count: number; costUsd: number }>;
+  totalCostUsd: number;
+  eventCount: number;
+  eventsWithCost: number;
+  sourceLabel: "worker_event" | "none";
+  coverageWarning: string | null;
+} {
+  const rows = host.db.db
+    .prepare(
+      `SELECT e.cost_usd, e.metadata_json, wr.worker, wr.metadata_json AS worker_metadata_json, t.category
+       FROM worker_events e
+       JOIN worker_runs wr ON wr.id = e.worker_run_id
+       JOIN project_queue_tasks t ON t.fabric_task_id = e.task_id
+       WHERE e.task_id = ?
+       ORDER BY e.ts ASC`
+    )
+    .all(fabricTaskId) as Array<{
+    cost_usd: number | null;
+    metadata_json: string;
+    worker: string | null;
+    worker_metadata_json: string;
+    category: string | null;
+  }>;
+  const attributions: QueueWorkerCostAttribution[] = [];
+  let eventsWithCost = 0;
+  for (const row of rows) {
+    const eventMetadata = safeJsonRecord(row.metadata_json);
+    const workerMetadata = safeJsonRecord(row.worker_metadata_json);
+    const costUsd = row.cost_usd ?? costFromWorkerEventMetadata(eventMetadata);
+    if (costUsd !== undefined && costUsd > 0) {
+      eventsWithCost += 1;
+      attributions.push({
+        role: costRoleFromMetadata(workerMetadata, row.category, row.worker),
+        costUsd
+      });
+    }
+  }
+  const byRole = aggregateWorkerCosts(attributions);
+  const totalCostUsd = roundUsd(Object.values(byRole).reduce((sum, entry) => sum + entry.costUsd, 0));
+  const hasWorkerRuns = rows.length > 0;
+  const sourceLabel = eventsWithCost > 0 ? "worker_event" : "none";
+  const coverageWarning =
+    hasWorkerRuns && eventsWithCost === 0
+      ? "worker_cost_missing: no worker events with cost data recorded for this task"
+      : !hasWorkerRuns
+        ? "no_worker_runs: task has no recorded worker runs"
+        : null;
+  return {
+    byRole,
+    totalCostUsd,
+    eventCount: rows.length,
+    eventsWithCost,
+    sourceLabel,
+    coverageWarning
+  };
 }
 
 function queueWorkerEventRows(host: SurfaceHost, queueId: string, limit: number): QueueWorkerEventRow[] {
@@ -4165,6 +4617,57 @@ function queueCostStrip(preflights: QueuePreflightRow[], workerCosts: QueueWorke
   };
 }
 
+function queueTaskCostCoverage(
+  tasks: ProjectQueueTaskRow[],
+  laneRows: Record<string, unknown>[]
+): Record<string, unknown> {
+  const laneByTaskId = new Map<string, Record<string, unknown>>();
+  for (const lane of laneRows) {
+    const queueTask = asRecord(lane.queueTask);
+    const queueTaskId = typeof queueTask.queueTaskId === "string" ? queueTask.queueTaskId : undefined;
+    if (queueTaskId) laneByTaskId.set(queueTaskId, lane);
+  }
+  let tasksWithCost = 0;
+  let tasksWithWorkerRuns = 0;
+  let tasksWithoutCostEvents = 0;
+  const tasksMissingCost: Array<{ queueTaskId: string; title: string; status: string; coverageWarning: string }> = [];
+  for (const task of tasks) {
+    const lane = laneByTaskId.get(task.id);
+    const cost = lane ? asRecord(lane.cost) : undefined;
+    if (cost) {
+      const totalCostUsd = typeof cost.totalCostUsd === "number" ? cost.totalCostUsd : 0;
+      const eventsWithCost = typeof cost.eventsWithCost === "number" ? cost.eventsWithCost : 0;
+      const workerRunsWithCost = totalCostUsd > 0 || eventsWithCost > 0;
+      if (workerRunsWithCost) tasksWithCost += 1;
+      const hasWorkerRuns = (typeof cost.eventCount === "number" ? cost.eventCount : 0) > 0;
+      if (hasWorkerRuns) {
+        tasksWithWorkerRuns += 1;
+        if (!workerRunsWithCost) {
+          tasksWithoutCostEvents += 1;
+          tasksMissingCost.push({
+            queueTaskId: task.id,
+            title: task.title,
+            status: task.status,
+            coverageWarning: String(cost.coverageWarning ?? "worker_cost_missing")
+          });
+        }
+      }
+    }
+  }
+  const bounded = tasksMissingCost.length > 10;
+  return {
+    sourceLabel: "worker_event_details",
+    totalTasks: tasks.length,
+    tasksWithCost,
+    tasksWithWorkerRuns,
+    tasksWithoutCostEvents,
+    costCoveragePercent: tasksWithWorkerRuns > 0 ? Math.round(tasksWithCost * 100 / tasksWithWorkerRuns) : (tasksWithCost > 0 ? 100 : 0),
+    tasksMissingCost: tasksMissingCost.slice(0, 10),
+    omittedTasks: bounded ? tasksMissingCost.length - 10 : 0,
+    coverageWarning: tasksWithoutCostEvents > 0 ? "Some tasks with worker runs have no cost-attributed events. Worker tooling should record cost data on events." : null
+  };
+}
+
 function costFromWorkerEventMetadata(metadata: Record<string, unknown>): number | undefined {
   const direct = typeof metadata.costUsd === "number" ? metadata.costUsd : undefined;
   if (direct !== undefined) return direct;
@@ -4896,6 +5399,17 @@ function buildQueueTaskPacket(queue: ProjectQueueRow, task: ProjectQueueTaskRow)
     requiredMcpServers: safeJsonArray(task.required_mcp_servers_json),
     requiredMemories: safeJsonArray(task.required_memories_json),
     requiredContextRefs: safeJsonArray(task.required_context_refs_json),
+    collab: {
+      queueRef: `project_queue:${queue.id}`,
+      taskRef: `project_queue_task:${task.id}`,
+      instructions: [
+        "Use collab_send with refs including the taskRef to send messages scoped to this queue task.",
+        "Use collab_ask with refs including the taskRef to ask another agent for review, help, or handoff.",
+        "Use collab_reply to answer open asks from the collab summary.",
+        "Use collab_status to see active claims and open asks.",
+        "Use project_queue_collab_summary to see all collab activity scoped to this queue."
+      ]
+    },
     operatorInstructions: [
       "Work only on this queue task unless the queue state says otherwise.",
       "Use only approved tools, MCP servers, memories, and context.",
@@ -5432,4 +5946,304 @@ function stringArrayField(record: Record<string, unknown>, field: string): strin
     throw new FabricError("INVALID_INPUT", `Expected string array field: ${field}`, false);
   }
   return value;
+}
+
+export function projectQueueWorkerHealth(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const session = host.requireSession(context);
+  const queue = requireQueue(host, getString(input, "queueId"), session.workspace_root);
+  const staleAfterMinutes = getOptionalNumber(input, "staleAfterMinutes") ?? 30;
+  if (!Number.isInteger(staleAfterMinutes) || staleAfterMinutes < 1 || staleAfterMinutes > 1440) {
+    throw new FabricError("INVALID_INPUT", "staleAfterMinutes must be an integer between 1 and 1440", false);
+  }
+  const nowIso = host.now().toISOString();
+  const nowMs = host.now().getTime();
+  const cutoffIso = new Date(nowMs - staleAfterMinutes * 60_000).toISOString();
+
+  const tasks = taskRows(host, queue.id);
+  const taskByFabricId = new Map<string, ProjectQueueTaskRow>();
+  const taskById = new Map<string, ProjectQueueTaskRow>();
+  for (const task of tasks) {
+    taskById.set(task.id, task);
+    if (task.fabric_task_id) taskByFabricId.set(task.fabric_task_id, task);
+  }
+
+  const fabricTaskIds = [...taskByFabricId.keys()];
+  let runs: WorkerRunRow[] = [];
+  if (fabricTaskIds.length > 0) {
+    const placeholders = fabricTaskIds.map(() => "?").join(", ");
+    runs = host.db.db
+      .prepare(`SELECT * FROM worker_runs WHERE task_id IN (${placeholders}) ORDER BY ts_updated DESC, ts_started DESC`)
+      .all(...fabricTaskIds) as WorkerRunRow[];
+  }
+
+  const runByTaskId = new Map<string, WorkerRunRow>();
+  for (const run of runs) {
+    runByTaskId.set(run.task_id, run);
+  }
+
+  const allRunsByTaskId = new Map<string, WorkerRunRow[]>();
+  for (const run of runs) {
+    const list = allRunsByTaskId.get(run.task_id) ?? [];
+    list.push(run);
+    allRunsByTaskId.set(run.task_id, list);
+  }
+
+  const workerRows: Array<Record<string, unknown>> = [];
+  for (const task of tasks) {
+    const isClosed = CLOSED_LANE_TASK_STATUSES.has(task.status) || task.status === "failed" || task.status === "canceled";
+    const taskRuns = task.fabric_task_id ? (allRunsByTaskId.get(task.fabric_task_id) ?? []) : [];
+    const latestRun = taskRuns.length > 0 ? taskRuns[0] : undefined;
+
+    // No worker run at all
+    if (!latestRun) {
+      if (isClosed) continue;
+      const blocked = !["running"].includes(task.status);
+      workerRows.push(healthClassify(task, undefined, cutoffIso, nowMs, blocked));
+      continue;
+    }
+
+    // Build evidence from events
+    const events = task.fabric_task_id && latestRun ? workerEventRows(host, task.fabric_task_id, latestRun.id, 10) : [];
+    const checkpoint = task.fabric_task_id && latestRun ? latestWorkerCheckpoint(host, task.fabric_task_id, latestRun.id) : undefined;
+    const spawnedEvent = events.find((e) => e.kind === "command_spawned");
+    const spawnedMetadata = spawnedEvent ? safeJsonRecord(spawnedEvent.metadata_json) : undefined;
+    const pid = typeof spawnedMetadata?.pid === "number" ? spawnedMetadata.pid : 0;
+    const hasRunnerEvidence = events.some((e) =>
+      ["command_spawned", "command_started", "command_finished", "test_result", "file_changed", "checkpoint"].includes(e.kind)
+    ) || Boolean(checkpoint);
+    const failedEvent = events.find((e) => e.kind === "failed");
+    const costSummary = task.fabric_task_id ? taskCostAttributions(host, task.fabric_task_id) : undefined;
+
+    workerRows.push(healthClassify(task, latestRun, cutoffIso, nowMs, false, {
+      events,
+      checkpoint,
+      pid: pid > 0 ? pid : undefined,
+      hasRunnerEvidence,
+      failedEvent: failedEvent ? { kind: failedEvent.kind, body: failedEvent.body } : undefined,
+      runnerLogPath: stringFromUnknown(spawnedMetadata?.runnerLogPath) ?? stringFromUnknown(safeJsonRecord(latestRun.metadata_json).runnerLogPath),
+      taskPacketPath: stringFromUnknown(spawnedMetadata?.taskPacketPath) ?? stringFromUnknown(safeJsonRecord(latestRun.metadata_json).taskPacketPath),
+      contextFilePath: stringFromUnknown(spawnedMetadata?.contextFilePath) ?? stringFromUnknown(safeJsonRecord(latestRun.metadata_json).contextFilePath),
+      cost: costSummary ? {
+        totalCostUsd: costSummary.totalCostUsd,
+        sourceLabel: costSummary.sourceLabel,
+        coverageWarning: costSummary.coverageWarning
+      } : undefined
+    }));
+  }
+
+  const summary = {
+    total: workerRows.length,
+    healthy: workerRows.filter((w) => w.classification === "healthy").length,
+    quiet: workerRows.filter((w) => w.classification === "quiet").length,
+    stale: workerRows.filter((w) => w.classification === "stale").length,
+    failed: workerRows.filter((w) => w.classification === "failed").length,
+    patchReady: workerRows.filter((w) => w.classification === "patch_ready").length,
+    completed: workerRows.filter((w) => w.classification === "completed").length,
+    blocked: workerRows.filter((w) => w.classification === "blocked").length
+  };
+
+  const nextActions: Array<Record<string, unknown>> = [];
+  if (summary.stale > 0) {
+    nextActions.push({
+      label: "Recover stale workers",
+      command: `agent-fabric-project recover-stale --queue ${queue.id} --dry-run`,
+      severity: "warning"
+    });
+  }
+  if (summary.failed > 0) {
+    nextActions.push({
+      label: "Review failed workers",
+      command: `agent-fabric-project lanes --queue ${queue.id}`,
+      severity: "warning"
+    });
+  }
+  if (summary.patchReady > 0) {
+    nextActions.push({
+      label: "Review patch-ready workers",
+      command: `agent-fabric-project review-patches --queue ${queue.id}`,
+      severity: "attention"
+    });
+  }
+  if (summary.quiet > 0) {
+    nextActions.push({
+      label: "Investigate quiet workers (no recent events)",
+      command: `agent-fabric-project task-detail --queue ${queue.id} --queue-task <queueTaskId>`,
+      severity: "attention"
+    });
+  }
+  if (nextActions.length === 0) {
+    nextActions.push({
+      label: "All workers are healthy",
+      severity: "ok"
+    });
+  }
+
+  return {
+    schema: "agent-fabric.project-queue-worker-health.v1",
+    queueId: queue.id,
+    generatedAt: nowIso,
+    staleAfterMinutes,
+    summary,
+    workers: workerRows,
+    nextActions
+  };
+}
+
+type HealthEvidence = {
+  events: WorkerEventRow[];
+  checkpoint?: WorkerCheckpointRow;
+  pid?: number;
+  hasRunnerEvidence: boolean;
+  failedEvent?: { kind: string; body: string | null };
+  runnerLogPath?: string;
+  taskPacketPath?: string;
+  contextFilePath?: string;
+  cost?: {
+    totalCostUsd: number;
+    sourceLabel: string;
+    coverageWarning: string | null;
+  };
+};
+
+function healthClassify(
+  task: ProjectQueueTaskRow,
+  run: WorkerRunRow | undefined,
+  cutoffIso: string,
+  nowMs: number,
+  forceBlocked: boolean,
+  evidence?: HealthEvidence
+): Record<string, unknown> {
+  const patchRefs = safeJsonArray(task.patch_refs_json).filter((ref): ref is string => typeof ref === "string");
+  const testRefs = safeJsonArray(task.test_refs_json).filter((ref): ref is string => typeof ref === "string");
+  if (!run) {
+    return {
+      queueTaskId: task.id,
+      fabricTaskId: task.fabric_task_id ?? undefined,
+      title: task.title,
+      status: task.status,
+      phase: task.phase ?? undefined,
+      workerRunId: undefined,
+      workerKind: undefined,
+      classification: "blocked",
+      healthLabel: "Blocked / no worker run",
+      reason: forceBlocked ? `Task status is ${task.status} with no worker run` : "No worker run assigned",
+      evidence: {
+        processPresent: false,
+        pid: undefined,
+        lastHeartbeatAt: undefined,
+        lastEventAt: undefined,
+        lastEventKind: undefined,
+        lastCheckpointAt: undefined,
+        hasRunnerEvidence: false,
+        runnerLogPath: undefined,
+        taskPacketPath: undefined,
+        contextFilePath: undefined,
+        patchRefs,
+        testRefs
+      },
+      nextAction: forceBlocked ? "Assign a worker or change task status" : "Launch a worker run for this task"
+    };
+  }
+
+  const runMetadata = safeJsonRecord(run.metadata_json);
+  const lastHeartbeatAt = run.ts_updated;
+  const heartbeatStale = parseDbTimestamp(lastHeartbeatAt) <= parseDbTimestamp(cutoffIso);
+  const lastEvent = evidence?.events?.[0];
+  const lastEventAt = lastEvent?.ts;
+  const lastCheckpoint = evidence?.checkpoint;
+  const lastCheckpointAt = lastCheckpoint?.ts;
+  const pid = evidence?.pid;
+  const hasRunnerEvidence = evidence?.hasRunnerEvidence ?? false;
+
+  // Classification logic
+  let classification: string;
+  let healthLabel: string;
+  let reason: string;
+  let nextAction: string;
+
+  if (task.status === "patch_ready") {
+    classification = "patch_ready";
+    healthLabel = "Patch ready for review";
+    reason = "Worker produced a patch that is ready for senior review";
+    nextAction = "Review the patch and accept or request revisions";
+  } else if (task.status === "completed" || task.status === "accepted" || task.status === "done") {
+    classification = "completed";
+    healthLabel = "Completed";
+    reason = `Task is ${task.status}`;
+    nextAction = "No action needed";
+  } else if (task.status === "failed" || task.status === "canceled" || evidence?.failedEvent) {
+    classification = "failed";
+    healthLabel = "Failed";
+    reason = evidence?.failedEvent
+      ? `Worker reported failure: ${evidence.failedEvent.body ?? "no details"}`
+      : `Task is ${task.status}`;
+    nextAction = "Inspect task detail, address the failure, and retry if needed";
+  } else if (!hasRunnerEvidence) {
+    classification = "quiet";
+    healthLabel = "Quiet";
+    reason = "No runner process evidence (command_spawned/command_started/file_changed/checkpoint) has been recorded";
+    nextAction = "Verify the worker process is running. If not, requeue or fail the task";
+  } else if (heartbeatStale) {
+    classification = "stale";
+    healthLabel = "Stale heartbeat";
+    reason = `Last worker update at ${lastHeartbeatAt} is older than the stale threshold`;
+    nextAction = "Recover the stale worker. Run recover-stale or restart the worker process";
+  } else if (heartbeatStale === false && hasRunnerEvidence) {
+    classification = "healthy";
+    healthLabel = "Running / healthy";
+    reason = "Worker process evidence exists and heartbeat is recent";
+    nextAction = "Monitor. No action needed";
+  } else {
+    classification = "quiet";
+    healthLabel = "Quiet / unknown";
+    reason = "Worker run exists but no recent activity evidence";
+    nextAction = "Inspect task detail to understand worker state";
+  }
+
+  return {
+    queueTaskId: task.id,
+    fabricTaskId: task.fabric_task_id ?? undefined,
+    title: task.title,
+    status: task.status,
+    phase: task.phase ?? undefined,
+    workerRunId: run.id,
+    workerKind: run.worker,
+    classification,
+    healthLabel,
+    reason,
+    evidence: {
+      processPresent: hasRunnerEvidence,
+      pid,
+      lastHeartbeatAt,
+      lastEventAt,
+      lastEventKind: lastEvent?.kind,
+      lastCheckpointAt,
+      hasRunnerEvidence,
+      runnerLogPath: evidence?.runnerLogPath,
+      taskPacketPath: evidence?.taskPacketPath,
+      contextFilePath: evidence?.contextFilePath,
+      patchRefs,
+      testRefs,
+      cost: evidence?.cost ? {
+        totalCostUsd: evidence.cost.totalCostUsd,
+        sourceLabel: evidence.cost.sourceLabel,
+        coverageWarning: evidence.cost.coverageWarning
+      } : undefined
+    },
+    nextAction
+  };
+}
+
+function laneProgressData(task: ProjectQueueTaskRow, run: WorkerRunRow, latestEvent?: Record<string, unknown>, checkpoint?: Record<string, unknown>): Record<string, unknown> {
+  const summary = typeof latestEvent?.body === "string" ? latestEvent.body : undefined;
+  const checkpointBody = typeof checkpoint?.summary === "string" ? checkpoint.summary : undefined;
+  const lastActivityAt = typeof run.ts_updated === "string" ? run.ts_updated : run.ts_started;
+  const nextAction = task.status === "patch_ready" ? "Review patch and accept or reject." : task.status === "running" ? "Watch for worker output." : "Check task status.";
+  return {
+    status: task.status,
+    label: task.title,
+    lastActivityAt,
+    summary: summary ?? checkpointBody ?? task.summary ?? undefined,
+    nextAction
+  };
 }
