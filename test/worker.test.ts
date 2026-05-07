@@ -172,6 +172,41 @@ describe("worker/task substrate", () => {
       summary: "Patch reviewed and accepted.",
       followups: ["Wire VS Code client UI"]
     });
+
+    const eventAfterFinish = daemon.callTool(
+      "fabric_task_event",
+      {
+        taskId: created.data.taskId,
+        workerRunId: started.data.workerRunId,
+        kind: "checkpoint",
+        body: "Late runner cleanup checkpoint."
+      },
+      contextFor(session, "task-event-final")
+    );
+    expect(eventAfterFinish.ok).toBe(true);
+    const afterFinalEvent = daemon.callTool("fabric_task_status", { taskId: created.data.taskId }, contextFor(session));
+    expect(afterFinalEvent.ok).toBe(true);
+    if (!afterFinalEvent.ok) throw new Error("status after final event failed");
+    expect(afterFinalEvent.data.status).toBe("completed");
+    expect(afterFinalEvent.data.workerRuns[0].status).toBe("completed");
+
+    const failedEventAfterFinish = daemon.callTool(
+      "fabric_task_event",
+      {
+        taskId: created.data.taskId,
+        workerRunId: started.data.workerRunId,
+        kind: "failed",
+        body: "Late failure from cleanup path."
+      },
+      contextFor(session, "task-event-final-failed")
+    );
+    expect(failedEventAfterFinish.ok).toBe(true);
+    const afterLateFailure = daemon.callTool("fabric_task_status", { taskId: created.data.taskId }, contextFor(session));
+    expect(afterLateFailure.ok).toBe(true);
+    if (!afterLateFailure.ok) throw new Error("status after late failure failed");
+    expect(afterLateFailure.data.status).toBe("completed");
+    expect(afterLateFailure.data.workerRuns[0].status).toBe("completed");
+
     const heartbeatAfterFinish = daemon.callTool(
       "fabric_task_heartbeat",
       { taskId: created.data.taskId, workerRunId: started.data.workerRunId, task: "Should not be accepted" },

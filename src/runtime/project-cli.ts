@@ -146,6 +146,17 @@ export type ProjectCliCommand =
       dryRun: boolean;
     }
   | {
+      command: "cleanup-queues";
+      json: boolean;
+      projectPath?: string;
+      queueId?: string;
+      statuses?: string[];
+      olderThanDays: number;
+      limit?: number;
+      dryRun: boolean;
+      deleteLinkedTaskHistory: boolean;
+    }
+  | {
       command: "retry-task";
       json: boolean;
       queueId: string;
@@ -945,6 +956,17 @@ type RecoverStaleResult = {
   }>;
 };
 
+type QueueCleanupResult = {
+  dryRun: boolean;
+  candidateCount?: number;
+  cleanedCount?: number;
+  protectedCount?: number;
+  totals?: Record<string, unknown>;
+  candidates?: unknown[];
+  cleaned?: unknown[];
+  protected?: unknown[];
+};
+
 type RetryTaskResult = {
   queue?: {
     queueId?: string;
@@ -1149,6 +1171,21 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       staleAfterMinutes: flags.staleAfterMinutes,
       action: parseRecoveryAction(flags.recoveryAction ?? "requeue"),
       dryRun: flags.dryRun
+    };
+  }
+
+  if (command === "cleanup-queues") {
+    const flags = parseFlags(args);
+    return {
+      command: "cleanup-queues",
+      json: flags.json,
+      projectPath: flags.projectPath,
+      queueId: flags.queueId,
+      statuses: flags.queueStatuses,
+      olderThanDays: flags.olderThanDays ?? 7,
+      limit: flags.limit,
+      dryRun: flags.dryRun || !flags.apply,
+      deleteLinkedTaskHistory: flags.deleteLinkedTaskHistory
     };
   }
 
@@ -1727,6 +1764,22 @@ export async function runProjectCommand(
     });
     return { action: "stale_recovered", message: formatRecoverStale(recovered), data: recovered as unknown as Record<string, unknown> };
   }
+  if (command.command === "cleanup-queues") {
+    const cleaned = await call<QueueCleanupResult>("project_queue_cleanup", {
+      projectPath: command.projectPath,
+      queueId: command.queueId,
+      statuses: command.statuses,
+      olderThanDays: command.olderThanDays,
+      limit: command.limit,
+      dryRun: command.dryRun,
+      deleteLinkedTaskHistory: command.deleteLinkedTaskHistory
+    });
+    return {
+      action: command.dryRun ? "queue_cleanup_preview" : "queue_cleanup_applied",
+      message: formatQueueCleanup(cleaned),
+      data: cleaned as unknown as Record<string, unknown>
+    };
+  }
   if (command.command === "retry-task") {
     const retried = await call<RetryTaskResult>("project_queue_retry_task", {
       queueId: command.queueId,
@@ -1985,6 +2038,7 @@ export function projectHelp(): string {
     "  agent-fabric-project claim-next --queue <id> [--worker-run <workerRunId>] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--workspace-mode in_place|git_worktree|clone|sandbox] [--workspace-path <path>] [--model-profile <alias>] [--context-policy <policy>] [--command <cmd>] [--json]",
     "  agent-fabric-project prepare-ready --queue <id> [--limit <n>] [--json]",
     "  agent-fabric-project recover-stale --queue <id> [--stale-after-minutes <n>] [--recovery-action requeue|fail] [--dry-run] [--json]",
+    "  agent-fabric-project cleanup-queues [--project <path>] [--queue <id>] [--queue-status completed|canceled] [--older-than-days <n>] [--limit <n>] [--delete-linked-task-history] [--apply] [--json]",
     "  agent-fabric-project retry-task --queue <id> --queue-task <queueTaskId> [--reason <text>] [--keep-outputs] [--json]",
     "  agent-fabric-project edit-task --queue <id> --queue-task <queueTaskId> --metadata-file <file> [--rewrite-context-ref old=new] [--note <text>] [--json]",
     "  agent-fabric-project import-tasks --queue <id> --tasks-file <file> [--approve-queue] [--json]",
@@ -3372,8 +3426,8 @@ async function factoryRun(
     });
   }
 
-  const packetDir = command.taskPacketDir ?? join(tmpdir(), "agent-fabric-factory", command.queueId, "task-packets");
-  const cwdTemplate = command.cwdTemplate ?? defaultSeniorCwdTemplate(command.queueId);
+  const packetDir = command.taskPacketDir ? resolve(command.taskPacketDir) : join(tmpdir(), "agent-fabric-factory", command.queueId, "task-packets");
+  const cwdTemplate = command.cwdTemplate ? resolve(command.cwdTemplate) : defaultSeniorCwdTemplate(command.queueId);
   const commandTemplate = [
     "AGENT_FABRIC_DEEPSEEK_AUTO_QUEUE=off",
     command.deepSeekWorkerCommand,
@@ -4384,6 +4438,25 @@ function formatRecoverStale(result: RecoverStaleResult): string {
     const worker = item.workerRunId ? ` worker=${item.workerRunId}` : "";
     const reason = item.reason ? ` reason=${item.reason}` : "";
     lines.push(`  ${item.queueTaskId ?? "unknown"}${title}${worker}${reason}`);
+  }
+  return lines.join("\n");
+}
+
+function formatQueueCleanup(result: QueueCleanupResult): string {
+  const action = result.dryRun ? "Queue cleanup preview" : "Queue cleanup applied";
+  const matched = result.dryRun ? result.candidateCount ?? 0 : result.cleanedCount ?? 0;
+  const protectedCount = result.protectedCount ?? 0;
+  const estimatedDeletedRows = typeof result.totals?.estimatedDeletedRows === "number" ? result.totals.estimatedDeletedRows : undefined;
+  const retainedLinkedRows =
+    typeof result.totals?.retainedLinkedTaskHistoryRows === "number" ? result.totals.retainedLinkedTaskHistoryRows : undefined;
+  const lines = [`${action}: ${matched} queue(s); protected=${protectedCount}`];
+  if (estimatedDeletedRows !== undefined) lines.push(`Estimated deleted rows: ${estimatedDeletedRows}`);
+  if (retainedLinkedRows !== undefined && retainedLinkedRows > 0) lines.push(`Retained linked task history rows: ${retainedLinkedRows}`);
+  const items = (result.dryRun ? result.candidates : result.cleaned) ?? [];
+  for (const item of items.slice(0, 10)) {
+    if (!item || typeof item !== "object") continue;
+    const queue = (item as { queue?: { queueId?: string; status?: string; title?: string } }).queue;
+    if (queue?.queueId) lines.push(`  ${queue.queueId} ${queue.status ?? "unknown"} ${queue.title ?? ""}`.trimEnd());
   }
   return lines.join("\n");
 }
@@ -5851,6 +5924,7 @@ type ParsedFlags = {
   modelAlias?: string;
   approvalToken?: string;
   accept: boolean;
+  apply: boolean;
   outputFile?: string;
   maxAgents?: number;
   queueId?: string;
@@ -5930,8 +6004,10 @@ type ParsedFlags = {
   maxEventsPerLane?: number;
   managerSummaryLimit?: number;
   staleAfterMinutes?: number;
+  olderThanDays?: number;
   recoveryAction?: string;
   dryRun: boolean;
+  deleteLinkedTaskHistory: boolean;
   remember: boolean;
   keepOutputs: boolean;
   progressFile?: string;
@@ -5948,6 +6024,7 @@ function parseFlags(args: string[]): ParsedFlags {
     approveQueue: false,
     remember: false,
     accept: false,
+    apply: false,
     applyPatch: false,
     approveToolContext: false,
     rememberToolContext: false,
@@ -5967,6 +6044,7 @@ function parseFlags(args: string[]): ParsedFlags {
     includeResume: false,
     archived: false,
     dryRun: false,
+    deleteLinkedTaskHistory: false,
     keepOutputs: false,
     ask: false
   };
@@ -5983,6 +6061,7 @@ function parseFlags(args: string[]): ParsedFlags {
     else if (arg === "--model-alias") flags.modelAlias = requiredValue(args, ++i, arg);
     else if (arg === "--approval-token") flags.approvalToken = requiredValue(args, ++i, arg);
     else if (arg === "--accept") flags.accept = true;
+    else if (arg === "--apply") flags.apply = true;
     else if (arg === "--output-file") flags.outputFile = requiredValue(args, ++i, arg);
     else if (arg === "--max-agents") flags.maxAgents = positiveInt(requiredValue(args, ++i, arg), "max-agents");
     else if (arg === "--queue") flags.queueId = requiredValue(args, ++i, arg);
@@ -6064,8 +6143,10 @@ function parseFlags(args: string[]): ParsedFlags {
     else if (arg === "--max-events") flags.maxEventsPerLane = positiveInt(requiredValue(args, ++i, arg), "max-events");
     else if (arg === "--manager-summary-limit") flags.managerSummaryLimit = positiveInt(requiredValue(args, ++i, arg), "manager-summary-limit");
     else if (arg === "--stale-after-minutes") flags.staleAfterMinutes = positiveInt(requiredValue(args, ++i, arg), "stale-after-minutes");
+    else if (arg === "--older-than-days") flags.olderThanDays = nonNegativeInt(requiredValue(args, ++i, arg), "older-than-days");
     else if (arg === "--recovery-action") flags.recoveryAction = requiredValue(args, ++i, arg);
     else if (arg === "--dry-run") flags.dryRun = true;
+    else if (arg === "--delete-linked-task-history") flags.deleteLinkedTaskHistory = true;
     else if (arg === "--progress-file") flags.progressFile = requiredValue(args, ++i, arg);
     else if (arg === "--keep-outputs") flags.keepOutputs = true;
     else if (arg === "--reason") flags.reason = requiredValue(args, ++i, arg);
@@ -6093,6 +6174,12 @@ function required(value: string | undefined, message: string): string {
 function positiveInt(value: string, field: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) throw new FabricError("INVALID_INPUT", `${field} must be a positive integer`, false);
+  return parsed;
+}
+
+function nonNegativeInt(value: string, field: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) throw new FabricError("INVALID_INPUT", `${field} must be a non-negative integer`, false);
   return parsed;
 }
 

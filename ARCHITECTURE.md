@@ -43,6 +43,13 @@ The `elixir/` application is an optional runtime layer inspired by Symphony-styl
 
 It does not replace the TypeScript daemon, SQLite migrations, approvals, cost controls, patch review, memory, or queue scheduling. Elixir may own processes, timers, and runner supervision; Agent Fabric remains the source of truth for tasks, worker runs, lifecycle events, heartbeats, checkpoints, artifacts, and final review state.
 
+Elixir also owns the tracker-to-task shaping seam. `IssueTaskPlanner` turns
+normalized Linear issues, workflow defaults, labels, and issue Markdown sections
+into richer Agent Fabric queue tasks with priority, risk, category, workstream,
+expected files, required context refs, acceptance criteria, and parallel-safety
+metadata. This borrows Symphony's "manage work, not sessions" posture while
+keeping all durable queue state and patch review inside Agent Fabric.
+
 High-scale Senior queues are organized around lightweight orchestration labels rather than raw transcript replay. Queue tasks can carry `managerId`, `parentManagerId`, `parentQueueId`, `phase`, `workstream`, `costCenter`, and `escalationTarget`; worker runs inherit those labels for card projection and reporting. `fabric_list_agents` paginates and groups cards, `project_queue_progress_report` returns a bounded `managerSummary`, and cost summaries separate senior, manager, and worker spend where worker events report cost data. These projections let Codex, Claude Code, desktop views, and future plugin surfaces supervise hundreds of lanes without forcing the senior model to read every raw worker log.
 
 ## Major Surfaces

@@ -174,6 +174,20 @@ defmodule AgentFabricOrchestrator.CodexRunnerTest do
 
       CodexRunner.stop(pid)
     end
+
+    test "stops a long-running provider when timeout_ms elapses" do
+      opts =
+        default_opts(
+          provider: AgentFabricOrchestrator.CodexRunnerTest.SlowProvider,
+          timeout_ms: 30
+        )
+
+      {:ok, pid} = CodexRunner.start_link(opts)
+      ref = Process.monitor(pid)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_000
+      refute Process.alive?(pid)
+    end
   end
 
   describe "FakeProvider self-exit" do
@@ -205,6 +219,31 @@ defmodule AgentFabricOrchestrator.CodexRunnerTest do
       end
     end
   end
+end
+
+defmodule AgentFabricOrchestrator.CodexRunnerTest.SlowProvider do
+  @behaviour AgentFabricOrchestrator.CodexRunner.Provider
+
+  def launch(_command, _workspace) do
+    parent = self()
+
+    pid =
+      spawn(fn ->
+        send(parent, {:provider_started, self()})
+        Process.sleep(:infinity)
+      end)
+
+    {:ok, pid}
+  end
+
+  def send_input(_provider_pid, _input), do: :ok
+
+  def stop(provider_pid, _timeout_ms) do
+    Process.exit(provider_pid, :kill)
+    :ok
+  end
+
+  def alive?(provider_pid), do: Process.alive?(provider_pid)
 end
 
 # ── Failing Provider for Test ───────────────────────────────────────

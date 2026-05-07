@@ -275,6 +275,17 @@ defmodule AgentFabricOrchestrator.LinearTest do
     end
   end
 
+  describe "paginated_query/0" do
+    test "includes cursor variables and pageInfo fields" do
+      q = Linear.paginated_query()
+      assert String.contains?(q, "$first")
+      assert String.contains?(q, "$after")
+      assert String.contains?(q, "pageInfo")
+      assert String.contains?(q, "hasNextPage")
+      assert String.contains?(q, "endCursor")
+    end
+  end
+
   # ─── extract_nodes/1 ──────────────────────────────────────────────────
 
   describe "extract_nodes/1" do
@@ -298,6 +309,27 @@ defmodule AgentFabricOrchestrator.LinearTest do
     test "returns empty list for empty response" do
       assert Linear.extract_nodes(%{}) == []
       assert Linear.extract_nodes(%{"data" => %{}}) == []
+    end
+  end
+
+  describe "extract_page_info/1" do
+    test "extracts cursor metadata from a valid response" do
+      response = %{
+        "data" => %{
+          "issues" => %{
+            "pageInfo" => %{"hasNextPage" => true, "endCursor" => "cursor_123"}
+          }
+        }
+      }
+
+      assert Linear.extract_page_info(response) == %{
+               has_next_page: true,
+               end_cursor: "cursor_123"
+             }
+    end
+
+    test "returns a stable empty cursor when missing" do
+      assert Linear.extract_page_info(%{}) == %{has_next_page: false, end_cursor: nil}
     end
   end
 
@@ -342,9 +374,16 @@ defmodule AgentFabricOrchestrator.LinearTest do
       assert {:ok, []} = Linear.candidate_issues(%{}, fake_http)
     end
 
-    test "returns empty list for malformed response" do
+    test "returns an error for malformed response" do
       fake_http = fn _req -> {:ok, %{"unexpected" => true}} end
-      assert {:ok, []} = Linear.candidate_issues(%{}, fake_http)
+      assert {:error, :malformed_linear_response} = Linear.candidate_issues(%{}, fake_http)
+    end
+
+    test "returns an error for GraphQL errors" do
+      errors = [%{"message" => "Authentication required"}]
+      fake_http = fn _req -> {:ok, %{"errors" => errors, "data" => nil}} end
+
+      assert {:error, {:graphql_errors, ^errors}} = Linear.candidate_issues(%{}, fake_http)
     end
 
     test "propagates HTTP errors" do
@@ -368,6 +407,55 @@ defmodule AgentFabricOrchestrator.LinearTest do
       end
 
       {:ok, []} = Linear.candidate_issues(config, fake_http)
+    end
+
+    test "passes pagination variables through to HTTP function" do
+      config = %{
+        "tracker" => %{
+          "team_key" => "TEAM",
+          "active_states" => ["Todo"],
+          "page_size" => "25",
+          "after_cursor" => "cursor_in_config"
+        }
+      }
+
+      fake_http = fn req ->
+        assert req.query == Linear.paginated_query()
+        assert req.variables.first == 10
+        assert req.variables.after == "cursor_from_opts"
+        assert req.variables.teamKey == "TEAM"
+        assert req.variables.states == ["Todo"]
+        {:ok, %{"data" => %{"issues" => %{"nodes" => [], "pageInfo" => %{}}}}}
+      end
+
+      assert {:ok, %{issues: [], page_info: %{has_next_page: false, end_cursor: nil}}} =
+               Linear.candidate_issues_with_page_info(config, fake_http,
+                 first: 10,
+                 after: "cursor_from_opts"
+               )
+    end
+
+    test "explicit nil cursor suppresses configured cursor" do
+      config = %{"tracker" => %{"team_key" => "TEAM", "after_cursor" => "cursor_in_config"}}
+
+      fake_http = fn req ->
+        assert req.variables.after == nil
+        {:ok, %{"data" => %{"issues" => %{"nodes" => [], "pageInfo" => %{}}}}}
+      end
+
+      assert {:ok, %{issues: []}} =
+               Linear.candidate_issues_with_page_info(config, fake_http, after: nil)
+    end
+
+    test "blank configured cursor is normalized to nil" do
+      config = %{"tracker" => %{"team_key" => "TEAM", "after_cursor" => "  "}}
+
+      fake_http = fn req ->
+        assert req.variables.after == nil
+        {:ok, %{"data" => %{"issues" => %{"nodes" => [], "pageInfo" => %{}}}}}
+      end
+
+      assert {:ok, %{issues: []}} = Linear.candidate_issues_with_page_info(config, fake_http)
     end
 
     test "default http returns error when no token" do

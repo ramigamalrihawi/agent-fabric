@@ -96,10 +96,19 @@ Codex and Claude Code should use the compact bridge facade when they want native
 
 Project CLI JSON output redacts approval/session token fields before printing. Use the in-process approval object only inside the current command invocation; do not copy tokens from logs or transcripts.
 
+Finished Senior queues can be cleaned with a dry-run-first retention command so old queue rows do not build up in active surfaces:
+
+```bash
+agent-fabric-project cleanup-queues --project <path> --older-than-days 7 --json
+agent-fabric-project cleanup-queues --project <path> --older-than-days 7 --apply --json
+```
+
+Cleanup only targets completed or canceled queues. The default pass deletes queue-owned database rows but preserves linked worker task history, checkpoints, logs, and patch artifacts for audit; use `--delete-linked-task-history` only for an intentional deeper compaction pass.
+
 ## Current Capabilities
 
 - **Collaboration:** `collab_send`, inbox reads, asks/replies, decisions, path claims, live SSE fan-out, and durable fallback.
-- **Project queues:** dependency-aware task DAGs, concurrency gates, risk buckets, task packets, ready queues, retries, stale-worker recovery, review matrix, and patch review.
+- **Project queues:** dependency-aware task DAGs, concurrency gates, risk buckets, task packets, ready queues, retries, stale-worker recovery, dry-run-first cleanup, review matrix, and patch review.
 - **Worker lifecycle:** task creation, start, heartbeat, events, checkpoints, resume packets, and finish records.
 - **Codex-style worker bridge:** `fabric_senior_start`, `fabric_senior_status`, `fabric_senior_resume`, `fabric_spawn_agents`, `fabric_list_agents`, `fabric_open_agent`, `fabric_message_agent`, `fabric_wait_agents`, and `fabric_accept_patch` expose queue-visible workers as `@af/<name>` background-agent cards with process-evidence based state.
 - **Memory:** typed memories, pending-review promotion, confirmations, invalidation, outcome reporting, and guarded injection.

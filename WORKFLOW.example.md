@@ -5,15 +5,40 @@ tracker:
   active_states: ["Todo", "In Progress"]
   blocked_states: ["Blocked"]
   terminal_states: ["Done", "Canceled"]
+  page_size: 50
+  # Optional starting cursor. After the first successful poll, runner.state_dir
+  # stores the resume cursor for watch mode.
+  after_cursor:
 workspace:
-  root: ~/.agent-fabric/workspaces/agent-fabric
+  root: ../.agent-fabric/workspaces/agent-fabric
   after_create: npm install
 codex:
   command: codex
   args: ["app-server"]
+  model_profile: codex-app-server
+  max_runtime_minutes: 30
+runner:
+  concurrency: 4
+  heartbeat_ms: 30000
+  # Stores local issue-to-queue mappings and Linear poll cursor state.
+  state_dir: ~/.agent-fabric/elixir
 agent_fabric:
-  project_path: /Users/example/projects/agent-fabric
+  project_path: ..
+  queue_title: Linear to Codex App Server
+  queue_id:
   queue_profile: fast
+  auto_start_execution: false
+  task_defaults:
+    phase: linear
+    category: implementation
+    priority: normal
+    risk: medium
+    parallel_safe: true
+    expected_files: []
+    required_context_refs: []
+    acceptance_criteria:
+      - Provide changed files, verification commands, risks, and follow-ups.
+      - Keep patch acceptance inside Agent Fabric review gates.
 ---
 
 Work on {{ issue.identifier }}: {{ issue.title }}

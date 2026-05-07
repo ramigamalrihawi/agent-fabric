@@ -1,6 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FabricDaemon } from "../src/daemon.js";
 import { formatProjectResult, parseProjectCliArgs, runProjectCommand, type ProjectToolCaller } from "../src/runtime/project-cli.js";
@@ -192,6 +192,32 @@ describe("project CLI runner", () => {
       staleAfterMinutes: 10,
       action: "fail",
       dryRun: true
+    });
+
+    expect(
+      parseProjectCliArgs([
+        "cleanup-queues",
+        "--project",
+        "/tmp/workspace/app",
+        "--queue-status",
+        "completed",
+        "--older-than-days",
+        "0",
+        "--limit",
+        "5",
+        "--delete-linked-task-history",
+        "--apply",
+        "--json"
+      ])
+    ).toMatchObject({
+      command: "cleanup-queues",
+      projectPath: "/tmp/workspace/app",
+      statuses: ["completed"],
+      olderThanDays: 0,
+      limit: 5,
+      deleteLinkedTaskHistory: true,
+      dryRun: false,
+      json: true
     });
 
     expect(parseProjectCliArgs(["retry-task", "--queue", "pqueue_1", "--queue-task", "pqtask_1", "--reason", "Try smaller patch", "--keep-outputs"])).toMatchObject({
@@ -1189,6 +1215,21 @@ describe("project CLI runner", () => {
     expect(patches.message).toContain("patch:review-command");
     const accepted = await runProjectCommand({ command: "review-patches", json: false, queueId, acceptTaskId: task.queueTaskId }, call);
     expect(accepted.action).toBe("patch_accepted");
+    const completed = await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "complete" }, call);
+    expect(completed.message).toContain("status=completed");
+    daemon.db.db.prepare("UPDATE project_queues SET ts_updated = datetime('now', '-10 days') WHERE id = ?").run(queueId);
+    const cleanupPreview = await runProjectCommand(
+      { command: "cleanup-queues", json: false, projectPath: "/tmp/workspace/app", olderThanDays: 7, dryRun: true, deleteLinkedTaskHistory: false },
+      call
+    );
+    expect(cleanupPreview.action).toBe("queue_cleanup_preview");
+    expect(cleanupPreview.message).toContain("1 queue");
+    const cleanupApplied = await runProjectCommand(
+      { command: "cleanup-queues", json: false, projectPath: "/tmp/workspace/app", olderThanDays: 7, dryRun: false, deleteLinkedTaskHistory: false },
+      call
+    );
+    expect(cleanupApplied.action).toBe("queue_cleanup_applied");
+    expect(cleanupApplied.message).toContain("1 queue");
     daemon.close();
   });
 
@@ -1734,6 +1775,8 @@ describe("project CLI runner", () => {
         deepSeekRole: "auto",
         sensitiveContextMode: "strict",
         patchMode: "write",
+        taskPacketDir: "relative-packets",
+        cwdTemplate: "relative-worktrees/{{queueTaskId}}",
         maxOutputChars: 4_000,
         approveToolContext: true,
         rememberToolContext: false,
@@ -1751,6 +1794,8 @@ describe("project CLI runner", () => {
     expect(result.data.commandTemplate).toContain("--json");
     expect(result.data.commandTemplate).toContain("--role {{deepseekRole}}");
     expect(result.data.commandTemplate).toContain("--sensitive-context-mode strict");
+    expect(result.data.packetDir).toBe(resolve("relative-packets"));
+    expect(result.data.cwdTemplate).toBe(resolve("relative-worktrees/{{queueTaskId}}"));
     daemon.close();
   });
 

@@ -317,6 +317,67 @@ defmodule AgentFabricOrchestrator.WorkflowTest do
       expanded = Workflow.expand_path(raw_root)
       assert expanded == "/env/test/ws"
     end
+
+    test "resolves relative and parent-relative paths to absolute paths" do
+      assert Workflow.expand_path("relative/dir") == Path.expand("relative/dir")
+      assert Workflow.expand_path("../up") == Path.expand("../up")
+    end
+  end
+
+  describe "runner config helpers" do
+    test "runner_concurrency prefers runner config then legacy agent config then default" do
+      assert Workflow.runner_concurrency(%{"runner" => %{"concurrency" => 10}}) == 10
+      assert Workflow.runner_concurrency(%{"runner" => %{"concurrency" => "6"}}) == 6
+      assert Workflow.runner_concurrency(%{"agent" => %{"max_concurrent_agents" => 3}}) == 3
+      assert Workflow.runner_concurrency(%{}, 8) == 8
+      assert Workflow.runner_concurrency(%{"runner" => %{"concurrency" => 0}}) == 4
+      assert Workflow.runner_concurrency(%{"runner" => %{"concurrency" => "bad"}}) == 4
+    end
+
+    test "heartbeat_ms reads positive config and falls back for invalid values" do
+      assert Workflow.heartbeat_ms(%{"runner" => %{"heartbeat_ms" => 5_000}}) == 5_000
+      assert Workflow.heartbeat_ms(%{"runner" => %{"heartbeat_ms" => "6000"}}) == 6_000
+      assert Workflow.heartbeat_ms(%{}, 60_000) == 60_000
+      assert Workflow.heartbeat_ms(%{"runner" => %{"heartbeat_ms" => 0}}) == 30_000
+      assert Workflow.heartbeat_ms(%{"runner" => %{"heartbeat_ms" => "bad"}}) == 30_000
+    end
+
+    test "state_dir can be tested with explicit env map" do
+      assert Workflow.state_dir(%{"runner" => %{"state_dir" => "/configured"}}, %{
+               "AGENT_FABRIC_ELIXIR_STATE_DIR" => "/env"
+             }) == "/configured"
+
+      assert Workflow.state_dir(%{}, %{"AGENT_FABRIC_ELIXIR_STATE_DIR" => "/env"}) == "/env"
+      assert Workflow.state_dir(%{}, %{}) =~ ".agent-fabric/elixir"
+    end
+
+    test "tracker pagination helpers read page size and cursor" do
+      config = %{"tracker" => %{"page_size" => "25", "after_cursor" => "cursor_1"}}
+
+      assert Workflow.tracker_page_size(config) == 25
+      assert Workflow.tracker_page_size(%{"tracker" => %{"page_size" => "bad"}}, 50) == 50
+      assert Workflow.tracker_after_cursor(config) == "cursor_1"
+      assert Workflow.tracker_after_cursor(%{"tracker" => %{}}) == nil
+      assert Workflow.tracker_after_cursor(%{"tracker" => %{"after_cursor" => "  "}}) == nil
+    end
+
+    test "task_defaults exposes Agent Fabric issue planning defaults" do
+      config = %{
+        "agent_fabric" => %{
+          "task_defaults" => %{
+            "priority" => "high",
+            "expected_files" => ["lib/example.ex"]
+          }
+        }
+      }
+
+      assert Workflow.task_defaults(config) == %{
+               "priority" => "high",
+               "expected_files" => ["lib/example.ex"]
+             }
+
+      assert Workflow.task_defaults(%{}) == %{}
+    end
   end
 
   # ─── Prompt Rendering Tests ──────────────────────────────────────────

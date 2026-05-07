@@ -24,7 +24,7 @@ describe("schema contract", () => {
   });
 
   it("numbered migration metadata reaches the current schema version", () => {
-    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    expect(MIGRATIONS.map((migration) => migration.version)).toEqual(Array.from({ length: SCHEMA_VERSION }, (_value, index) => index + 1));
     expect(MIGRATIONS.at(-1)?.version).toBe(SCHEMA_VERSION);
   });
 });

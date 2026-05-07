@@ -102,6 +102,8 @@ npm run dev:project -- prepare-ready --queue <queueId> --limit 4
 npm run dev:project -- launch-plan --queue <queueId> --limit 4
 npm run dev:project -- claim-next --queue <queueId> --worker local-cli --workspace-mode git_worktree --workspace-path /path/to/worktree --model-profile execute.cheap
 npm run dev:project -- recover-stale --queue <queueId> --stale-after-minutes 30 --dry-run
+npm run dev:project -- cleanup-queues --project /path/to/project --older-than-days 7 --json
+npm run dev:project -- cleanup-queues --project /path/to/project --older-than-days 7 --apply --json
 npm run dev:project -- retry-task --queue <queueId> --queue-task <queueTaskId> --reason "Address review comments"
 npm run dev:project -- edit-task --queue <queueId> --queue-task <queueTaskId> --metadata-file task-metadata.json
 npm run dev:project -- write-task-packets --queue <queueId> --out-dir .agent-fabric/task-packets --format markdown --ready-only
@@ -626,6 +628,28 @@ List queues for the Desktop project sidebar or terminal overview. Closed queues 
 ```
 
 Each row includes queue metadata, task status counts, active worker count, available slots, ready/blocked counts, pending approval count, and policy counts.
+
+## `project_queue_cleanup`
+
+Dry-run or apply cleanup for finished project queues. This first retention pass is database-only: it deletes eligible completed/canceled queue rows and their queue-owned rows through foreign-key cascades. It does not remove filesystem worktrees, task packets, logs, or patch artifacts.
+
+Dry-run is the default. Active, paused, review, running, patch-ready, and other non-finished queues are protected even when a `queueId` is supplied.
+
+```ts
+{
+  queueId?: string;
+  projectPath?: string;
+  statuses?: Array<"completed" | "canceled">; // default ["completed", "canceled"]
+  olderThanDays?: number; // default 7; use 0 for immediate cleanup
+  limit?: number; // default 50, max 200
+  dryRun?: boolean; // default true
+  deleteLinkedTaskHistory?: boolean; // default false
+}
+```
+
+By default, cleanup preserves linked `tasks`, `worker_runs`, `worker_events`, and `worker_checkpoints` so completed worker evidence remains available after the queue shell is removed. Set `deleteLinkedTaskHistory` only for an intentional deeper compaction pass after review; that removes linked worker history as well.
+
+The response includes `candidateCount` or `cleanedCount`, `protectedCount`, per-queue counts, `estimatedDeletedRows`, and `retainedLinkedTaskHistoryRows`.
 
 ## `project_queue_record_stage`
 

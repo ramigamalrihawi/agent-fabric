@@ -264,6 +264,42 @@ defmodule AgentFabricOrchestrator.Linear do
     """
   end
 
+  @doc """
+  Return the GraphQL query used to fetch one cursor-aware issue page.
+  """
+  @spec paginated_query() :: String.t()
+  def paginated_query do
+    """
+    query AgentFabricIssuesPaginated($teamKey: String, $states: [String!], $first: Int, $after: String) {
+      issues(
+        filter: {
+          team: { key: { eq: $teamKey } }
+          state: { name: { in: $states } }
+        }
+        first: $first
+        after: $after
+      ) {
+        nodes {
+          id
+          identifier
+          title
+          description
+          url
+          updatedAt
+          state { name }
+          team { key }
+          assignee { id }
+          labels { nodes { name } }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+    """
+  end
+
   # ─── Fetch Candidates (injectable HTTP) ──────────────────────────────
 
   @doc """
@@ -276,28 +312,55 @@ defmodule AgentFabricOrchestrator.Linear do
   """
   @spec candidate_issues(map(), function()) :: {:ok, list(Issue.t())} | {:error, term()}
   def candidate_issues(config, http_fun \\ &default_http/1) do
+    case candidate_issues_with_page_info(config, http_fun) do
+      {:ok, %{issues: issues}} -> {:ok, issues}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Fetch one candidate issue page using explicit pagination options.
+
+  This wrapper keeps the old `candidate_issues_with_page_info/3` test injection
+  shape while giving orchestrators a clean public entrypoint for persisted
+  cursor polling.
+  """
+  @spec candidate_issues_page(map(), keyword() | map()) ::
+          {:ok, %{issues: list(Issue.t()), page_info: map()}} | {:error, term()}
+  def candidate_issues_page(config, opts \\ %{}) do
+    candidate_issues_with_page_info(config, &default_http/1, opts)
+  end
+
+  @doc """
+  Fetch candidate issues and return normalized issues plus cursor metadata.
+
+  `opts` may include `:first` and `:after`. When omitted, page size and cursor
+  come from tracker config or `LINEAR_PAGE_SIZE`/`LINEAR_AFTER_CURSOR`.
+  """
+  @spec candidate_issues_with_page_info(map(), function(), keyword() | map()) ::
+          {:ok, %{issues: list(Issue.t()), page_info: map()}} | {:error, term()}
+  def candidate_issues_with_page_info(config, http_fun \\ &default_http/1, opts \\ %{}) do
     tracker = config["tracker"] || %{}
 
     request = %{
       url: tracker["url"] || "https://api.linear.app/graphql",
       token: tracker["token"] || System.get_env("LINEAR_API_KEY"),
-      query: query(),
+      query: paginated_query(),
       variables: %{
         teamKey: tracker["team_key"],
-        states: tracker["active_states"] || []
+        states: tracker["active_states"] || [],
+        first: page_size(tracker, opts),
+        after: after_cursor(tracker, opts)
       }
     }
 
-    with {:ok, response} <- http_fun.(request) do
-      issues =
-        response
-        |> nested(["data", "issues", "nodes"])
-        |> case do
-          nodes when is_list(nodes) -> normalize_issues(nodes)
-          _ -> []
-        end
-
-      {:ok, issues}
+    with {:ok, response} <- http_fun.(request),
+         :ok <- validate_response(response) do
+      {:ok,
+       %{
+         issues: response |> extract_nodes() |> normalize_issues(),
+         page_info: extract_page_info(response)
+       }}
     end
   end
 
@@ -309,6 +372,24 @@ defmodule AgentFabricOrchestrator.Linear do
     case nested(response, ["data", "issues", "nodes"]) do
       nodes when is_list(nodes) -> nodes
       _ -> []
+    end
+  end
+
+  @doc """
+  Extract Linear page metadata from a GraphQL response map.
+  """
+  @spec extract_page_info(map()) :: %{has_next_page: boolean(), end_cursor: String.t() | nil}
+  def extract_page_info(response) do
+    case nested(response, ["data", "issues", "pageInfo"]) do
+      %{} = page_info ->
+        %{
+          has_next_page:
+            Map.get(page_info, "hasNextPage") || Map.get(page_info, :hasNextPage) || false,
+          end_cursor: Map.get(page_info, "endCursor") || Map.get(page_info, :endCursor)
+        }
+
+      _ ->
+        %{has_next_page: false, end_cursor: nil}
     end
   end
 
@@ -350,6 +431,83 @@ defmodule AgentFabricOrchestrator.Linear do
       _ -> []
     end
   end
+
+  defp validate_response(%{"errors" => errors}) when is_list(errors) and errors != [],
+    do: {:error, {:graphql_errors, errors}}
+
+  defp validate_response(%{errors: errors}) when is_list(errors) and errors != [],
+    do: {:error, {:graphql_errors, errors}}
+
+  defp validate_response(%{"data" => data}) when is_map(data), do: :ok
+  defp validate_response(%{data: data}) when is_map(data), do: :ok
+  defp validate_response(_), do: {:error, :malformed_linear_response}
+
+  defp page_size(tracker, opts) do
+    opts
+    |> option(:first)
+    |> normalize_positive_integer(nil)
+    |> case do
+      nil ->
+        tracker
+        |> Map.get("page_size")
+        |> normalize_positive_integer(nil)
+
+      value ->
+        value
+    end
+    |> case do
+      nil -> System.get_env("LINEAR_PAGE_SIZE") |> normalize_positive_integer(50)
+      value -> value
+    end
+  end
+
+  defp after_cursor(tracker, opts) do
+    case option(opts, :after, :missing) do
+      :missing ->
+        normalize_cursor(tracker["after_cursor"] || System.get_env("LINEAR_AFTER_CURSOR"))
+
+      value ->
+        normalize_cursor(value)
+    end
+  end
+
+  defp normalize_cursor(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_cursor(value), do: value
+
+  defp option(opts, key) when is_map(opts),
+    do: Map.get(opts, key) || Map.get(opts, to_string(key))
+
+  defp option(opts, key) when is_list(opts), do: Keyword.get(opts, key)
+
+  defp option(opts, key, default) when is_map(opts) do
+    cond do
+      Map.has_key?(opts, key) -> Map.get(opts, key)
+      Map.has_key?(opts, to_string(key)) -> Map.get(opts, to_string(key))
+      true -> default
+    end
+  end
+
+  defp option(opts, key, default) when is_list(opts) do
+    if Keyword.has_key?(opts, key), do: Keyword.get(opts, key), else: default
+  end
+
+  defp normalize_positive_integer(nil, default), do: default
+  defp normalize_positive_integer(value, _default) when is_integer(value) and value > 0, do: value
+
+  defp normalize_positive_integer(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {parsed, ""} when parsed > 0 -> parsed
+      _ -> default
+    end
+  end
+
+  defp normalize_positive_integer(_value, default), do: default
 
   defp nested(nil, _path), do: nil
 

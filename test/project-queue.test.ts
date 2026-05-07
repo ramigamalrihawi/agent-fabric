@@ -94,6 +94,202 @@ describe("project queue substrate", () => {
     daemon.close();
   });
 
+  it("previews and applies cleanup for completed queues while retaining linked task history by default", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "cleanup-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+    const added = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId: created.data.queueId,
+        tasks: [{ clientKey: "cleanup-task", title: "Cleanup task", goal: "Create linked task history.", risk: "low" }]
+      },
+      contextFor(session, "cleanup-add-task")
+    );
+    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error("add task failed");
+    const fabricTaskId = String(added.data.created[0].fabricTaskId);
+    const queueTaskId = String(added.data.created[0].queueTaskId);
+    const taskDone = daemon.callTool(
+      "project_queue_update_task",
+      { queueId: created.data.queueId, queueTaskId, status: "completed", summary: "Cleanup task done." },
+      contextFor(session, "cleanup-task-done")
+    );
+    expect(taskDone.ok).toBe(true);
+
+    const completed = daemon.callTool(
+      "project_queue_decide",
+      { queueId: created.data.queueId, decision: "complete", note: "Ready for cleanup." },
+      contextFor(session, "cleanup-complete")
+    );
+    expect(completed.ok).toBe(true);
+    daemon.db.db.prepare("UPDATE project_queues SET ts_updated = datetime('now', '-10 days') WHERE id = ?").run(created.data.queueId);
+
+    const preview = daemon.callTool(
+      "project_queue_cleanup",
+      { projectPath: "/tmp/workspace/app", olderThanDays: 7 },
+      contextFor(session, "cleanup-preview")
+    );
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) throw new Error("cleanup preview failed");
+    expect(preview.data).toMatchObject({
+      dryRun: true,
+      candidateCount: 1,
+      protectedCount: 0,
+      totals: expect.objectContaining({
+        queueRows: 1,
+        queueTasks: 1,
+        linkedFabricTasks: 1,
+        retainedLinkedTaskHistoryRows: 1
+      })
+    });
+    expect(tableCount(daemon, "project_queues")).toBe(1);
+
+    const applied = daemon.callTool(
+      "project_queue_cleanup",
+      { projectPath: "/tmp/workspace/app", olderThanDays: 7, dryRun: false },
+      contextFor(session, "cleanup-apply")
+    );
+    expect(applied.ok).toBe(true);
+    if (!applied.ok) throw new Error("cleanup apply failed");
+    expect(applied.data).toMatchObject({ dryRun: false, cleanedCount: 1, protectedCount: 0 });
+    expect(tableCount(daemon, "project_queues")).toBe(0);
+    expect(tableCount(daemon, "project_queue_tasks")).toBe(0);
+    expect((daemon.db.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE id = ?").get(fabricTaskId) as { count: number }).count).toBe(1);
+    daemon.close();
+  });
+
+  it("protects active queues and can delete linked task history only when explicitly requested", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const activeQueue = createQueue(daemon, session, "cleanup-active-create");
+    expect(activeQueue.ok).toBe(true);
+    if (!activeQueue.ok) throw new Error("active queue create failed");
+    const protectedPreview = daemon.callTool(
+      "project_queue_cleanup",
+      { queueId: activeQueue.data.queueId, olderThanDays: 0 },
+      contextFor(session, "cleanup-active-preview")
+    );
+    expect(protectedPreview.ok).toBe(true);
+    if (!protectedPreview.ok) throw new Error("protected preview failed");
+    expect(protectedPreview.data).toMatchObject({ dryRun: true, candidateCount: 0, protectedCount: 1 });
+    expect(tableCount(daemon, "project_queues")).toBe(1);
+
+    const completedQueue = createQueue(daemon, session, "cleanup-linked-create");
+    expect(completedQueue.ok).toBe(true);
+    if (!completedQueue.ok) throw new Error("completed queue create failed");
+    const added = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId: completedQueue.data.queueId,
+        tasks: [{ clientKey: "linked-history", title: "Linked history", goal: "Create worker history.", risk: "low" }]
+      },
+      contextFor(session, "cleanup-linked-add")
+    );
+    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error("linked task add failed");
+    const task = added.data.created[0] as { queueTaskId: string; fabricTaskId: string };
+    const worker = startWorkerForQueueTask(daemon, session, task, "cleanup-linked-worker");
+    const event = daemon.callTool(
+      "fabric_task_event",
+      { taskId: task.fabricTaskId, workerRunId: worker.workerRunId, kind: "checkpoint", body: "Worker history exists." },
+      contextFor(session, "cleanup-linked-event")
+    );
+    expect(event.ok).toBe(true);
+    const checkpoint = daemon.callTool(
+      "fabric_task_checkpoint",
+      { taskId: task.fabricTaskId, workerRunId: worker.workerRunId, summary: { currentGoal: "Cleanup test" } },
+      contextFor(session, "cleanup-linked-checkpoint")
+    );
+    expect(checkpoint.ok).toBe(true);
+    const finished = daemon.callTool(
+      "fabric_task_finish",
+      { taskId: task.fabricTaskId, workerRunId: worker.workerRunId, status: "completed", summary: "Worker history complete." },
+      contextFor(session, "cleanup-linked-finish")
+    );
+    expect(finished.ok).toBe(true);
+    const queueTaskDone = daemon.callTool(
+      "project_queue_update_task",
+      { queueId: completedQueue.data.queueId, queueTaskId: task.queueTaskId, status: "completed", summary: "Queue task complete." },
+      contextFor(session, "cleanup-linked-task-done")
+    );
+    expect(queueTaskDone.ok).toBe(true);
+    const completed = daemon.callTool(
+      "project_queue_decide",
+      { queueId: completedQueue.data.queueId, decision: "complete", note: "Ready for deep cleanup." },
+      contextFor(session, "cleanup-linked-complete")
+    );
+    expect(completed.ok).toBe(true);
+    daemon.db.db.prepare("UPDATE project_queues SET ts_updated = datetime('now', '-10 days') WHERE id = ?").run(completedQueue.data.queueId);
+
+    const applied = daemon.callTool(
+      "project_queue_cleanup",
+      { queueId: completedQueue.data.queueId, olderThanDays: 7, deleteLinkedTaskHistory: true, dryRun: false },
+      contextFor(session, "cleanup-linked-apply")
+    );
+    expect(applied.ok).toBe(true);
+    if (!applied.ok) throw new Error("linked cleanup apply failed");
+    expect(applied.data).toMatchObject({
+      dryRun: false,
+      cleanedCount: 1,
+      totals: expect.objectContaining({
+        linkedFabricTasks: 1,
+        workerRuns: 1,
+        workerEvents: expect.any(Number),
+        workerCheckpoints: 1,
+        retainedLinkedTaskHistoryRows: 0
+      })
+    });
+    expect(Number((applied.data.totals as Record<string, unknown>).workerEvents)).toBeGreaterThanOrEqual(1);
+    expect((daemon.db.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE id = ?").get(task.fabricTaskId) as { count: number }).count).toBe(0);
+    expect(tableCount(daemon, "worker_runs")).toBe(0);
+    expect(tableCount(daemon, "worker_events")).toBe(0);
+    expect(tableCount(daemon, "worker_checkpoints")).toBe(0);
+    daemon.close();
+  });
+
+  it("does not clean completed queues that still contain reviewable task states", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "cleanup-reviewable-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("reviewable queue create failed");
+    const added = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId: created.data.queueId,
+        tasks: [{ clientKey: "reviewable-task", title: "Reviewable task", goal: "Preserve patch review.", risk: "high" }]
+      },
+      contextFor(session, "cleanup-reviewable-add")
+    );
+    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error("reviewable task add failed");
+    const queueTaskId = String(added.data.created[0].queueTaskId);
+    const reviewable = daemon.callTool(
+      "project_queue_update_task",
+      { queueId: created.data.queueId, queueTaskId, status: "patch_ready", summary: "Awaiting senior review." },
+      contextFor(session, "cleanup-reviewable-task")
+    );
+    expect(reviewable.ok).toBe(true);
+    daemon.db.db
+      .prepare("UPDATE project_queues SET status = 'completed', ts_updated = datetime('now', '-10 days') WHERE id = ?")
+      .run(created.data.queueId);
+
+    const preview = daemon.callTool(
+      "project_queue_cleanup",
+      { queueId: created.data.queueId, olderThanDays: 7 },
+      contextFor(session, "cleanup-reviewable-preview")
+    );
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) throw new Error("reviewable cleanup preview failed");
+    expect(preview.data).toMatchObject({ dryRun: true, candidateCount: 0, protectedCount: 1 });
+    expect(JSON.stringify(preview.data.protected)).toContain("active or reviewable task");
+    expect(tableCount(daemon, "project_queues")).toBe(1);
+    daemon.close();
+  });
+
   it("validates queue task fabric links and missing context refs before launch", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload());
@@ -154,6 +350,71 @@ describe("project queue substrate", () => {
     if (!links.ok) throw new Error("link validation failed");
     expect(links.data).toMatchObject({ ok: false, checked: 1 });
     expect(links.data.issues[0]).toMatchObject({ type: "missing_fabric_task_id", queueTaskId });
+    daemon.close();
+  });
+
+  it("reuses existing queue tasks by durable clientKey", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "client-key-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+
+    const first = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId: created.data.queueId,
+        tasks: [
+          {
+            clientKey: "linear:ENG-1",
+            title: "ENG-1: First import",
+            goal: "Create the queue-visible task for ENG-1.",
+            risk: "low"
+          }
+        ]
+      },
+      contextFor(session, "client-key-add-first")
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error("first add task failed");
+    expect(first.data.created).toHaveLength(1);
+    expect(first.data.created[0]).toMatchObject({ clientKey: "linear:ENG-1" });
+
+    const again = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId: created.data.queueId,
+        tasks: [
+          {
+            clientKey: "linear:ENG-1",
+            title: "ENG-1: Duplicate import",
+            goal: "Should reuse the already-created queue task.",
+            risk: "low"
+          }
+        ]
+      },
+      contextFor(session, "client-key-add-second")
+    );
+    expect(again.ok).toBe(true);
+    if (!again.ok) throw new Error("second add task failed");
+    expect(again.data.created).toHaveLength(0);
+    expect(again.data.reused).toHaveLength(1);
+    expect(again.data.reused[0]).toMatchObject({
+      queueTaskId: first.data.created[0].queueTaskId,
+      fabricTaskId: first.data.created[0].fabricTaskId,
+      clientKey: "linear:ENG-1",
+      reused: true
+    });
+
+    const status = daemon.callTool("project_queue_status", { queueId: created.data.queueId }, contextFor(session, "client-key-status"));
+    expect(status.ok).toBe(true);
+    if (!status.ok) throw new Error("queue status failed");
+    expect(status.data.tasks).toHaveLength(1);
+    expect(status.data.tasks[0]).toMatchObject({
+      queueTaskId: first.data.created[0].queueTaskId,
+      clientKey: "linear:ENG-1",
+      title: "ENG-1: First import"
+    });
     daemon.close();
   });
 

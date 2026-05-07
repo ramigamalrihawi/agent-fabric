@@ -4,7 +4,9 @@ defmodule AgentFabricOrchestrator.WorkspaceTest do
   alias AgentFabricOrchestrator.Workspace
 
   test "creates deterministic workspace and runs after_create once" do
-    tmp_root = Path.join(System.tmp_dir!(), "af-workspace-test-#{System.unique_integer([:positive])}")
+    tmp_root =
+      Path.join(System.tmp_dir!(), "af-workspace-test-#{System.unique_integer([:positive])}")
+
     issue = %{identifier: "ENG-77", title: "Add workspace manager"}
 
     on_exit(fn -> File.rm_rf(tmp_root) end)

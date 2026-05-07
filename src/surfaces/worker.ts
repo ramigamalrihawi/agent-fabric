@@ -421,6 +421,7 @@ function ensureNotFinal(task: TaskRow): void {
 }
 
 function statusAfterEvent(kind: string, currentRunStatus: string): { workerRunStatus: string; taskStatus: string } {
+  if (FINAL_STATUSES.has(currentRunStatus)) return { workerRunStatus: currentRunStatus, taskStatus: currentRunStatus };
   if (kind === "patch_ready") return { workerRunStatus: "patch_ready", taskStatus: "patch_ready" };
   if (kind === "failed") return { workerRunStatus: "failed", taskStatus: "failed" };
   if (kind === "completed") return { workerRunStatus: "completed", taskStatus: "completed" };

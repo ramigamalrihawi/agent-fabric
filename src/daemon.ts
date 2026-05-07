@@ -126,6 +126,7 @@ import {
   projectQueueApprovalInbox,
   projectQueueAssignWorker,
   projectQueueClaimNext,
+  projectQueueCleanup,
   projectQueueCreate,
   projectQueueDashboard,
   projectQueueDecide,
@@ -234,6 +235,7 @@ const SUPPORTED_TOOLS = new Set([
   "tool_context_status",
   "project_queue_create",
   "project_queue_list",
+  "project_queue_cleanup",
   "project_queue_status",
   "project_queue_update_settings",
   "project_queue_dashboard",
@@ -605,6 +607,9 @@ export class FabricDaemon {
       }
       if (tool === "project_queue_list") {
         return { ok: true, tool, data: projectQueueList(this, input, context) as T };
+      }
+      if (tool === "project_queue_cleanup") {
+        return { ok: true, tool, data: projectQueueCleanup(this, input, context) as T };
       }
       if (tool === "project_queue_status") {
         return { ok: true, tool, data: projectQueueStatus(this, input, context) as T };

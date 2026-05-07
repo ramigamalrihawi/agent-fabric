@@ -383,6 +383,15 @@ proxyTool("project_queue_list", "List project queues for the Desktop project sid
   includeClosed: z.boolean().optional(),
   limit: z.number().int().positive().optional()
 });
+proxyTool("project_queue_cleanup", "Dry-run or apply cleanup for completed/canceled project queues after a retention window.", {
+  queueId: z.string().optional(),
+  projectPath: z.string().optional(),
+  statuses: z.array(z.enum(["completed", "canceled"])).optional(),
+  olderThanDays: z.number().int().nonnegative().optional(),
+  limit: z.number().int().positive().optional(),
+  dryRun: z.boolean().optional(),
+  deleteLinkedTaskHistory: z.boolean().optional()
+});
 proxyTool("project_queue_status", "Read project queue stages, tasks, decisions, tool/context proposals, and project policies.", {
   queueId: z.string()
 });

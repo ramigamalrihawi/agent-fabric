@@ -18,6 +18,7 @@ import {
   safeJsonRecord
 } from "../runtime/input.js";
 import { defaultMaxEventsPerLane, maxParallelAgentsLimit, maxQueueEventLimit, maxQueueListLimit } from "../runtime/limits.js";
+import { countWhere } from "../runtime/queries.js";
 import type { CallContext } from "../types.js";
 import type { SurfaceHost } from "./host.js";
 import { llmApprove, llmPreflight } from "./costPolicy.js";
@@ -60,6 +61,7 @@ type ProjectQueueTaskRow = {
   id: string;
   queue_id: string;
   fabric_task_id: string | null;
+  client_key: string | null;
   title: string;
   goal: string;
   phase: string | null;
@@ -90,6 +92,19 @@ type ProjectQueueTaskRow = {
   agent_id: string;
   ts_created: string;
   ts_updated: string;
+};
+
+type ProjectQueueTaskAddResult = {
+  queueTaskId: string;
+  fabricTaskId?: string;
+  clientKey?: string;
+  title: string;
+  status: string;
+  phase?: string;
+  managerId?: string;
+  workstream?: string;
+  dependsOn: unknown[];
+  reused?: boolean;
 };
 
 type ProjectQueueDecisionRow = {
@@ -237,6 +252,23 @@ type StaleWorkerRow = ProjectQueueTaskRow & {
   stale_reason: string;
 };
 
+type QueueCleanupCandidate = {
+  queue: ProjectQueueRow;
+  counts: QueueCleanupCounts;
+};
+
+type QueueCleanupCounts = {
+  queueRows: number;
+  queueTasks: number;
+  stages: number;
+  decisions: number;
+  toolContextProposals: number;
+  linkedFabricTasks: number;
+  workerRuns: number;
+  workerEvents: number;
+  workerCheckpoints: number;
+};
+
 type MissingGrant = {
   kind: string;
   grantKey: string;
@@ -259,6 +291,8 @@ const TOOL_DECISIONS = new Set(["approve", "reject", "revise"]);
 const GRANT_KINDS = new Set(["mcp_server", "tool", "memory", "context"]);
 const POLICY_STATUSES = new Set(["approved", "rejected"]);
 const RECOVERY_ACTIONS = new Set(["requeue", "fail"]);
+const CLEANUP_QUEUE_STATUSES = new Set(["completed", "canceled"]);
+const CLEANUP_BLOCKING_TASK_STATUSES = new Set(["queued", "ready", "running", "blocked", "review", "patch_ready", "failed"]);
 const QUEUE_DECISIONS = new Set([
   "accept_improved_prompt",
   "request_prompt_revision",
@@ -360,6 +394,94 @@ export function projectQueueList(host: SurfaceHost, input: unknown, context: Cal
     count: queues.length,
     queues: queues.map((queue) => queueListItem(host, queue))
   };
+}
+
+export function projectQueueCleanup(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const session = host.requireSession(context);
+  const queueId = getOptionalString(input, "queueId");
+  const projectPath = getOptionalString(input, "projectPath");
+  const rawStatuses = getStringArray(input, "statuses");
+  const statuses = rawStatuses.length > 0 ? rawStatuses.map((status) => normalizeValue(status, CLEANUP_QUEUE_STATUSES, "statuses")) : ["completed", "canceled"];
+  const olderThanDays = normalizeNonNegativeInteger(getOptionalNumber(input, "olderThanDays") ?? 7, "olderThanDays");
+  const limit = normalizeListLimit(getOptionalNumber(input, "limit") ?? 50);
+  const dryRun = getOptionalBoolean(input, "dryRun") ?? true;
+  const deleteLinkedTaskHistory = getOptionalBoolean(input, "deleteLinkedTaskHistory") ?? false;
+  const cutoff = new Date(host.now().getTime() - olderThanDays * 24 * 60 * 60 * 1000);
+  const scope = { queueId: queueId ?? undefined, projectPath: projectPath ?? undefined, statuses, olderThanDays, cutoff: cutoff.toISOString(), limit };
+  const evaluated = queueCleanupCandidates(host, session.workspace_root, {
+    queueId,
+    projectPath,
+    statuses,
+    cutoff,
+    limit,
+    deleteLinkedTaskHistory
+  });
+
+  if (dryRun) {
+    return {
+      dryRun: true,
+      deleteLinkedTaskHistory,
+      scope,
+      candidateCount: evaluated.candidates.length,
+      protectedCount: evaluated.protected.length,
+      totals: sumCleanupCounts(evaluated.candidates.map((candidate) => candidate.counts), deleteLinkedTaskHistory),
+      candidates: evaluated.candidates.map((candidate) => formatCleanupCandidate(candidate, deleteLinkedTaskHistory)),
+      protected: evaluated.protected
+    };
+  }
+
+  return host.recordMutation("project_queue_cleanup", input, context, (mutationSession) => {
+    const latest = queueCleanupCandidates(host, mutationSession.workspace_root, {
+      queueId,
+      projectPath,
+      statuses,
+      cutoff,
+      limit,
+      deleteLinkedTaskHistory
+    });
+    const cleaned: Array<Record<string, unknown>> = [];
+    const cleanedQueueIds: string[] = [];
+    for (const candidate of latest.candidates) {
+      const linkedTaskIds = linkedFabricTaskIds(host, candidate.queue.id);
+      if (deleteLinkedTaskHistory) {
+        deleteLinkedTaskRows(host, linkedTaskIds);
+      }
+      host.db.db.prepare("DELETE FROM project_queues WHERE id = ?").run(candidate.queue.id);
+      cleanedQueueIds.push(candidate.queue.id);
+      cleaned.push(formatCleanupCandidate(candidate, deleteLinkedTaskHistory));
+    }
+    const totals = sumCleanupCounts(latest.candidates.map((candidate) => candidate.counts), deleteLinkedTaskHistory);
+    host.writeAuditAndEvent({
+      sessionId: mutationSession.id,
+      agentId: mutationSession.agent_id,
+      hostName: mutationSession.host_name,
+      workspaceRoot: mutationSession.workspace_root,
+      action: "project.queue.cleanup",
+      sourceTable: "project_queues",
+      sourceId: queueId ?? "cleanup_batch",
+      eventType: "project.queue.cleanup",
+      payload: {
+        dryRun: false,
+        deleteLinkedTaskHistory,
+        scope,
+        cleanedQueueIds,
+        protected: latest.protected,
+        totals
+      },
+      testMode: mutationSession.test_mode === 1,
+      context
+    });
+    return {
+      dryRun: false,
+      deleteLinkedTaskHistory,
+      scope,
+      cleanedCount: cleaned.length,
+      protectedCount: latest.protected.length,
+      totals,
+      cleaned,
+      protected: latest.protected
+    };
+  });
 }
 
 export function projectQueueStatus(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
@@ -903,12 +1025,31 @@ export function projectQueueAddTasks(host: SurfaceHost, input: unknown, context:
 
   return host.recordMutation("project_queue_add_tasks", input, context, (session) => {
     const queue = requireQueue(host, queueId, session.workspace_root);
-    const existingTaskIds = new Set(taskRows(host, queue.id).map((task) => task.id));
+    const existingTasks = taskRows(host, queue.id);
+    const existingTaskIds = new Set(existingTasks.map((task) => task.id));
+    const existingByClientKey = new Map(
+      existingTasks.filter((task) => task.client_key).map((task) => [task.client_key as string, task])
+    );
     const prepared = rawTasks.map((item) => prepareTask(item));
     const clientKeyToId = new Map<string, string>();
+    const taskIdsToCreate = new Set<string>();
     for (const task of prepared) {
+      if (task.clientKey) {
+        const existing = existingByClientKey.get(task.clientKey);
+        if (existing) {
+          task.queueTaskId = existing.id;
+          clientKeyToId.set(task.clientKey, task.queueTaskId);
+          continue;
+        }
+        const previousPreparedId = clientKeyToId.get(task.clientKey);
+        if (previousPreparedId) {
+          task.queueTaskId = previousPreparedId;
+          continue;
+        }
+      }
       task.queueTaskId = newId("pqtask");
       if (task.clientKey) clientKeyToId.set(task.clientKey, task.queueTaskId);
+      taskIdsToCreate.add(task.queueTaskId);
     }
     const allTaskIds = new Set([...existingTaskIds, ...prepared.map((task) => task.queueTaskId)]);
     for (const task of prepared) {
@@ -920,8 +1061,34 @@ export function projectQueueAddTasks(host: SurfaceHost, input: unknown, context:
       }
     }
 
-    const created = [];
+    const created: ProjectQueueTaskAddResult[] = [];
+    const reused: ProjectQueueTaskAddResult[] = [];
+    const createdByQueueTaskId = new Map<string, ProjectQueueTaskAddResult>();
     for (const task of prepared) {
+      if (!taskIdsToCreate.has(task.queueTaskId)) {
+        const existing = task.clientKey ? existingByClientKey.get(task.clientKey) : undefined;
+        if (existing) {
+          reused.push({
+            queueTaskId: existing.id,
+            fabricTaskId: existing.fabric_task_id ?? undefined,
+            clientKey: task.clientKey,
+            title: existing.title,
+            status: existing.status,
+            phase: existing.phase ?? undefined,
+            managerId: existing.manager_id ?? undefined,
+            workstream: existing.workstream ?? undefined,
+            dependsOn: safeJsonArray(existing.depends_on_json),
+            reused: true
+          });
+        }
+        continue;
+      }
+      const alreadyCreated = createdByQueueTaskId.get(task.queueTaskId);
+      if (alreadyCreated) {
+        reused.push({ ...alreadyCreated, reused: true });
+        continue;
+      }
+
       const fabricTaskId = newId("task");
       const correlationId = context.correlationId ?? newId("corr");
       const refs = [`project_queue:${queue.id}`, `project_queue_task:${task.queueTaskId}`];
@@ -947,30 +1114,31 @@ export function projectQueueAddTasks(host: SurfaceHost, input: unknown, context:
         );
       host.db.db
         .prepare(
-	          `INSERT INTO project_queue_tasks (
-	            id, queue_id, fabric_task_id, title, goal, phase, manager_id,
-	            parent_manager_id, parent_queue_id, workstream, cost_center,
-	            escalation_target, category, status, priority, parallel_group,
-	            parallel_safe, risk, expected_files_json,
-	            acceptance_criteria_json, required_tools_json, required_mcp_servers_json,
-	            required_memories_json, required_context_refs_json, depends_on_json,
-	            session_id, agent_id, origin_peer_id, test_mode
-	          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	        )
+          `INSERT INTO project_queue_tasks (
+            id, queue_id, fabric_task_id, client_key, title, goal, phase, manager_id,
+            parent_manager_id, parent_queue_id, workstream, cost_center,
+            escalation_target, category, status, priority, parallel_group,
+            parallel_safe, risk, expected_files_json,
+            acceptance_criteria_json, required_tools_json, required_mcp_servers_json,
+            required_memories_json, required_context_refs_json, depends_on_json,
+            session_id, agent_id, origin_peer_id, test_mode
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
         .run(
           task.queueTaskId,
           queue.id,
           fabricTaskId,
-	          task.title,
-	          task.goal,
-	          task.phase,
-	          task.managerId,
-	          task.parentManagerId,
-	          task.parentQueueId,
-	          task.workstream,
-	          task.costCenter,
-	          task.escalationTarget,
-	          task.category,
+          task.clientKey ?? null,
+          task.title,
+          task.goal,
+          task.phase,
+          task.managerId,
+          task.parentManagerId,
+          task.parentQueueId,
+          task.workstream,
+          task.costCenter,
+          task.escalationTarget,
+          task.category,
           task.status,
           task.priority,
           task.parallelGroup,
@@ -988,17 +1156,19 @@ export function projectQueueAddTasks(host: SurfaceHost, input: unknown, context:
           host.originPeerId,
           session.test_mode
         );
-      created.push({
+      const createdTask = {
         queueTaskId: task.queueTaskId,
         fabricTaskId,
-	        clientKey: task.clientKey,
-	        title: task.title,
-	        status: task.status,
-	        phase: task.phase ?? undefined,
-	        managerId: task.managerId ?? undefined,
-	        workstream: task.workstream ?? undefined,
-	        dependsOn: task.dependsOn
-	      });
+        clientKey: task.clientKey,
+        title: task.title,
+        status: task.status,
+        phase: task.phase ?? undefined,
+        managerId: task.managerId ?? undefined,
+        workstream: task.workstream ?? undefined,
+        dependsOn: task.dependsOn
+      };
+      created.push(createdTask);
+      createdByQueueTaskId.set(task.queueTaskId, createdTask);
     }
     host.db.db.prepare("UPDATE project_queues SET status = 'queue_review', ts_updated = CURRENT_TIMESTAMP WHERE id = ?").run(queue.id);
     host.writeAuditAndEvent({
@@ -1010,11 +1180,11 @@ export function projectQueueAddTasks(host: SurfaceHost, input: unknown, context:
       sourceTable: "project_queue_tasks",
       sourceId: queue.id,
       eventType: "project.queue.tasks.added",
-      payload: { queueId: queue.id, count: created.length, taskIds: created.map((task) => task.queueTaskId) },
+      payload: { queueId: queue.id, count: created.length, reused: reused.length, taskIds: created.map((task) => task.queueTaskId) },
       testMode: session.test_mode === 1,
       context
     });
-    return { queueId: queue.id, created };
+    return { queueId: queue.id, created, reused };
   });
 }
 
@@ -2534,6 +2704,13 @@ function normalizeListLimit(value: number): number {
   const max = maxQueueListLimit();
   if (!Number.isInteger(value) || value < 1 || value > max) {
     throw new FabricError("INVALID_INPUT", `limit must be an integer between 1 and ${max}`, false);
+  }
+  return value;
+}
+
+function normalizeNonNegativeInteger(value: number, field: string): number {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new FabricError("INVALID_INPUT", `${field} must be a non-negative integer`, false);
   }
   return value;
 }
@@ -4363,6 +4540,176 @@ function queueListItem(host: SurfaceHost, queue: ProjectQueueRow): Record<string
   };
 }
 
+function queueCleanupCandidates(
+  host: SurfaceHost,
+  workspaceRoot: string,
+  options: {
+    queueId?: string;
+    projectPath?: string;
+    statuses: string[];
+    cutoff: Date;
+    limit: number;
+    deleteLinkedTaskHistory: boolean;
+  }
+): { candidates: QueueCleanupCandidate[]; protected: Array<Record<string, unknown>> } {
+  const queues = queueCleanupScopeRows(host, workspaceRoot, options);
+  const candidates: QueueCleanupCandidate[] = [];
+  const protectedRows: Array<Record<string, unknown>> = [];
+
+  for (const queue of queues) {
+    const protectedReason = queueCleanupProtectedReason(host, queue, options.statuses, options.cutoff);
+    if (protectedReason) {
+      protectedRows.push({ queue: formatQueue(queue), reason: protectedReason });
+      continue;
+    }
+    candidates.push({ queue, counts: queueCleanupCounts(host, queue.id) });
+  }
+
+  return { candidates, protected: protectedRows };
+}
+
+function queueCleanupScopeRows(
+  host: SurfaceHost,
+  workspaceRoot: string,
+  options: {
+    queueId?: string;
+    projectPath?: string;
+    statuses: string[];
+    limit: number;
+  }
+): ProjectQueueRow[] {
+  if (options.queueId) {
+    return [requireQueue(host, options.queueId, workspaceRoot)];
+  }
+
+  const params: Array<string | number> = [workspaceRoot, workspaceRoot];
+  const where = ["(workspace_root = ? OR project_path = ?)"];
+  if (options.projectPath) {
+    where.push("project_path = ?");
+    params.push(options.projectPath);
+  }
+  where.push(`status IN (${options.statuses.map(() => "?").join(", ")})`);
+  params.push(...options.statuses, options.limit);
+  return host.db.db
+    .prepare(`SELECT * FROM project_queues WHERE ${where.join(" AND ")} ORDER BY ts_updated ASC LIMIT ?`)
+    .all(...params) as ProjectQueueRow[];
+}
+
+function queueCleanupProtectedReason(host: SurfaceHost, queue: ProjectQueueRow, statuses: string[], cutoff: Date): string | undefined {
+  if (!statuses.includes(queue.status)) return `queue status is ${queue.status}, not cleanup-eligible`;
+  const updatedAt = Date.parse(queue.ts_updated);
+  if (Number.isFinite(updatedAt) && updatedAt > cutoff.getTime()) return `queue updated after retention cutoff ${cutoff.toISOString()}`;
+  const blockingTaskStatuses = [...CLEANUP_BLOCKING_TASK_STATUSES];
+  const blockingTasks = countWhere(
+    host.db,
+    "project_queue_tasks",
+    `queue_id = ? AND status IN (${blockingTaskStatuses.map(() => "?").join(", ")})`,
+    [queue.id, ...blockingTaskStatuses]
+  );
+  if (blockingTasks > 0) return `queue has ${blockingTasks} active or reviewable task(s)`;
+  const linkedTaskIds = linkedFabricTaskIds(host, queue.id);
+  const runningWorkers = countWorkerRunsForTaskIds(host, linkedTaskIds, ["running"]);
+  if (runningWorkers > 0) return `queue has ${runningWorkers} running linked worker(s)`;
+  return undefined;
+}
+
+function queueCleanupCounts(host: SurfaceHost, queueId: string): QueueCleanupCounts {
+  const linkedTaskIds = linkedFabricTaskIds(host, queueId);
+  return {
+    queueRows: 1,
+    queueTasks: countWhere(host.db, "project_queue_tasks", "queue_id = ?", [queueId]),
+    stages: countWhere(host.db, "project_queue_stages", "queue_id = ?", [queueId]),
+    decisions: countWhere(host.db, "project_queue_decisions", "queue_id = ?", [queueId]),
+    toolContextProposals: countWhere(host.db, "tool_context_proposals", "queue_id = ?", [queueId]),
+    linkedFabricTasks: linkedTaskIds.length,
+    workerRuns: countRowsForTaskIds(host, "worker_runs", linkedTaskIds),
+    workerEvents: countRowsForTaskIds(host, "worker_events", linkedTaskIds),
+    workerCheckpoints: countRowsForTaskIds(host, "worker_checkpoints", linkedTaskIds)
+  };
+}
+
+function linkedFabricTaskIds(host: SurfaceHost, queueId: string): string[] {
+  const rows = host.db.db
+    .prepare("SELECT DISTINCT fabric_task_id AS task_id FROM project_queue_tasks WHERE queue_id = ? AND fabric_task_id IS NOT NULL")
+    .all(queueId) as Array<{ task_id: string }>;
+  return rows.map((row) => row.task_id);
+}
+
+function countRowsForTaskIds(host: SurfaceHost, table: "worker_runs" | "worker_events" | "worker_checkpoints", taskIds: string[]): number {
+  if (taskIds.length === 0) return 0;
+  const placeholders = taskIds.map(() => "?").join(", ");
+  const row = host.db.db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE task_id IN (${placeholders})`).get(...taskIds) as { count: number };
+  return row.count;
+}
+
+function countWorkerRunsForTaskIds(host: SurfaceHost, taskIds: string[], statuses: string[]): number {
+  if (taskIds.length === 0 || statuses.length === 0) return 0;
+  const taskPlaceholders = taskIds.map(() => "?").join(", ");
+  const statusPlaceholders = statuses.map(() => "?").join(", ");
+  const row = host.db.db
+    .prepare(`SELECT COUNT(*) AS count FROM worker_runs WHERE task_id IN (${taskPlaceholders}) AND status IN (${statusPlaceholders})`)
+    .get(...taskIds, ...statuses) as { count: number };
+  return row.count;
+}
+
+function deleteLinkedTaskRows(host: SurfaceHost, taskIds: string[]): void {
+  if (taskIds.length === 0) return;
+  const placeholders = taskIds.map(() => "?").join(", ");
+  host.db.db.prepare(`DELETE FROM worker_checkpoints WHERE task_id IN (${placeholders})`).run(...taskIds);
+  host.db.db.prepare(`DELETE FROM worker_events WHERE task_id IN (${placeholders})`).run(...taskIds);
+  host.db.db.prepare(`DELETE FROM worker_runs WHERE task_id IN (${placeholders})`).run(...taskIds);
+  host.db.db.prepare(`DELETE FROM tasks WHERE id IN (${placeholders})`).run(...taskIds);
+}
+
+function formatCleanupCandidate(candidate: QueueCleanupCandidate, deleteLinkedTaskHistory: boolean): Record<string, unknown> {
+  return {
+    queue: formatQueue(candidate.queue),
+    counts: candidate.counts,
+    estimatedDeletedRows: cleanupDeletedRowEstimate(candidate.counts, deleteLinkedTaskHistory),
+    retainedLinkedTaskHistoryRows: deleteLinkedTaskHistory ? 0 : cleanupLinkedTaskHistoryRows(candidate.counts)
+  };
+}
+
+function sumCleanupCounts(counts: QueueCleanupCounts[], deleteLinkedTaskHistory: boolean): Record<string, unknown> {
+  const totals: QueueCleanupCounts = {
+    queueRows: 0,
+    queueTasks: 0,
+    stages: 0,
+    decisions: 0,
+    toolContextProposals: 0,
+    linkedFabricTasks: 0,
+    workerRuns: 0,
+    workerEvents: 0,
+    workerCheckpoints: 0
+  };
+  for (const count of counts) {
+    totals.queueRows += count.queueRows;
+    totals.queueTasks += count.queueTasks;
+    totals.stages += count.stages;
+    totals.decisions += count.decisions;
+    totals.toolContextProposals += count.toolContextProposals;
+    totals.linkedFabricTasks += count.linkedFabricTasks;
+    totals.workerRuns += count.workerRuns;
+    totals.workerEvents += count.workerEvents;
+    totals.workerCheckpoints += count.workerCheckpoints;
+  }
+  return {
+    ...totals,
+    estimatedDeletedRows: cleanupDeletedRowEstimate(totals, deleteLinkedTaskHistory),
+    retainedLinkedTaskHistoryRows: deleteLinkedTaskHistory ? 0 : cleanupLinkedTaskHistoryRows(totals)
+  };
+}
+
+function cleanupDeletedRowEstimate(counts: QueueCleanupCounts, deleteLinkedTaskHistory: boolean): number {
+  const queueRows = counts.queueRows + counts.queueTasks + counts.stages + counts.decisions + counts.toolContextProposals;
+  if (!deleteLinkedTaskHistory) return queueRows;
+  return queueRows + cleanupLinkedTaskHistoryRows(counts);
+}
+
+function cleanupLinkedTaskHistoryRows(counts: QueueCleanupCounts): number {
+  return counts.linkedFabricTasks + counts.workerRuns + counts.workerEvents + counts.workerCheckpoints;
+}
+
 function formatQueue(row: ProjectQueueRow): Record<string, unknown> {
   return {
     queueId: row.id,
@@ -4404,16 +4751,17 @@ function formatQueueTask(row: ProjectQueueTaskRow): Record<string, unknown> {
     queueTaskId: row.id,
     queueId: row.queue_id,
     fabricTaskId: row.fabric_task_id ?? undefined,
-	    title: row.title,
-	    goal: row.goal,
-	    phase: row.phase ?? undefined,
-	    managerId: row.manager_id ?? undefined,
-	    parentManagerId: row.parent_manager_id ?? undefined,
-	    parentQueueId: row.parent_queue_id ?? undefined,
-	    workstream: row.workstream ?? undefined,
-	    costCenter: row.cost_center ?? undefined,
-	    escalationTarget: row.escalation_target ?? undefined,
-	    category: row.category,
+    clientKey: row.client_key ?? undefined,
+    title: row.title,
+    goal: row.goal,
+    phase: row.phase ?? undefined,
+    managerId: row.manager_id ?? undefined,
+    parentManagerId: row.parent_manager_id ?? undefined,
+    parentQueueId: row.parent_queue_id ?? undefined,
+    workstream: row.workstream ?? undefined,
+    costCenter: row.cost_center ?? undefined,
+    escalationTarget: row.escalation_target ?? undefined,
+    category: row.category,
     status: row.status,
     priority: row.priority,
     parallelGroup: row.parallel_group ?? undefined,
@@ -4439,12 +4787,13 @@ function formatQueueTaskLink(row: ProjectQueueTaskRow): Record<string, unknown> 
   return {
     queueTaskId: row.id,
     fabricTaskId: row.fabric_task_id ?? undefined,
+    clientKey: row.client_key ?? undefined,
     title: row.title,
-	    status: row.status,
-	    phase: row.phase ?? undefined,
-	    managerId: row.manager_id ?? undefined,
-	    workstream: row.workstream ?? undefined,
-	    priority: row.priority,
+    status: row.status,
+    phase: row.phase ?? undefined,
+    managerId: row.manager_id ?? undefined,
+    workstream: row.workstream ?? undefined,
+    priority: row.priority,
     risk: row.risk,
     parallelGroup: row.parallel_group ?? undefined,
     parallelSafe: row.parallel_safe === 1
