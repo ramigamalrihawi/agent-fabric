@@ -93,6 +93,7 @@ const DESKTOP_READ_ROUTES = [
   "/api/queues",
   "/api/queues/:queueId/snapshot",
   "/api/queues/:queueId/action-inbox",
+  "/api/queues/:queueId/health",
   "/api/queues/:queueId/dashboard",
   "/api/queues/:queueId/review-matrix",
   "/api/queues/:queueId/approvals",
@@ -129,7 +130,8 @@ const DESKTOP_FEATURES = {
   taskPacketReadRoute: true,
   readyPacketLinks: true,
   staleWorkerRecovery: true,
-  codexWorkerBridge: true
+  codexWorkerBridge: true,
+  managerHealth: true
 };
 
 export async function createDesktopFabricCaller(options: DesktopServerOptions = {}): Promise<DesktopToolCaller> {
@@ -353,6 +355,15 @@ async function handleApi(
         memoryMax: numberQuery(url, "memoryMax") ?? 25
       });
       return writeToolResponse(response, snapshot.actionInbox);
+    }
+    if (section === "health") {
+      return writeToolResponse(
+        response,
+        await desktopQueueHealth(caller, queueId, {
+          maxEvents: numberQuery(url, "maxEvents") ?? 1,
+          managerSummaryLimit: numberQuery(url, "managerSummaryLimit") ?? 10
+        })
+      );
     }
     if (section === "dashboard") return writeToolResponse(response, await caller("project_queue_dashboard", { queueId }));
     if (section === "review-matrix") return writeToolResponse(response, await caller("project_queue_review_matrix", { queueId, limit: numberQuery(url, "limit") }));
@@ -820,6 +831,30 @@ function desktopActionInbox(input: {
       info: items.filter((item) => item.severity === "info").length
     },
     items
+  };
+}
+
+async function desktopQueueHealth(
+  caller: DesktopToolCaller,
+  queueId: string,
+  options: { maxEvents: number; managerSummaryLimit: number }
+): Promise<Record<string, unknown>> {
+  const progress = asObject(
+    await caller("project_queue_progress_report", {
+      queueId,
+      maxEventsPerLane: options.maxEvents,
+      managerSummaryLimit: options.managerSummaryLimit
+    })
+  );
+  return {
+    schema: "agent-fabric.desktop-manager-health.v1",
+    queue: progress.queue,
+    generatedAt: progress.generatedAt,
+    summary: progress.summary,
+    counts: progress.counts,
+    managerSummary: progress.managerSummary,
+    nextActions: progress.nextActions,
+    verificationChecklist: progress.verificationChecklist
   };
 }
 

@@ -28,12 +28,15 @@ senior harness / client
 Agent Fabric supports a supervisor-worker pattern for high-quality work at lower blended cost:
 
 1. A senior harness, such as a GPT-5.5 or Claude Opus 4.7 session, owns prompt improvement, decomposition, risk judgment, and final integration.
-2. The queue fans out independent tasks to cheaper DeepSeek V4 Pro max-reasoning workers with focused task packets and approved context.
-3. The senior harness and DeepSeek workers can communicate bidirectionally through `collab_send`, durable inbox reads, live SSE fan-out, asks/replies, decisions, and checkpoints.
-4. Review lanes inspect implementation outputs, test logs, risks, docs, and patch artifacts before anything is applied.
-5. The senior harness reviews the evidence, accepts or rejects findings, runs final checks, and hands off the result.
+2. Optional manager harnesses own roadmap phases or workstreams and supervise their own queue-visible Agent Fabric worker batches.
+3. The queue fans out independent tasks to cheaper DeepSeek V4 Pro max-reasoning workers with focused task packets and approved context.
+4. The senior harness, manager harnesses, and DeepSeek workers can communicate bidirectionally through `collab_send`, durable inbox reads, live SSE fan-out, asks/replies, decisions, and checkpoints.
+5. Review lanes inspect implementation outputs, test logs, risks, docs, and patch artifacts before anything is applied.
+6. The senior harness reviews the evidence, accepts or rejects findings, runs final checks, and hands off the result.
 
 This keeps expensive senior-model tokens focused on judgment while allowing liberal DeepSeek token use for breadth, adversarial review, and long-context investigation.
+
+High-scale Senior queues are organized around lightweight orchestration labels rather than raw transcript replay. Queue tasks can carry `managerId`, `parentManagerId`, `parentQueueId`, `phase`, `workstream`, `costCenter`, and `escalationTarget`; worker runs inherit those labels for card projection and reporting. `fabric_list_agents` paginates and groups cards, `project_queue_progress_report` returns a bounded `managerSummary`, and cost summaries separate senior, manager, and worker spend where worker events report cost data. These projections let Codex, Claude Code, desktop views, and future plugin surfaces supervise hundreds of lanes without forcing the senior model to read every raw worker log.
 
 ## Major Surfaces
 

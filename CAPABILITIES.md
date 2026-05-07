@@ -37,7 +37,7 @@ Codex-like and Claude-like integrations should call:
 
 Cards use stable `@af/<name>` handles. Default names are assigned in this order: `Rami`, `Belle`, `Amir`, `Falak`, `Gamal`, `Angela`, then deterministic numeric suffixes.
 
-Cards must be process-evidence based. Native projections should show `planned`, `starting`, `running`, `no_runner`, `stale`, `failed`, `completed`, or `patch_ready` from runner state, not queue task status alone. `fabric_spawn_agents` may return planned cards and a `run-ready` command, but it must not create fake running cards.
+Cards must be process-evidence based. Native projections should show `planned`, `starting`, `running`, `no_runner`, `stale`, `failed`, `completed`, or `patch_ready` from runner state, not queue task status alone. `fabric_spawn_agents` may return planned cards and a `run-ready` command, but it must not create fake running cards. `fabric_list_agents` supports `page`, `pageSize`, and `groupBy` for high-scale manager views, and cards carry manager/phase/workstream/task-risk metadata when present.
 
 ## Rules
 
@@ -53,4 +53,6 @@ Cards must be process-evidence based. Native projections should show `planned`, 
 - Do not launch Senior DeepSeek direct lanes with bare `agent-fabric-deepseek-worker run-task`. Queue runners mark the shell as `AGENT_FABRIC_WORKER_QUEUE_VISIBLE=1`, and untracked direct runs require the explicit `AGENT_FABRIC_DEEPSEEK_ALLOW_UNTRACKED=1` escape hatch.
 - DeepSeek direct task packets include a bounded generated context sidecar from `expectedFiles` and file-like `requiredContextRefs`; use `{{contextFile}}` in custom command templates when overriding the default runner.
 - Custom `deepseek-direct` templates that invoke `agent-fabric-deepseek-worker` are linked with `--fabric-task {{fabricTaskId}}`; missing fabric task links or moved required context refs block launch.
-- Senior concurrency defaults to 10 lanes and accepts explicit 20-lane requests; the hard local cap is 32.
+- Senior concurrency defaults to 10 lanes and accepts explicit 20-lane requests. Local caps are configurable up to 1000 through `AGENT_FABRIC_SENIOR_MAX_LANE_COUNT`, `AGENT_FABRIC_MAX_PARALLEL_AGENTS`, `AGENT_FABRIC_MAX_CODEX_AGENT_COUNT`, or shared `AGENT_FABRIC_QUEUE_MAX_AGENTS`; set `AGENT_FABRIC_SENIOR_DEFAULT_LANE_COUNT` only when the local default launch size should intentionally be higher than 10.
+- Progress reports include bounded `managerSummary` groups for status, manager, phase, and workstream so expensive senior/manager models can review evidence without reading raw worker transcripts.
+- The desktop server exposes the same manager-health packet at `/api/queues/<queueId>/health` for native dashboards and plugin surfaces.

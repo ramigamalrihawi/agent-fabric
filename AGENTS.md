@@ -20,6 +20,8 @@ material.
 - Use `git_worktree` for mutating worker lanes. Use `sandbox` only for report-only planner/reviewer lanes that will not edit project files.
 - Use `research-planner` for report-only DeepSeek planner/reviewer routing; pair it with `sandbox` for non-git projects.
 - Keep Codex native subagents for supervisor-side exploration, review, and adjudication. They do not satisfy a requested DeepSeek lane count unless explicitly registered as Agent Fabric workers.
+- For roadmap-scale work, use manager/phase/workstream queue metadata so root seniors can preserve expensive-token context and delegate broad execution to cheaper queue-visible DeepSeek/Jcode workers.
+- Local high-scale caps are configurable up to 1000; keep default Senior requests at 10 unless the operator asks for more lanes or sets `AGENT_FABRIC_SENIOR_DEFAULT_LANE_COUNT`.
 
 ## Codex Worker Controls
 
@@ -38,7 +40,7 @@ Prefer these compact Agent Fabric tools from Codex:
 
 - `fabric_senior_start`, `fabric_senior_status`, `fabric_senior_resume`: start or resume a Senior queue and return worker cards/progress.
 - `fabric_spawn_agents`: preview runner-backed Agent Fabric worker cards, usually `count=10`, `workspaceMode=git_worktree`; it must never claim `running` without runner evidence. Start real shells with `senior-run` or `run-ready`.
-- `fabric_list_agents`: show Codex-style worker cards with `@af/<name>` handles.
+- `fabric_list_agents`: show Codex-style worker cards with `@af/<name>` handles; use `page`, `pageSize`, and `groupBy` for high-scale queues.
 - `fabric_open_agent`: open one worker's task, transcript, checkpoints, and artifacts.
 - `fabric_message_agent`: send a durable revision, note, or ask to an `@af/<name>` worker.
 - `fabric_wait_agents`: poll worker cards until they reach closed or target statuses.

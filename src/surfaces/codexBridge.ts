@@ -1,5 +1,6 @@
 import { FabricError } from "../runtime/errors.js";
 import { getOptionalBoolean, getOptionalNumber, getOptionalString, getString, getStringArray } from "../runtime/input.js";
+import { defaultMaxEventsPerLane, maxCodexAgentCount } from "../runtime/limits.js";
 import type { CallContext } from "../types.js";
 import { collabAsk, collabSend } from "./collab.js";
 import type { SurfaceHost } from "./host.js";
@@ -16,8 +17,8 @@ import {
 
 const WORKERS = new Set(["deepseek-direct", "jcode-deepseek"]);
 const SENIOR_DEFAULT_WORKER_ENV = "AGENT_FABRIC_SENIOR_DEFAULT_WORKER";
-const MAX_CODEX_AGENT_COUNT = 32;
 const WORKSPACE_MODES = new Set(["git_worktree", "sandbox"]);
+const CARD_GROUPS = new Set(["status", "phase", "workstream", "worker", "risk", "category"]);
 const DEFAULT_AGENT_NAMES = [
   "Rami",
   "Belle",
@@ -95,7 +96,7 @@ export function fabricSpawnAgents(host: SurfaceHost, input: unknown, context: Ca
   const plannedCards = planned.map((entry, index) =>
     plannedAgentCard(queueId, entry, existing + index, { worker, workspaceMode, modelProfile, maxRuntimeMinutes })
   );
-  const listed = fabricListAgents(host, { queueId, includeCompleted: true, maxEventsPerLane: 5 }, context);
+  const listed = fabricListAgents(host, { queueId, includeCompleted: true, maxEventsPerLane: defaultMaxEventsPerLane() }, context);
   const runnerCommand = [
     "agent-fabric-project",
     "run-ready",
@@ -175,7 +176,7 @@ export function fabricSeniorStart(host: SurfaceHost, input: unknown, context: Ca
     },
     childContext(context, "spawn")
   );
-  const progress = projectQueueProgressReport(host, { queueId, maxEventsPerLane: 5 }, context);
+  const progress = projectQueueProgressReport(host, { queueId, maxEventsPerLane: defaultMaxEventsPerLane() }, context);
   return {
     schema: "agent-fabric.senior-start.v1",
     queueId,
@@ -195,8 +196,9 @@ function seniorDefaultWorker(): "deepseek-direct" | "jcode-deepseek" {
 
 export function fabricSeniorStatus(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const queueId = getString(input, "queueId");
-  const cards = fabricListAgents(host, { queueId, includeCompleted: true, maxEventsPerLane: getOptionalNumber(input, "maxEventsPerLane") ?? 5 }, context);
-  const progress = projectQueueProgressReport(host, { queueId, maxEventsPerLane: getOptionalNumber(input, "maxEventsPerLane") ?? 5 }, context);
+  const maxEventsPerLane = getOptionalNumber(input, "maxEventsPerLane") ?? defaultMaxEventsPerLane();
+  const cards = fabricListAgents(host, { queueId, includeCompleted: true, maxEventsPerLane }, context);
+  const progress = projectQueueProgressReport(host, { queueId, maxEventsPerLane }, context);
   return {
     schema: "agent-fabric.senior-status.v1",
     queueId,
@@ -220,20 +222,37 @@ export function fabricSeniorResume(host: SurfaceHost, input: unknown, context: C
 export function fabricListAgents(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const queueId = getString(input, "queueId");
   const includeCompleted = getOptionalBoolean(input, "includeCompleted") ?? false;
-  const maxEventsPerLane = getOptionalNumber(input, "maxEventsPerLane") ?? 5;
+  const maxEventsPerLane = getOptionalNumber(input, "maxEventsPerLane") ?? defaultMaxEventsPerLane();
+  const pageSize = normalizeOptionalPageSize(getOptionalNumber(input, "pageSize"));
+  const page = normalizeOptionalPage(getOptionalNumber(input, "page"), pageSize);
+  const groupBy = normalizeOptionalGroupBy(getOptionalString(input, "groupBy"));
   const lanes = projectQueueAgentLanes(host, { queueId, includeCompleted, maxEventsPerLane }, context);
   const laneRows = arrayFrom(lanes.lanes);
   const cards = laneRows
     .map((lane, index) => laneCard(queueId, lane, index))
     .sort((left, right) => numberFrom(left.nameIndex) - numberFrom(right.nameIndex) || left.displayName.localeCompare(right.displayName));
+  const visibleCards = pageSize ? cards.slice((page - 1) * pageSize, page * pageSize) : cards;
   return {
     schema: "agent-fabric.codex-agents.v1",
     queue: lanes.queue,
     queueId,
     mentionPrefix: "@af/",
     count: cards.length,
+    returnedCount: visibleCards.length,
     activeCount: cards.filter((card) => !CLOSED_STATUSES.has(String(card.rawStatus).toLowerCase())).length,
-    cards
+    pagination: pageSize
+      ? {
+          page,
+          pageSize,
+          total: cards.length,
+          pageCount: Math.ceil(cards.length / pageSize),
+          hasNextPage: page * pageSize < cards.length,
+          hasPreviousPage: page > 1
+        }
+      : undefined,
+    groupBy: groupBy ?? undefined,
+    groups: groupBy ? groupAgentCards(cards, groupBy, pageSize ?? 20) : undefined,
+    cards: visibleCards
   };
 }
 
@@ -321,7 +340,7 @@ export function fabricWaitAgents(host: SurfaceHost, input: unknown, context: Cal
   const queueId = getString(input, "queueId");
   const requestedAgents = getStringArray(input, "agents");
   const targetStatuses = new Set(getStringArray(input, "targetStatuses").map((status) => status.toLowerCase()));
-  const listed = fabricListAgents(host, { queueId, includeCompleted: true, maxEventsPerLane: getOptionalNumber(input, "maxEventsPerLane") ?? 5 }, context);
+  const listed = fabricListAgents(host, { queueId, includeCompleted: true, maxEventsPerLane: getOptionalNumber(input, "maxEventsPerLane") ?? defaultMaxEventsPerLane() }, context);
   const cards = arrayFrom(listed.cards).filter((card) => requestedAgents.length === 0 || requestedAgents.some((agent) => agentMatchesCard(agent, card)));
   const done = cards.every((card) => {
     const status = String(card.rawStatus ?? "").toLowerCase();
@@ -409,6 +428,7 @@ function laneCard(queueId: string, lane: Record<string, unknown>, index: number)
   const run = objectFrom(lane.workerRun);
   const progress = objectFrom(lane.progress);
   const metadata = objectFrom(run.metadata);
+  const orchestrationMetadata = objectFrom(metadata.orchestration);
   const codexBridge = objectFrom(metadata.codexBridge);
   const agentId = String(run.workerRunId ?? lane.laneId ?? task.queueTaskId ?? `agent-${index + 1}`);
   const displayName = stringFrom(codexBridge.displayName) ?? agentNameForIndex(index);
@@ -461,7 +481,32 @@ function laneCard(queueId: string, lane: Record<string, unknown>, index: number)
     task: {
       queueTaskId: task.queueTaskId,
       title: task.title,
-      status: task.status
+      status: task.status,
+      phase: task.phase,
+      managerId: task.managerId,
+      parentManagerId: task.parentManagerId,
+      parentQueueId: task.parentQueueId,
+      workstream: task.workstream,
+      costCenter: task.costCenter,
+      escalationTarget: task.escalationTarget,
+      category: task.category,
+      priority: task.priority,
+      risk: task.risk,
+      parallelGroup: task.parallelGroup
+    },
+    orchestration: {
+      phase: task.phase,
+      workstream: task.workstream ?? orchestrationMetadata.workstream ?? task.parallelGroup ?? task.phase,
+      category: task.category,
+      priority: task.priority,
+      risk: task.risk,
+      managerId: stringFrom(task.managerId) ?? stringFrom(metadata.managerId) ?? stringFrom(orchestrationMetadata.managerId) ?? stringFrom(codexBridge.managerId),
+      parentManagerId:
+        stringFrom(task.parentManagerId) ?? stringFrom(metadata.parentManagerId) ?? stringFrom(orchestrationMetadata.parentManagerId) ?? stringFrom(codexBridge.parentManagerId),
+      parentQueueId: stringFrom(task.parentQueueId) ?? stringFrom(metadata.parentQueueId) ?? stringFrom(orchestrationMetadata.parentQueueId) ?? stringFrom(codexBridge.parentQueueId),
+      costCenter: stringFrom(task.costCenter) ?? stringFrom(metadata.costCenter) ?? stringFrom(orchestrationMetadata.costCenter) ?? stringFrom(codexBridge.costCenter),
+      escalationTarget:
+        stringFrom(task.escalationTarget) ?? stringFrom(metadata.escalationTarget) ?? stringFrom(orchestrationMetadata.escalationTarget) ?? stringFrom(codexBridge.escalationTarget)
     },
     workspace: {
       mode: run.workspaceMode,
@@ -518,7 +563,30 @@ function plannedAgentCard(
     task: {
       queueTaskId,
       title: task.title,
-      status: task.status ?? "queued"
+      status: task.status ?? "queued",
+      phase: task.phase,
+      managerId: task.managerId,
+      parentManagerId: task.parentManagerId,
+      parentQueueId: task.parentQueueId,
+      workstream: task.workstream,
+      costCenter: task.costCenter,
+      escalationTarget: task.escalationTarget,
+      category: task.category,
+      priority: task.priority,
+      risk: task.risk,
+      parallelGroup: task.parallelGroup
+    },
+    orchestration: {
+      phase: task.phase,
+      managerId: task.managerId,
+      parentManagerId: task.parentManagerId,
+      parentQueueId: task.parentQueueId,
+      workstream: task.workstream ?? task.parallelGroup ?? task.phase,
+      costCenter: task.costCenter,
+      escalationTarget: task.escalationTarget,
+      category: task.category,
+      priority: task.priority,
+      risk: task.risk
     },
     workspace: {
       mode: options.workspaceMode,
@@ -558,10 +626,63 @@ function agentMatchesCard(agent: string, card: Record<string, unknown>): boolean
 }
 
 function normalizeCount(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > MAX_CODEX_AGENT_COUNT) {
-    throw new FabricError("INVALID_INPUT", `count must be an integer between 1 and ${MAX_CODEX_AGENT_COUNT}`, false);
+  const max = maxCodexAgentCount();
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new FabricError("INVALID_INPUT", `count must be an integer between 1 and ${max}`, false);
   }
   return value;
+}
+
+function normalizeOptionalPage(value: number | undefined, pageSize: number | undefined): number {
+  if (value === undefined) return pageSize ? 1 : 1;
+  if (!Number.isInteger(value) || value < 1) {
+    throw new FabricError("INVALID_INPUT", "page must be a positive integer", false);
+  }
+  return value;
+}
+
+function normalizeOptionalPageSize(value: number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value) || value < 1 || value > 500) {
+    throw new FabricError("INVALID_INPUT", "pageSize must be an integer between 1 and 500", false);
+  }
+  return value;
+}
+
+function normalizeOptionalGroupBy(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (CARD_GROUPS.has(value)) return value;
+  throw new FabricError("INVALID_INPUT", `groupBy must be one of: ${[...CARD_GROUPS].join(", ")}`, false);
+}
+
+function groupAgentCards(cards: AgentCard[], groupBy: string, maxItemsPerGroup: number): Array<Record<string, unknown>> {
+  const groups = new Map<string, AgentCard[]>();
+  for (const card of cards) {
+    const key = cardGroupKey(card, groupBy);
+    const group = groups.get(key) ?? [];
+    group.push(card);
+    groups.set(key, group);
+  }
+  return [...groups.entries()]
+    .sort((left, right) => right[1].length - left[1].length || left[0].localeCompare(right[0]))
+    .map(([key, group]) => ({
+      key,
+      count: group.length,
+      omitted: Math.max(0, group.length - maxItemsPerGroup),
+      cards: group.slice(0, maxItemsPerGroup)
+    }));
+}
+
+function cardGroupKey(card: AgentCard, groupBy: string): string {
+  const task = objectFrom(card.task);
+  const orchestration = objectFrom(card.orchestration);
+  if (groupBy === "status") return String(card.rawStatus ?? "unknown");
+  if (groupBy === "worker") return String(card.workerKind ?? "unknown");
+  if (groupBy === "phase") return stringFrom(orchestration.phase) ?? stringFrom(task.phase) ?? "unassigned";
+  if (groupBy === "workstream") return stringFrom(orchestration.workstream) ?? stringFrom(task.parallelGroup) ?? stringFrom(task.phase) ?? "unassigned";
+  if (groupBy === "risk") return stringFrom(orchestration.risk) ?? stringFrom(task.risk) ?? "unknown";
+  if (groupBy === "category") return stringFrom(orchestration.category) ?? stringFrom(task.category) ?? "unknown";
+  return "unknown";
 }
 
 function normalizeValue(value: string, allowed: Set<string>, field: string): string {

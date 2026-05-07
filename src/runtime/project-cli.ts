@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { FabricError } from "./errors.js";
 import { formatLocalConfigDoctor, runLocalConfigDoctor } from "./local-config-doctor.js";
+import { defaultMaxEventsPerLane, seniorDefaultLaneCount, seniorMaxLaneCount } from "./limits.js";
 import { applyPatchWithSystemPatch, checkPatchWithSystemPatch, validateGitStylePatch } from "./patches.js";
 
 type WorkerKind = "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "deepseek-direct" | "jcode-deepseek" | "manual";
@@ -18,7 +19,6 @@ const SENIOR_DEFAULT_WORKER = "deepseek-direct" as const;
 const SENIOR_DEFAULT_WORKSPACE_MODE: "git_worktree" = "git_worktree";
 const SENIOR_DEFAULT_MODEL_PROFILE = "deepseek-v4-pro:max";
 const SENIOR_DEFAULT_LANE_COUNT = 10;
-const SENIOR_MAX_LANE_COUNT = 32;
 const SENIOR_DEEPSEEK_WORKERS = new Set<WorkerKind>(["deepseek-direct", "jcode-deepseek"]);
 const WORKER_HEARTBEAT_MS = Number(process.env.AGENT_FABRIC_WORKER_HEARTBEAT_MS ?? process.env.AGENT_FABRIC_JCODE_HEARTBEAT_MS ?? 30_000);
 const TASK_CONTEXT_MAX_FILE_BYTES = 48_000;
@@ -279,6 +279,7 @@ export type ProjectCliCommand =
       queueId: string;
       progressFile?: string;
       maxEventsPerLane?: number;
+      managerSummaryLimit?: number;
     }
   | {
       command: "import-tasks";
@@ -789,6 +790,12 @@ type QueueTask = {
   category?: string;
   risk?: string;
   phase?: string;
+  managerId?: string;
+  parentManagerId?: string;
+  parentQueueId?: string;
+  workstream?: string;
+  costCenter?: string;
+  escalationTarget?: string;
   priority?: string;
   parallelGroup?: string;
   parallelSafe?: boolean;
@@ -1314,7 +1321,7 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       queueId: flags.queueId,
       planFile: flags.planFile,
       tasksFile: flags.tasksFile,
-      count: flags.count ?? SENIOR_DEFAULT_LANE_COUNT,
+      count: flags.count ?? (seniorModePermissive(process.env) ? seniorDefaultLaneCount() : SENIOR_DEFAULT_LANE_COUNT),
       worker: parseCodexBridgeWorker(flags.worker ?? seniorDefaultWorker(process.env)),
       approveModelCalls: flags.approveModelCalls,
       dryRun: flags.dryRun,
@@ -1330,7 +1337,8 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       json: flags.json,
       queueId: required(flags.queueId, "progress-report requires --queue <id>"),
       progressFile: flags.progressFile,
-      maxEventsPerLane: flags.maxEventsPerLane
+      maxEventsPerLane: flags.maxEventsPerLane,
+      managerSummaryLimit: flags.managerSummaryLimit
     };
   }
 
@@ -2207,7 +2215,7 @@ async function seedDemoProject(
   const dashboard = await call<DashboardResult>("project_queue_dashboard", {
     queueId,
     includeCompletedLanes: false,
-    maxEventsPerLane: 5
+    maxEventsPerLane: defaultMaxEventsPerLane()
   });
   const approvals = await call<QueueApprovalInbox>("project_queue_approval_inbox", {
     queueId,
@@ -2217,7 +2225,7 @@ async function seedDemoProject(
   const lanes = await call<AgentLanesResult>("project_queue_agent_lanes", {
     queueId,
     includeCompleted: false,
-    maxEventsPerLane: 5
+    maxEventsPerLane: defaultMaxEventsPerLane()
   });
 
   return {
@@ -3545,7 +3553,7 @@ async function seniorRun(
   call: ProjectToolCaller
 ): Promise<ProjectRunResult> {
   const projectPath = resolve(command.projectPath ?? process.cwd());
-  const count = Math.min(Math.max(command.count, 1), SENIOR_MAX_LANE_COUNT);
+  const count = Math.min(Math.max(command.count, 1), seniorMaxLaneCount());
   const progressFile = command.progressFile ?? join(projectPath, ".agent-fabric", "progress.md");
   const taskPacketDir = join(projectPath, ".agent-fabric", "task-packets");
   const cwdTemplate = join(projectPath, ".agent-fabric", "worktrees", "{{queueTaskId}}");
@@ -3663,7 +3671,7 @@ async function seniorRun(
           },
           call
         );
-  const progress = await call<Record<string, unknown>>("project_queue_progress_report", { queueId, maxEventsPerLane: 5 });
+  const progress = await call<Record<string, unknown>>("project_queue_progress_report", { queueId, maxEventsPerLane: defaultMaxEventsPerLane() });
   writeProgressMarkdown(progressFile, progress);
 
   return {
@@ -3690,7 +3698,8 @@ async function writeProgressReport(
 ): Promise<ProjectRunResult> {
   const report = await call<Record<string, unknown>>("project_queue_progress_report", {
     queueId: command.queueId,
-    maxEventsPerLane: command.maxEventsPerLane
+    maxEventsPerLane: command.maxEventsPerLane,
+    managerSummaryLimit: command.managerSummaryLimit
   });
   if (command.progressFile) writeProgressMarkdown(command.progressFile, report);
   return {
@@ -4389,9 +4398,15 @@ function formatTaskMetadataUpdated(result: { queue?: { queueId?: string; status?
   if (previous && task) {
     const changed: string[] = [];
     if (previous.title !== task.title) changed.push("title");
-    if (previous.goal !== task.goal) changed.push("goal");
-    if (previous.phase !== task.phase) changed.push("phase");
-    if (previous.category !== task.category) changed.push("category");
+	    if (previous.goal !== task.goal) changed.push("goal");
+	    if (previous.phase !== task.phase) changed.push("phase");
+	    if (previous.managerId !== task.managerId) changed.push("managerId");
+	    if (previous.parentManagerId !== task.parentManagerId) changed.push("parentManagerId");
+	    if (previous.parentQueueId !== task.parentQueueId) changed.push("parentQueueId");
+	    if (previous.workstream !== task.workstream) changed.push("workstream");
+	    if (previous.costCenter !== task.costCenter) changed.push("costCenter");
+	    if (previous.escalationTarget !== task.escalationTarget) changed.push("escalationTarget");
+	    if (previous.category !== task.category) changed.push("category");
     if (previous.priority !== task.priority) changed.push("priority");
     if (previous.parallelGroup !== task.parallelGroup) changed.push("parallelGroup");
     if (previous.parallelSafe !== task.parallelSafe) changed.push("parallelSafe");
@@ -4876,8 +4891,9 @@ function contextRefPathForValidation(projectPath: string, ref: string): string |
 }
 
 function normalizeParallel(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > SENIOR_MAX_LANE_COUNT) {
-    throw new FabricError("INVALID_INPUT", `parallel must be an integer between 1 and ${SENIOR_MAX_LANE_COUNT}`, false);
+  const max = seniorMaxLaneCount();
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new FabricError("INVALID_INPUT", `parallel must be an integer between 1 and ${max}`, false);
   }
   return value;
 }
@@ -5160,10 +5176,12 @@ function formatTaskPacketMarkdown(packet: Record<string, unknown>): string {
     "schema: agent-fabric.task-packet.v1",
     `queueId: ${frontmatterValue(String(queue.queueId))}`,
     `queueTaskId: ${frontmatterValue(task.queueTaskId)}`,
-    `fabricTaskId: ${frontmatterValue(task.fabricTaskId ?? "")}`,
-    `projectPath: ${frontmatterValue(String(queue.projectPath))}`,
-    `contextFilePath: ${frontmatterValue(contextFilePath)}`,
-    "---",
+	    `fabricTaskId: ${frontmatterValue(task.fabricTaskId ?? "")}`,
+	    `projectPath: ${frontmatterValue(String(queue.projectPath))}`,
+	    `contextFilePath: ${frontmatterValue(contextFilePath)}`,
+	    `managerId: ${frontmatterValue(task.managerId ?? "")}`,
+	    `workstream: ${frontmatterValue(task.workstream ?? task.parallelGroup ?? "")}`,
+	    "---",
     "",
     `# ${task.title}`,
     "",
@@ -5179,10 +5197,16 @@ function formatTaskPacketMarkdown(packet: Record<string, unknown>): string {
     "",
     task.goal,
     "",
-    "## Task Metadata",
-    "",
-    `Phase: ${task.phase ?? ""}`,
-    `Priority: ${task.priority ?? "normal"}`,
+	    "## Task Metadata",
+	    "",
+	    `Phase: ${task.phase ?? ""}`,
+	    `Manager: ${task.managerId ?? ""}`,
+	    `Parent manager: ${task.parentManagerId ?? ""}`,
+	    `Parent queue: ${task.parentQueueId ?? ""}`,
+	    `Workstream: ${task.workstream ?? task.parallelGroup ?? ""}`,
+	    `Cost center: ${task.costCenter ?? ""}`,
+	    `Escalation target: ${task.escalationTarget ?? ""}`,
+	    `Priority: ${task.priority ?? "normal"}`,
     `Parallel safe: ${String(task.parallelSafe ?? true)}`,
     `Depends on: ${JSON.stringify(task.dependsOn ?? [])}`,
     `Required tools: ${JSON.stringify(task.requiredTools ?? [])}`,
@@ -5895,6 +5919,7 @@ type ParsedFlags = {
   includeResume: boolean;
   archived: boolean;
   maxEventsPerLane?: number;
+  managerSummaryLimit?: number;
   staleAfterMinutes?: number;
   recoveryAction?: string;
   dryRun: boolean;
@@ -6028,6 +6053,7 @@ function parseFlags(args: string[]): ParsedFlags {
     else if (arg === "--include-resume") flags.includeResume = true;
     else if (arg === "--archived") flags.archived = true;
     else if (arg === "--max-events") flags.maxEventsPerLane = positiveInt(requiredValue(args, ++i, arg), "max-events");
+    else if (arg === "--manager-summary-limit") flags.managerSummaryLimit = positiveInt(requiredValue(args, ++i, arg), "manager-summary-limit");
     else if (arg === "--stale-after-minutes") flags.staleAfterMinutes = positiveInt(requiredValue(args, ++i, arg), "stale-after-minutes");
     else if (arg === "--recovery-action") flags.recoveryAction = requiredValue(args, ++i, arg);
     else if (arg === "--dry-run") flags.dryRun = true;
@@ -6240,9 +6266,7 @@ function resolveOptionalSeniorModelProfile(modelProfile: string | undefined): st
 
 function defaultSeniorLaneCount(fallback: number): number {
   if (!seniorModePermissive(process.env)) return fallback;
-  const parsed = Number(process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS ?? process.env.AGENT_FABRIC_SENIOR_LANE_COUNT ?? SENIOR_DEFAULT_LANE_COUNT);
-  if (!Number.isFinite(parsed)) return SENIOR_DEFAULT_LANE_COUNT;
-  return Math.min(SENIOR_MAX_LANE_COUNT, Math.max(1, Math.floor(parsed)));
+  return seniorDefaultLaneCount();
 }
 
 function defaultSeniorTaskPacketDir(queueId: string): string {

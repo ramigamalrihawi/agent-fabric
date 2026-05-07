@@ -50,6 +50,92 @@ describe("Codex-style Agent Fabric worker bridge", () => {
     daemon.close();
   });
 
+  it("supports high-scale card pagination, grouping, manager summaries, and cost role attribution", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const queueId = createQueue(daemon, session, "hundred-create", 100);
+    const tasks = addReadyTasks(daemon, session, queueId, 100, (index) => ({
+      managerId: index < 50 ? "manager-a" : "manager-b",
+      workstream: index % 2 === 0 ? "frontend" : "backend"
+    }));
+    startExecution(daemon, session, queueId, "hundred-start");
+
+    const planned = daemon.callTool(
+      "fabric_spawn_agents",
+      { queueId, count: 100, worker: "deepseek-direct", workspaceMode: "git_worktree", planOnly: true },
+      contextFor(session, "hundred-plan")
+    );
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) throw new Error("spawn failed");
+    expect(planned.data).toMatchObject({ status: "planned", requested: 100, planned: 100, queued: 0 });
+
+    for (let index = 0; index < tasks.length; index += 1) {
+      const claim = daemon.callTool(
+        "project_queue_claim_next",
+        {
+          queueId,
+          worker: "deepseek-direct",
+          workspaceMode: "git_worktree",
+          modelProfile: "deepseek-v4-pro:max",
+          metadata: { costRole: "worker", codexBridge: { managerId: "manager-a" } }
+        },
+        contextFor(session, `hundred-claim-${index}`)
+      );
+      expect(claim.ok).toBe(true);
+      if (!claim.ok) throw new Error("claim failed");
+      const claimed = claim.data.claimed as { fabricTaskId: string };
+      const workerRun = claim.data.workerRun as { workerRunId: string };
+      const event = daemon.callTool(
+        "fabric_task_event",
+        {
+          taskId: claimed.fabricTaskId,
+          workerRunId: workerRun.workerRunId,
+          kind: "command_started",
+          body: `worker ${index + 1} started`,
+          costUsd: index === 0 ? 0.01 : undefined
+        },
+        contextFor(session, `hundred-event-${index}`)
+      );
+      expect(event.ok).toBe(true);
+    }
+
+    const page = daemon.callTool(
+      "fabric_list_agents",
+      { queueId, includeCompleted: true, page: 2, pageSize: 25, groupBy: "status", maxEventsPerLane: 1 },
+      contextFor(session, "hundred-list")
+    );
+    expect(page.ok).toBe(true);
+    if (!page.ok) throw new Error("list failed");
+    expect(page.data).toMatchObject({
+      count: 100,
+      returnedCount: 25,
+      pagination: { page: 2, pageSize: 25, total: 100, pageCount: 4, hasNextPage: true, hasPreviousPage: true }
+    });
+    expect(page.data.cards).toHaveLength(25);
+    expect(page.data.groups[0]).toMatchObject({ key: "running", count: 100, omitted: 75 });
+    expect(page.data.cards[0].orchestration).toMatchObject({ risk: "low", category: "implementation" });
+
+    const progress = daemon.callTool(
+      "project_queue_progress_report",
+      { queueId, maxEventsPerLane: 1, managerSummaryLimit: 3 },
+      contextFor(session, "hundred-progress")
+    );
+    expect(progress.ok).toBe(true);
+    if (!progress.ok) throw new Error("progress failed");
+    expect(progress.data.managerSummary).toMatchObject({
+      bounded: true,
+      maxItemsPerSection: 3,
+      totals: { tasks: 100, lanes: 100 }
+    });
+    expect(progress.data.managerSummary.groups.byStatus[0]).toMatchObject({ key: "running", count: 100 });
+    expect(progress.data.managerSummary.groups.byStatus[0].items).toMatchObject({ count: 100, omitted: 97 });
+    expect(progress.data.managerSummary.groups.byManager).toEqual(
+      expect.arrayContaining([expect.objectContaining({ key: "manager-a", count: 50 }), expect.objectContaining({ key: "manager-b", count: 50 })])
+    );
+    expect(progress.data.summary.cost.byRole.worker).toMatchObject({ count: 1, costUsd: 0.01 });
+    daemon.close();
+  });
+
   it("plans bridge cards without fake runners, then opens a real runner-backed @af worker", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload());
@@ -207,20 +293,22 @@ function addReadyTasks(
   daemon: FabricDaemon,
   session: { sessionId: string; sessionToken: string },
   queueId: string,
-  count: number
+  count: number,
+  taskOverrides: (index: number) => Record<string, unknown> = () => ({})
 ): Array<{ queueTaskId: string; fabricTaskId: string }> {
   const added = daemon.callTool(
     "project_queue_add_tasks",
     {
       queueId,
-      tasks: Array.from({ length: count }, (_, index) => ({
-        title: `Task ${index + 1}`,
-        goal: `Implement independent slice ${index + 1}.`,
-        category: "implementation",
-        priority: "normal",
-        parallelSafe: true,
-        risk: "low"
-      }))
+	      tasks: Array.from({ length: count }, (_, index) => ({
+	        title: `Task ${index + 1}`,
+	        goal: `Implement independent slice ${index + 1}.`,
+	        category: "implementation",
+	        priority: "normal",
+	        parallelSafe: true,
+	        risk: "low",
+	        ...taskOverrides(index)
+	      }))
     },
     contextFor(session, `tasks-${count}`)
   );

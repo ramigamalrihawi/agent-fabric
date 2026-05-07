@@ -100,7 +100,7 @@ describe("desktop command center server", () => {
           ready: true,
           daemon: { daemon: { status: "ok" } },
           server: { status: "ok", transport: "http", apiAuth: { required: true, header: "x-agent-fabric-desktop-token" } },
-          features: { queueSnapshot: true, batchClaimApprovalRetry: true, actionInbox: true, taskPacketReadRoute: true, readyPacketLinks: true, projectCreateFlow: true, promptImproveFlow: true, planningFlow: true, demoSeed: true }
+          features: { queueSnapshot: true, batchClaimApprovalRetry: true, actionInbox: true, taskPacketReadRoute: true, readyPacketLinks: true, projectCreateFlow: true, promptImproveFlow: true, planningFlow: true, demoSeed: true, managerHealth: true }
         }
       });
       const data = (readiness as { data: { api: { callTools: string[]; readRoutes: string[] } } }).data;
@@ -109,6 +109,7 @@ describe("desktop command center server", () => {
       expect(data.api.readRoutes).toContain("/api/bootstrap");
       expect(data.api.readRoutes).toContain("/api/queues/:queueId/snapshot");
       expect(data.api.readRoutes).toContain("/api/queues/:queueId/action-inbox");
+      expect(data.api.readRoutes).toContain("/api/queues/:queueId/health");
       expect(data.api.readRoutes).toContain("/api/queues/:queueId/tasks/:queueTaskId/packet");
       expect(data.api.readRoutes).toContain("/api/queues/:queueId/ready-packet-links");
     }, fakeCaller(calls));
@@ -445,6 +446,31 @@ describe("desktop command center server", () => {
       {
         tool: "memory_list",
         input: { status: "pending_review", max: 5 }
+      }
+    ]);
+  });
+
+  it("exposes a compact manager health endpoint for queue dashboards", async () => {
+    const calls: Array<{ tool: string; input: Record<string, unknown> }> = [];
+    await withDesktop(async ({ url }) => {
+      const health = await getJson(`${url}api/queues/queue_1/health?maxEvents=7&managerSummaryLimit=4`);
+      expect(health).toMatchObject({
+        ok: true,
+        data: {
+          schema: "agent-fabric.desktop-manager-health.v1",
+          queue: { queueId: "queue_1" },
+          summary: { status: "running", nextAction: "Watch active worker lanes." },
+          managerSummary: { bounded: true, maxItemsPerSection: 4 },
+          nextActions: [{ label: "Open active lanes" }],
+          verificationChecklist: ["Review every patch-ready task before acceptance."]
+        }
+      });
+    }, fakeCaller(calls));
+
+    expect(calls).toEqual([
+      {
+        tool: "project_queue_progress_report",
+        input: { queueId: "queue_1", maxEventsPerLane: 7, managerSummaryLimit: 4 }
       }
     ]);
   });
@@ -908,6 +934,17 @@ function fakeCaller(calls: Array<{ tool: string; input: Record<string, unknown> 
     if (tool === "project_queue_approval_inbox") return { queueId: input.queueId, toolContext: [], modelCalls: [] };
     if (tool === "project_queue_timeline") return { queueId: input.queueId, items: [] };
     if (tool === "project_queue_agent_lanes") return { queueId: input.queueId, lanes: [] };
+    if (tool === "project_queue_progress_report")
+      return {
+        schema: "agent-fabric.project-queue-progress.v1",
+        queue: { queueId: input.queueId },
+        generatedAt: "2026-05-07T00:00:00.000Z",
+        summary: { status: "running", nextAction: "Watch active worker lanes." },
+        counts: { running: 2 },
+        managerSummary: { bounded: true, maxItemsPerSection: input.managerSummaryLimit, groups: { byManager: [] } },
+        nextActions: [{ label: "Open active lanes" }],
+        verificationChecklist: ["Review every patch-ready task before acceptance."]
+      };
     if (tool === "project_queue_launch_plan")
       return {
         queueId: input.queueId,

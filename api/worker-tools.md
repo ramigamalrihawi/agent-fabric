@@ -45,6 +45,8 @@ Codex and Claude Code integrations should prefer the compact worker-card tools w
 
 These tools expose `@af/<name>` handles and openable worker cards while preserving Agent Fabric as the durable source of truth. `fabric_accept_patch` requires senior review metadata (`reviewedBy`, `reviewSummary`).
 
+For high-scale Senior queues, `fabric_list_agents` supports `page`, `pageSize`, and `groupBy` (`status`, `phase`, `workstream`, `worker`, `risk`, or `category`). Worker cards include orchestration labels such as manager, parent manager, parent queue, workstream, cost center, escalation target, risk, and category when the queue task provides them. Native Codex, Claude Code, desktop, or plugin surfaces should page/group these Agent Fabric cards instead of mirroring unbounded transcript lists.
+
 ## `fabric_task_create`
 
 Create a durable task before assigning it to any worker.

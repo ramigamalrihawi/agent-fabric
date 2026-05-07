@@ -17,6 +17,7 @@ import {
   safeJsonArray,
   safeJsonRecord
 } from "../runtime/input.js";
+import { defaultMaxEventsPerLane, maxParallelAgentsLimit, maxQueueEventLimit, maxQueueListLimit } from "../runtime/limits.js";
 import type { CallContext } from "../types.js";
 import type { SurfaceHost } from "./host.js";
 import { llmApprove, llmPreflight } from "./costPolicy.js";
@@ -62,6 +63,12 @@ type ProjectQueueTaskRow = {
   title: string;
   goal: string;
   phase: string | null;
+  manager_id: string | null;
+  parent_manager_id: string | null;
+  parent_queue_id: string | null;
+  workstream: string | null;
+  cost_center: string | null;
+  escalation_target: string | null;
   category: string;
   status: string;
   priority: string;
@@ -162,6 +169,11 @@ type QueuePreflightRow = {
   decision: string;
   risk: string;
   estimated_cost_usd: number;
+};
+
+type QueueWorkerCostAttribution = {
+  role: string;
+  costUsd: number;
 };
 
 type WorkerRunRow = {
@@ -267,7 +279,6 @@ const EXECUTION_BLOCKED_QUEUE_STATUSES = new Set(["paused", "canceled", "complet
 const WORKER_START_OPEN_QUEUE_STATUSES = new Set(["running"]);
 const RETRYABLE_TASK_STATUSES = new Set(["blocked", "review", "patch_ready", "failed", "canceled"]);
 const TASK_METADATA_EDITABLE_STATUSES = new Set(["queued", "ready", "blocked", "review", "patch_ready", "failed", "canceled"]);
-const MAX_PARALLEL_AGENTS = 32;
 
 export function projectQueueCreate(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const projectPath = getString(input, "projectPath");
@@ -437,7 +448,7 @@ export function projectQueueDashboard(host: SurfaceHost, input: unknown, context
   const session = host.requireSession(context);
   const queue = requireQueue(host, getString(input, "queueId"), session.workspace_root);
   const includeCompletedLanes = getOptionalBoolean(input, "includeCompletedLanes") ?? false;
-  const maxEventsPerLane = normalizeEventLimit(getOptionalNumber(input, "maxEventsPerLane") ?? 5);
+  const maxEventsPerLane = normalizeEventLimit(getOptionalNumber(input, "maxEventsPerLane") ?? defaultMaxEventsPerLane());
   const tasks = taskRows(host, queue.id);
   const stages = host.db.db
     .prepare("SELECT * FROM project_queue_stages WHERE queue_id = ? ORDER BY ts_created ASC")
@@ -463,6 +474,7 @@ export function projectQueueDashboard(host: SurfaceHost, input: unknown, context
   const nowIso = host.now().toISOString();
   const modelApprovals = pendingModelApprovalRows(host, queue.id, session.workspace_root, false, 50, nowIso);
   const preflights = queuePreflightRows(host, queue.id, session.workspace_root);
+  const workerCosts = queueWorkerCostAttributions(host, queue.id);
   const analyzed = analyzeReadiness(tasks);
   const executionBlock = queueExecutionBlockReason(queue.status);
   const scheduled = executionBlock
@@ -491,7 +503,8 @@ export function projectQueueDashboard(host: SurfaceHost, input: unknown, context
       pendingToolApprovals: pendingApprovals.length,
       pendingModelApprovals: modelApprovals.length,
       staleRunningCount: staleRunning.length,
-      preflights
+      preflights,
+      workerCosts
     }),
     activeWorkers,
     availableSlots: Math.max(0, queue.max_parallel_agents - activeWorkers),
@@ -567,9 +580,11 @@ export function projectQueueReviewMatrix(host: SurfaceHost, input: unknown, cont
       leafTasks: tasks.filter((task) => (dependentCounts.get(task.id) ?? 0) === 0).length
     },
     buckets: {
-      status: groupTasks(tasks, (task) => task.status),
-      phase: groupTasks(tasks, (task) => task.phase ?? "unphased"),
-      category: groupTasks(tasks, (task) => task.category),
+	      status: groupTasks(tasks, (task) => task.status),
+	      phase: groupTasks(tasks, (task) => task.phase ?? "unphased"),
+	      manager: groupTasks(tasks, (task) => task.manager_id ?? "unmanaged"),
+	      workstream: groupTasks(tasks, (task) => task.workstream ?? task.parallel_group ?? task.phase ?? "unassigned"),
+	      category: groupTasks(tasks, (task) => task.category),
       risk: groupTasks(tasks, (task) => task.risk),
       priority: groupTasks(tasks, (task) => task.priority),
       parallelGroup: groupTasks(tasks, (task) => task.parallel_group ?? "ungrouped")
@@ -932,22 +947,30 @@ export function projectQueueAddTasks(host: SurfaceHost, input: unknown, context:
         );
       host.db.db
         .prepare(
-          `INSERT INTO project_queue_tasks (
-            id, queue_id, fabric_task_id, title, goal, phase, category, status,
-            priority, parallel_group, parallel_safe, risk, expected_files_json,
-            acceptance_criteria_json, required_tools_json, required_mcp_servers_json,
-            required_memories_json, required_context_refs_json, depends_on_json,
-            session_id, agent_id, origin_peer_id, test_mode
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        )
+	          `INSERT INTO project_queue_tasks (
+	            id, queue_id, fabric_task_id, title, goal, phase, manager_id,
+	            parent_manager_id, parent_queue_id, workstream, cost_center,
+	            escalation_target, category, status, priority, parallel_group,
+	            parallel_safe, risk, expected_files_json,
+	            acceptance_criteria_json, required_tools_json, required_mcp_servers_json,
+	            required_memories_json, required_context_refs_json, depends_on_json,
+	            session_id, agent_id, origin_peer_id, test_mode
+	          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	        )
         .run(
           task.queueTaskId,
           queue.id,
           fabricTaskId,
-          task.title,
-          task.goal,
-          task.phase,
-          task.category,
+	          task.title,
+	          task.goal,
+	          task.phase,
+	          task.managerId,
+	          task.parentManagerId,
+	          task.parentQueueId,
+	          task.workstream,
+	          task.costCenter,
+	          task.escalationTarget,
+	          task.category,
           task.status,
           task.priority,
           task.parallelGroup,
@@ -968,11 +991,14 @@ export function projectQueueAddTasks(host: SurfaceHost, input: unknown, context:
       created.push({
         queueTaskId: task.queueTaskId,
         fabricTaskId,
-        clientKey: task.clientKey,
-        title: task.title,
-        status: task.status,
-        dependsOn: task.dependsOn
-      });
+	        clientKey: task.clientKey,
+	        title: task.title,
+	        status: task.status,
+	        phase: task.phase ?? undefined,
+	        managerId: task.managerId ?? undefined,
+	        workstream: task.workstream ?? undefined,
+	        dependsOn: task.dependsOn
+	      });
     }
     host.db.db.prepare("UPDATE project_queues SET status = 'queue_review', ts_updated = CURRENT_TIMESTAMP WHERE id = ?").run(queue.id);
     host.writeAuditAndEvent({
@@ -1321,14 +1347,15 @@ export function projectQueueClaimNext(host: SurfaceHost, input: unknown, context
         availableSlots: slots,
         blocked
       };
-    }
-    if (worker && task.fabric_task_id) {
-      const claimedWorkerRunId = newWorkerRunId as string;
-      const claimedWorkspaceMode = workspaceMode ?? "in_place";
-      const claimedModelProfile = modelProfile ?? "execute.cheap";
-      const resolvedContextPolicy = contextPolicy ?? (claimProposal?.proposalId ? `tool_context:${claimProposal.proposalId}` : null);
-      const claimedCommand = command.length > 0 ? command : defaultWorkerCommand(worker, task.fabric_task_id);
-      host.db.db
+	    }
+	    if (worker && task.fabric_task_id) {
+	      const claimedWorkerRunId = newWorkerRunId as string;
+	      const claimedWorkspaceMode = workspaceMode ?? "in_place";
+	      const claimedModelProfile = modelProfile ?? "execute.cheap";
+	      const resolvedContextPolicy = contextPolicy ?? (claimProposal?.proposalId ? `tool_context:${claimProposal.proposalId}` : null);
+	      const claimedCommand = command.length > 0 ? command : defaultWorkerCommand(worker, task.fabric_task_id);
+	      const workerMetadata = workerRunMetadataForTask(metadata, task);
+	      host.db.db
         .prepare(
           `INSERT INTO worker_runs (
             id, task_id, worker, status, project_path, workspace_mode, workspace_path,
@@ -1345,9 +1372,9 @@ export function projectQueueClaimNext(host: SurfaceHost, input: unknown, context
           workspacePath ?? defaultWorkerWorkspacePath(queue.project_path, task.id, claimedWorkspaceMode),
           claimedModelProfile,
           resolvedContextPolicy,
-          maxRuntimeMinutes,
-          JSON.stringify(claimedCommand),
-          JSON.stringify(metadata),
+	          maxRuntimeMinutes,
+	          JSON.stringify(claimedCommand),
+	          JSON.stringify(workerMetadata),
           session.id,
           session.agent_id,
           host.originPeerId,
@@ -1371,10 +1398,10 @@ export function projectQueueClaimNext(host: SurfaceHost, input: unknown, context
           projectPath: queue.project_path,
           workspaceMode: claimedWorkspaceMode,
           workspacePath: workspacePath ?? defaultWorkerWorkspacePath(queue.project_path, task.id, claimedWorkspaceMode),
-          modelProfile: claimedModelProfile,
-          contextPolicy: resolvedContextPolicy,
-          command: claimedCommand,
-          metadata,
+	          modelProfile: claimedModelProfile,
+	          contextPolicy: resolvedContextPolicy,
+	          command: claimedCommand,
+	          metadata: workerMetadata,
           queueId: queue.id,
           queueTaskId: task.id
         },
@@ -1579,7 +1606,7 @@ export function projectQueueAgentLanes(host: SurfaceHost, input: unknown, contex
   const session = host.requireSession(context);
   const queue = requireQueue(host, getString(input, "queueId"), session.workspace_root);
   const includeCompleted = getOptionalBoolean(input, "includeCompleted") ?? false;
-  const maxEventsPerLane = normalizeEventLimit(getOptionalNumber(input, "maxEventsPerLane") ?? 5);
+  const maxEventsPerLane = normalizeEventLimit(getOptionalNumber(input, "maxEventsPerLane") ?? defaultMaxEventsPerLane());
   const tasks = taskRows(host, queue.id);
   const taskByFabricId = new Map(tasks.filter((task) => task.fabric_task_id).map((task) => [task.fabric_task_id as string, task]));
   const fabricTaskIds = [...taskByFabricId.keys()];
@@ -1702,7 +1729,8 @@ export function projectQueueApproveModelCalls(host: SurfaceHost, input: unknown,
 export function projectQueueProgressReport(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const session = host.requireSession(context);
   const queue = requireQueue(host, getString(input, "queueId"), session.workspace_root);
-  const maxEventsPerLane = normalizeEventLimit(getOptionalNumber(input, "maxEventsPerLane") ?? 5);
+  const maxEventsPerLane = normalizeEventLimit(getOptionalNumber(input, "maxEventsPerLane") ?? defaultMaxEventsPerLane());
+  const managerSummaryLimit = normalizeManagerSummaryLimit(getOptionalNumber(input, "managerSummaryLimit") ?? 10);
   const tasks = taskRows(host, queue.id);
   const counts = statusCounts(tasks);
   const activeWorkers = tasks.filter((task) => ACTIVE_WORKER_STATUSES.has(task.status)).length;
@@ -1720,8 +1748,10 @@ export function projectQueueProgressReport(host: SurfaceHost, input: unknown, co
        WHERE queue_id = ? AND status = 'proposed' AND approval_required = 1
        ORDER BY ts_created ASC`
     )
-    .all(queue.id) as ToolContextProposalRow[];
+	    .all(queue.id) as ToolContextProposalRow[];
   const lanes = projectQueueAgentLanes(host, { queueId: queue.id, includeCompleted: true, maxEventsPerLane }, context);
+  const preflights = queuePreflightRows(host, queue.id, session.workspace_root);
+  const workerCosts = queueWorkerCostAttributions(host, queue.id);
   const patchReadyTasks = tasks.filter((task) => task.status === "patch_ready").map(formatQueueTask);
   const acceptedTasks = tasks.filter((task) => task.status === "accepted").map(formatQueueTask);
   const failedTasks = tasks.filter((task) => task.status === "failed" || task.status === "canceled").map(formatQueueTask);
@@ -1737,15 +1767,25 @@ export function projectQueueProgressReport(host: SurfaceHost, input: unknown, co
     pendingToolApprovals: toolApprovals.length,
     pendingModelApprovals: modelApprovals.length,
     staleRunningCount: staleWorkerRows(host, queue.id, new Date(host.now().getTime() - 30 * 60_000).toISOString(), host.now().getTime()).length,
-    preflights: queuePreflightRows(host, queue.id, session.workspace_root)
+    preflights,
+    workerCosts
   });
   const nextActions = nextProgressActions(queue, summary, pendingApprovalCount, patchReadyTasks.length, scheduled.ready.length);
+  const laneRows = arrayRecordsFromUnknown(lanes.lanes);
 
   return {
     schema: "agent-fabric.project-queue-progress.v1",
     queue: formatQueue(queue),
     generatedAt: nowIso,
     summary,
+    managerSummary: queueManagerSummary({
+      tasks,
+      lanes: laneRows,
+      blockedEntries,
+      toolApprovals,
+      modelApprovals,
+      maxItems: managerSummaryLimit
+    }),
     counts,
     workers: lanes,
     blockers: blockedEntries.map(formatBlockedEntry),
@@ -1919,12 +1959,24 @@ export function projectQueueUpdateTaskMetadata(host: SurfaceHost, input: unknown
   const title = getOptionalString(input, "title");
   const goal = getOptionalString(input, "goal");
   const phase = getOptionalString(input, "phase");
+  const managerId = getOptionalString(input, "managerId") ?? getOptionalString(input, "manager");
+  const parentManagerId = getOptionalString(input, "parentManagerId");
+  const parentQueueId = getOptionalString(input, "parentQueueId");
+  const workstream = getOptionalString(input, "workstream");
+  const costCenter = getOptionalString(input, "costCenter");
+  const escalationTarget = getOptionalString(input, "escalationTarget");
   const category = getOptionalString(input, "category");
   const priority = optionalNormalized(input, "priority", TASK_PRIORITIES);
   const parallelGroup = getOptionalString(input, "parallelGroup");
   const parallelSafe = getOptionalBoolean(input, "parallelSafe");
   const risk = optionalNormalized(input, "risk", RISKS);
   const clearPhase = getOptionalBoolean(input, "clearPhase") ?? false;
+  const clearManagerId = getOptionalBoolean(input, "clearManagerId") ?? getOptionalBoolean(input, "clearManager") ?? false;
+  const clearParentManagerId = getOptionalBoolean(input, "clearParentManagerId") ?? false;
+  const clearParentQueueId = getOptionalBoolean(input, "clearParentQueueId") ?? false;
+  const clearWorkstream = getOptionalBoolean(input, "clearWorkstream") ?? false;
+  const clearCostCenter = getOptionalBoolean(input, "clearCostCenter") ?? false;
+  const clearEscalationTarget = getOptionalBoolean(input, "clearEscalationTarget") ?? false;
   const clearParallelGroup = getOptionalBoolean(input, "clearParallelGroup") ?? false;
   const expectedFiles = optionalStringArrayInput(input, "expectedFiles");
   const acceptanceCriteria = optionalStringArrayInput(input, "acceptanceCriteria");
@@ -1947,6 +1999,12 @@ export function projectQueueUpdateTaskMetadata(host: SurfaceHost, input: unknown
   if (goal !== undefined && goal.trim().length === 0) throw new FabricError("INVALID_INPUT", "goal must not be empty", false);
   if (category !== undefined && category.trim().length === 0) throw new FabricError("INVALID_INPUT", "category must not be empty", false);
   if (phase !== undefined && clearPhase) throw new FabricError("INVALID_INPUT", "Pass either phase or clearPhase, not both", false);
+  if (managerId !== undefined && clearManagerId) throw new FabricError("INVALID_INPUT", "Pass either managerId or clearManagerId, not both", false);
+  if (parentManagerId !== undefined && clearParentManagerId) throw new FabricError("INVALID_INPUT", "Pass either parentManagerId or clearParentManagerId, not both", false);
+  if (parentQueueId !== undefined && clearParentQueueId) throw new FabricError("INVALID_INPUT", "Pass either parentQueueId or clearParentQueueId, not both", false);
+  if (workstream !== undefined && clearWorkstream) throw new FabricError("INVALID_INPUT", "Pass either workstream or clearWorkstream, not both", false);
+  if (costCenter !== undefined && clearCostCenter) throw new FabricError("INVALID_INPUT", "Pass either costCenter or clearCostCenter, not both", false);
+  if (escalationTarget !== undefined && clearEscalationTarget) throw new FabricError("INVALID_INPUT", "Pass either escalationTarget or clearEscalationTarget, not both", false);
   if (parallelGroup !== undefined && clearParallelGroup) throw new FabricError("INVALID_INPUT", "Pass either parallelGroup or clearParallelGroup, not both", false);
   rejectSetAndPatch(requiredTools, addRequiredTools, removeRequiredTools, "requiredTools");
   rejectSetAndPatch(requiredMcpServers, addRequiredMcpServers, removeRequiredMcpServers, "requiredMcpServers");
@@ -1980,10 +2038,16 @@ export function projectQueueUpdateTaskMetadata(host: SurfaceHost, input: unknown
     host.db.db
       .prepare(
         `UPDATE project_queue_tasks
-         SET title = ?,
-             goal = ?,
-             phase = ?,
-             category = ?,
+	         SET title = ?,
+	             goal = ?,
+	             phase = ?,
+	             manager_id = ?,
+	             parent_manager_id = ?,
+	             parent_queue_id = ?,
+	             workstream = ?,
+	             cost_center = ?,
+	             escalation_target = ?,
+	             category = ?,
              priority = ?,
              parallel_group = ?,
              parallel_safe = ?,
@@ -1999,10 +2063,16 @@ export function projectQueueUpdateTaskMetadata(host: SurfaceHost, input: unknown
          WHERE id = ?`
       )
       .run(
-        nextTitle,
-        nextGoal,
-        clearPhase ? null : phase ?? task.phase,
-        category?.trim() ?? task.category,
+	        nextTitle,
+	        nextGoal,
+	        clearPhase ? null : phase ?? task.phase,
+	        clearManagerId ? null : managerId ?? task.manager_id,
+	        clearParentManagerId ? null : parentManagerId ?? task.parent_manager_id,
+	        clearParentQueueId ? null : parentQueueId ?? task.parent_queue_id,
+	        clearWorkstream ? null : workstream ?? task.workstream,
+	        clearCostCenter ? null : costCenter ?? task.cost_center,
+	        clearEscalationTarget ? null : escalationTarget ?? task.escalation_target,
+	        category?.trim() ?? task.category,
         nextPriority,
         clearParallelGroup ? null : parallelGroup ?? task.parallel_group,
         parallelSafe === undefined ? task.parallel_safe : parallelSafe ? 1 : 0,
@@ -2374,6 +2444,12 @@ function prepareTask(input: unknown): {
   title: string;
   goal: string;
   phase: string | null;
+  managerId: string | null;
+  parentManagerId: string | null;
+  parentQueueId: string | null;
+  workstream: string | null;
+  costCenter: string | null;
+  escalationTarget: string | null;
   category: string;
   status: string;
   priority: string;
@@ -2401,6 +2477,12 @@ function prepareTask(input: unknown): {
     title,
     goal,
     phase: optionalStringField(record, "phase") ?? null,
+    managerId: optionalStringField(record, "managerId") ?? optionalStringField(record, "manager") ?? null,
+    parentManagerId: optionalStringField(record, "parentManagerId") ?? null,
+    parentQueueId: optionalStringField(record, "parentQueueId") ?? null,
+    workstream: optionalStringField(record, "workstream") ?? null,
+    costCenter: optionalStringField(record, "costCenter") ?? null,
+    escalationTarget: optionalStringField(record, "escalationTarget") ?? null,
     category: optionalStringField(record, "category") ?? "implementation",
     status,
     priority: normalizeValue(optionalStringField(record, "priority") ?? "normal", TASK_PRIORITIES, "task.priority"),
@@ -2433,22 +2515,25 @@ function defaultQueueTitle(projectPath: string): string {
 }
 
 function normalizeMaxParallelAgents(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > MAX_PARALLEL_AGENTS) {
-    throw new FabricError("INVALID_INPUT", `maxParallelAgents must be an integer between 1 and ${MAX_PARALLEL_AGENTS}`, false);
+  const max = maxParallelAgentsLimit();
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new FabricError("INVALID_INPUT", `maxParallelAgents must be an integer between 1 and ${max}`, false);
   }
   return value;
 }
 
 function normalizePositiveLimit(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > 100) {
-    throw new FabricError("INVALID_INPUT", "limit must be an integer between 1 and 100", false);
+  const max = maxQueueListLimit();
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new FabricError("INVALID_INPUT", `limit must be an integer between 1 and ${max}`, false);
   }
   return value;
 }
 
 function normalizeListLimit(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > 200) {
-    throw new FabricError("INVALID_INPUT", "limit must be an integer between 1 and 200", false);
+  const max = maxQueueListLimit();
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new FabricError("INVALID_INPUT", `limit must be an integer between 1 and ${max}`, false);
   }
   return value;
 }
@@ -2461,8 +2546,16 @@ function normalizeStaleAfterMinutes(value: number): number {
 }
 
 function normalizeEventLimit(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > 50) {
-    throw new FabricError("INVALID_INPUT", "maxEventsPerLane must be an integer between 1 and 50", false);
+  const max = maxQueueEventLimit();
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new FabricError("INVALID_INPUT", `maxEventsPerLane must be an integer between 1 and ${max}`, false);
+  }
+  return value;
+}
+
+function normalizeManagerSummaryLimit(value: number): number {
+  if (!Number.isInteger(value) || value < 1 || value > 100) {
+    throw new FabricError("INVALID_INPUT", "managerSummaryLimit must be an integer between 1 and 100", false);
   }
   return value;
 }
@@ -2528,10 +2621,16 @@ function validateDependencyPatch(taskId: string, dependsOn: string[], tasks: Pro
 
 function taskMetadataSnapshot(task: ProjectQueueTaskRow): Record<string, unknown> {
   return {
-    title: task.title,
-    goal: task.goal,
-    phase: task.phase ?? undefined,
-    category: task.category,
+	    title: task.title,
+	    goal: task.goal,
+	    phase: task.phase ?? undefined,
+	    managerId: task.manager_id ?? undefined,
+	    parentManagerId: task.parent_manager_id ?? undefined,
+	    parentQueueId: task.parent_queue_id ?? undefined,
+	    workstream: task.workstream ?? undefined,
+	    costCenter: task.cost_center ?? undefined,
+	    escalationTarget: task.escalation_target ?? undefined,
+	    category: task.category,
     priority: task.priority,
     parallelGroup: task.parallel_group ?? undefined,
     parallelSafe: task.parallel_safe === 1,
@@ -2543,6 +2642,33 @@ function taskMetadataSnapshot(task: ProjectQueueTaskRow): Record<string, unknown
     requiredMemories: safeJsonArray(task.required_memories_json),
     requiredContextRefs: safeJsonArray(task.required_context_refs_json),
     dependsOn: safeJsonArray(task.depends_on_json)
+  };
+}
+
+function workerRunMetadataForTask(inputMetadata: Record<string, unknown>, task: ProjectQueueTaskRow): Record<string, unknown> {
+  const orchestration = {
+    ...asRecord(inputMetadata.orchestration),
+    phase: task.phase ?? undefined,
+    managerId: task.manager_id ?? undefined,
+    parentManagerId: task.parent_manager_id ?? undefined,
+    parentQueueId: task.parent_queue_id ?? undefined,
+    workstream: task.workstream ?? task.parallel_group ?? task.phase ?? undefined,
+    costCenter: task.cost_center ?? undefined,
+    escalationTarget: task.escalation_target ?? undefined,
+    category: task.category,
+    priority: task.priority,
+    risk: task.risk
+  };
+  return {
+    ...inputMetadata,
+    managerId: inputMetadata.managerId ?? task.manager_id ?? undefined,
+    parentManagerId: inputMetadata.parentManagerId ?? task.parent_manager_id ?? undefined,
+    parentQueueId: inputMetadata.parentQueueId ?? task.parent_queue_id ?? undefined,
+    workstream: inputMetadata.workstream ?? task.workstream ?? task.parallel_group ?? task.phase ?? undefined,
+    costCenter: inputMetadata.costCenter ?? task.cost_center ?? undefined,
+    escalationTarget: inputMetadata.escalationTarget ?? task.escalation_target ?? undefined,
+    costRole: inputMetadata.costRole ?? (task.category.includes("manager") ? "manager" : undefined),
+    orchestration
   };
 }
 
@@ -2710,6 +2836,37 @@ function queuePreflightRows(host: SurfaceHost, queueId: string, workspaceRoot: s
        ORDER BY ts ASC`
     )
     .all(workspaceRoot, `project_queue:${queueId}`, taskPattern) as QueuePreflightRow[];
+}
+
+function queueWorkerCostAttributions(host: SurfaceHost, queueId: string): QueueWorkerCostAttribution[] {
+  const rows = host.db.db
+    .prepare(
+      `SELECT e.cost_usd, e.metadata_json, wr.worker, wr.metadata_json AS worker_metadata_json, t.category
+       FROM worker_events e
+       JOIN worker_runs wr ON wr.id = e.worker_run_id
+       JOIN project_queue_tasks t ON t.fabric_task_id = e.task_id
+       WHERE t.queue_id = ?
+       ORDER BY e.ts ASC`
+    )
+    .all(queueId) as Array<{
+    cost_usd: number | null;
+    metadata_json: string;
+    worker: string | null;
+    worker_metadata_json: string;
+    category: string | null;
+  }>;
+  const attributions: QueueWorkerCostAttribution[] = [];
+  for (const row of rows) {
+    const eventMetadata = safeJsonRecord(row.metadata_json);
+    const workerMetadata = safeJsonRecord(row.worker_metadata_json);
+    const costUsd = row.cost_usd ?? costFromWorkerEventMetadata(eventMetadata);
+    if (costUsd === undefined || costUsd <= 0) continue;
+    attributions.push({
+      role: costRoleFromMetadata(workerMetadata, row.category, row.worker),
+      costUsd
+    });
+  }
+  return attributions;
 }
 
 function queueWorkerEventRows(host: SurfaceHost, queueId: string, limit: number): QueueWorkerEventRow[] {
@@ -3521,6 +3678,7 @@ function queueSummaryStrip(input: {
   pendingModelApprovals: number;
   staleRunningCount: number;
   preflights: QueuePreflightRow[];
+  workerCosts: QueueWorkerCostAttribution[];
 }): Record<string, unknown> {
   const reviewCount = (input.counts.review ?? 0) + (input.counts.patch_ready ?? 0);
   const doneCount = input.tasks.filter((task) => DEPENDENCY_DONE.has(task.status)).length;
@@ -3611,7 +3769,146 @@ function queueSummaryStrip(input: {
       maxParallelAgents: input.queue.max_parallel_agents
     },
     risk: queueRiskStrip(input.tasks),
-    cost: queueCostStrip(input.preflights)
+    cost: queueCostStrip(input.preflights, input.workerCosts)
+  };
+}
+
+function queueManagerSummary(input: {
+  tasks: ProjectQueueTaskRow[];
+  lanes: Record<string, unknown>[];
+  blockedEntries: BlockedEntry[];
+  toolApprovals: ToolContextProposalRow[];
+  modelApprovals: ApprovalRequestWithPreflightRow[];
+  maxItems: number;
+}): Record<string, unknown> {
+  const laneByTaskId = new Map<string, Record<string, unknown>>();
+  for (const lane of input.lanes) {
+    const task = asRecord(lane.queueTask);
+    const queueTaskId = stringFromUnknown(task.queueTaskId);
+    if (queueTaskId) laneByTaskId.set(queueTaskId, lane);
+  }
+  const items = input.tasks.map((task) => managerTaskItem(task, laneByTaskId.get(task.id)));
+  const blockedTaskIds = new Set(input.blockedEntries.map((entry) => entry.task.id));
+  const approvalTaskIds = new Set(input.toolApprovals.map((approval) => approval.queue_task_id).filter((id): id is string => Boolean(id)));
+  const failedItems = items.filter((item) => item.status === "failed" || item.status === "canceled");
+  const patchReadyItems = items.filter((item) => item.status === "patch_ready" || item.status === "review");
+  const blockedItems = items.filter((item) => blockedTaskIds.has(String(item.queueTaskId)) || item.status === "blocked");
+  const approvalItems = items.filter((item) => approvalTaskIds.has(String(item.queueTaskId)));
+  const escalationItems = items.filter((item) => {
+    const risk = String(item.risk ?? "");
+    const status = String(item.status ?? "");
+    return risk === "high" || risk === "breakglass" || status === "failed" || status === "blocked";
+  });
+  const evidenceItems = items.filter((item) => valuesFromUnknown(item.patchRefs).length > 0 || valuesFromUnknown(item.testRefs).length > 0);
+
+  return {
+    bounded: true,
+    maxItemsPerSection: input.maxItems,
+    totals: {
+      tasks: input.tasks.length,
+      lanes: input.lanes.length,
+      phases: new Set(items.map((item) => String(item.phase ?? "unassigned"))).size,
+      pendingToolApprovals: input.toolApprovals.length,
+      pendingModelApprovals: input.modelApprovals.length
+    },
+    groups: {
+      byStatus: groupedManagerItems(items, (item) => String(item.status ?? "unknown"), input.maxItems),
+      byManager: groupedManagerItems(items, (item) => String(item.managerId ?? "unmanaged"), input.maxItems),
+      byPhase: groupedManagerItems(items, (item) => String(item.phase ?? "unassigned"), input.maxItems),
+      byWorkstream: groupedManagerItems(items, (item) => String(item.workstream ?? item.parallelGroup ?? item.phase ?? "unassigned"), input.maxItems)
+    },
+    attention: {
+      blocked: boundedItems(blockedItems, input.maxItems),
+      patchReady: boundedItems(patchReadyItems, input.maxItems),
+      failed: boundedItems(failedItems, input.maxItems),
+      approvals: {
+        toolContext: boundedItems(
+          input.toolApprovals.map((approval) => ({
+            proposalId: approval.id,
+            queueTaskId: approval.queue_task_id ?? undefined,
+            fabricTaskId: approval.fabric_task_id ?? undefined,
+            modelAlias: approval.model_alias ?? undefined,
+            status: approval.status
+          })),
+          input.maxItems
+        ),
+        modelCalls: boundedItems(
+          input.modelApprovals.map((approval) => ({
+            requestId: approval.id,
+            preflightRequestId: approval.preflight_request_id,
+            status: approval.status,
+            decision: approval.decision ?? undefined,
+            risk: approval.risk,
+            estimatedCostUsd: roundUsd(approval.estimated_cost_usd)
+          })),
+          input.maxItems
+        )
+      },
+      escalationNeeded: boundedItems(escalationItems, input.maxItems)
+    },
+    evidence: boundedItems(evidenceItems, input.maxItems)
+  };
+}
+
+function managerTaskItem(task: ProjectQueueTaskRow, lane?: Record<string, unknown>): Record<string, unknown> {
+  const progress = asRecord(lane?.progress);
+  const run = asRecord(lane?.workerRun);
+  const patchRefs = safeJsonArray(task.patch_refs_json).filter((ref): ref is string => typeof ref === "string");
+  const testRefs = safeJsonArray(task.test_refs_json).filter((ref): ref is string => typeof ref === "string");
+  return {
+    queueTaskId: task.id,
+    fabricTaskId: task.fabric_task_id ?? undefined,
+    title: task.title,
+    status: task.status,
+    phase: task.phase ?? "unassigned",
+    managerId: task.manager_id ?? undefined,
+    parentManagerId: task.parent_manager_id ?? undefined,
+    parentQueueId: task.parent_queue_id ?? undefined,
+    workstream: task.workstream ?? undefined,
+    costCenter: task.cost_center ?? undefined,
+    escalationTarget: task.escalation_target ?? undefined,
+    category: task.category,
+    priority: task.priority,
+    risk: task.risk,
+    parallelGroup: task.parallel_group ?? undefined,
+    workerRunId: stringFromUnknown(run.workerRunId),
+    workerKind: stringFromUnknown(run.worker),
+    workerStatus: stringFromUnknown(run.status),
+    workspaceMode: stringFromUnknown(run.workspaceMode),
+    lastActivityAt: stringFromUnknown(progress.lastActivityAt) ?? stringFromUnknown(run.updatedAt) ?? task.ts_updated,
+    summary: task.summary ?? stringFromUnknown(progress.summary) ?? undefined,
+    nextAction: stringFromUnknown(progress.nextAction),
+    patchRefs,
+    testRefs
+  };
+}
+
+function groupedManagerItems(
+  items: Record<string, unknown>[],
+  keyFor: (item: Record<string, unknown>) => string,
+  maxItems: number
+): Array<Record<string, unknown>> {
+  const groups = new Map<string, Record<string, unknown>[]>();
+  for (const item of items) {
+    const key = keyFor(item);
+    const group = groups.get(key) ?? [];
+    group.push(item);
+    groups.set(key, group);
+  }
+  return [...groups.entries()]
+    .sort((left, right) => right[1].length - left[1].length || left[0].localeCompare(right[0]))
+    .map(([key, group]) => ({
+      key,
+      count: group.length,
+      items: boundedItems(group, maxItems)
+    }));
+}
+
+function boundedItems(items: Record<string, unknown>[], maxItems: number): Record<string, unknown> {
+  return {
+    count: items.length,
+    omitted: Math.max(0, items.length - maxItems),
+    items: items.slice(0, maxItems)
   };
 }
 
@@ -3679,13 +3976,62 @@ function queueRiskStrip(tasks: ProjectQueueTaskRow[]): Record<string, unknown> {
   };
 }
 
-function queueCostStrip(preflights: QueuePreflightRow[]): Record<string, unknown> {
+function queueCostStrip(preflights: QueuePreflightRow[], workerCosts: QueueWorkerCostAttribution[]): Record<string, unknown> {
+  const workerCostByRole = aggregateWorkerCosts(workerCosts);
   return {
     preflightCount: preflights.length,
     estimatedCostUsd: roundUsd(sumNumbers(preflights.map((row) => row.estimated_cost_usd))),
     byDecision: aggregatePreflightRows(preflights, (row) => row.decision),
-    byRisk: aggregatePreflightRows(preflights, (row) => row.risk)
+    byRisk: aggregatePreflightRows(preflights, (row) => row.risk),
+    byRole: workerCostByRole,
+    roleWarnings: costRoleWarnings(workerCostByRole)
   };
+}
+
+function costFromWorkerEventMetadata(metadata: Record<string, unknown>): number | undefined {
+  const direct = typeof metadata.costUsd === "number" ? metadata.costUsd : undefined;
+  if (direct !== undefined) return direct;
+  const structured = asRecord(metadata.structuredResult);
+  const raw = asRecord(structured.raw);
+  const rawCost = raw.costUsd;
+  return typeof rawCost === "number" && Number.isFinite(rawCost) ? rawCost : undefined;
+}
+
+function costRoleFromMetadata(workerMetadata: Record<string, unknown>, category: string | null, worker: string | null): string {
+  const explicit =
+    stringFromUnknown(workerMetadata.costRole) ??
+    stringFromUnknown(workerMetadata.role) ??
+    stringFromUnknown(asRecord(workerMetadata.orchestration).costRole) ??
+    stringFromUnknown(asRecord(workerMetadata.codexBridge).role);
+  if (explicit === "senior" || explicit === "manager" || explicit === "worker") return explicit;
+  const normalizedCategory = (category ?? "").toLowerCase();
+  if (normalizedCategory.includes("manager")) return "manager";
+  if (normalizedCategory.includes("adjudicator") || normalizedCategory.includes("reviewer") || normalizedCategory.includes("planner")) return "worker";
+  return worker && worker !== "manual" ? "worker" : "unknown";
+}
+
+function aggregateWorkerCosts(rows: QueueWorkerCostAttribution[]): Record<string, { count: number; costUsd: number }> {
+  const grouped: Record<string, { count: number; costUsd: number }> = {};
+  for (const row of rows) {
+    grouped[row.role] ??= { count: 0, costUsd: 0 };
+    grouped[row.role].count += 1;
+    grouped[row.role].costUsd += row.costUsd;
+  }
+  for (const value of Object.values(grouped)) value.costUsd = roundUsd(value.costUsd);
+  return grouped;
+}
+
+function costRoleWarnings(grouped: Record<string, { count: number; costUsd: number }>): string[] {
+  const warnings: string[] = [];
+  const managerCost = grouped.manager?.costUsd ?? 0;
+  const workerCost = grouped.worker?.costUsd ?? 0;
+  if (managerCost > 0 && managerCost > workerCost) {
+    warnings.push("manager_cost_exceeds_worker_cost");
+  }
+  if ((grouped.worker?.count ?? 0) > 0 && workerCost === 0) {
+    warnings.push("worker_cost_missing_or_unreported");
+  }
+  return warnings;
 }
 
 function aggregatePreflightRows(rows: QueuePreflightRow[], keyFor: (row: QueuePreflightRow) => string): Record<string, { count: number; estimatedCostUsd: number }> {
@@ -3812,6 +4158,8 @@ function taskMemoryIntent(task: ProjectQueueTaskRow): Record<string, unknown> {
     title: task.title,
     goal: task.goal,
     phase: task.phase,
+    managerId: task.manager_id,
+    workstream: task.workstream,
     category: task.category,
     risk: task.risk,
     expectedFiles: safeJsonArray(task.expected_files_json),
@@ -4056,10 +4404,16 @@ function formatQueueTask(row: ProjectQueueTaskRow): Record<string, unknown> {
     queueTaskId: row.id,
     queueId: row.queue_id,
     fabricTaskId: row.fabric_task_id ?? undefined,
-    title: row.title,
-    goal: row.goal,
-    phase: row.phase ?? undefined,
-    category: row.category,
+	    title: row.title,
+	    goal: row.goal,
+	    phase: row.phase ?? undefined,
+	    managerId: row.manager_id ?? undefined,
+	    parentManagerId: row.parent_manager_id ?? undefined,
+	    parentQueueId: row.parent_queue_id ?? undefined,
+	    workstream: row.workstream ?? undefined,
+	    costCenter: row.cost_center ?? undefined,
+	    escalationTarget: row.escalation_target ?? undefined,
+	    category: row.category,
     status: row.status,
     priority: row.priority,
     parallelGroup: row.parallel_group ?? undefined,
@@ -4086,9 +4440,11 @@ function formatQueueTaskLink(row: ProjectQueueTaskRow): Record<string, unknown> 
     queueTaskId: row.id,
     fabricTaskId: row.fabric_task_id ?? undefined,
     title: row.title,
-    status: row.status,
-    phase: row.phase ?? undefined,
-    priority: row.priority,
+	    status: row.status,
+	    phase: row.phase ?? undefined,
+	    managerId: row.manager_id ?? undefined,
+	    workstream: row.workstream ?? undefined,
+	    priority: row.priority,
     risk: row.risk,
     parallelGroup: row.parallel_group ?? undefined,
     parallelSafe: row.parallel_safe === 1
@@ -4480,6 +4836,15 @@ function stringFromUnknown(value: unknown): string | undefined {
 function stringArrayFromUnknown(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((entry): entry is string => typeof entry === "string");
+}
+
+function arrayRecordsFromUnknown(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object" && !Array.isArray(entry));
+}
+
+function valuesFromUnknown(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
 }
 
 function formatDecision(row: ProjectQueueDecisionRow): Record<string, unknown> {

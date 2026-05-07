@@ -5,6 +5,7 @@ import { defaultPaths } from "../paths.js";
 import type { BridgeRegister, BridgeSession } from "../types.js";
 import { bridgeCallContext } from "./bridge-context.js";
 import { FabricError } from "./errors.js";
+import { maxParallelAgentsLimit, seniorDefaultLaneCount } from "./limits.js";
 import { applyPatchWithSystemPatch, resolvePatchFilePath, validateGitStylePatch } from "./patches.js";
 import type { ProjectModelRequest } from "./project-cli.js";
 
@@ -744,9 +745,7 @@ function seniorPromptSummary(packet: Record<string, unknown>, taskDir: string): 
 }
 
 function seniorMaxParallelAgents(env: NodeJS.ProcessEnv): number {
-  const parsed = Number(env.AGENT_FABRIC_QUEUE_MAX_AGENTS ?? env.AGENT_FABRIC_SENIOR_LANE_COUNT ?? 10);
-  if (!Number.isFinite(parsed)) return 10;
-  return Math.max(1, Math.min(16, Math.floor(parsed)));
+  return Math.min(maxParallelAgentsLimit(env), seniorDefaultLaneCount(env));
 }
 
 function seniorQueueMetadataPath(taskDir: string): string {

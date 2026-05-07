@@ -41,7 +41,7 @@ proxyTool("fabric_inspect_context_package", "Inspect the sanitized context packa
 });
 proxyTool("fabric_spawn_agents", "Spawn queue-visible Agent Fabric worker lanes for Codex-style background work.", {
   queueId: z.string(),
-  count: z.number().int().positive().max(32).optional(),
+  count: z.number().int().positive().max(1000).optional(),
   worker: z.enum(["deepseek-direct", "jcode-deepseek"]).optional(),
   workspaceMode: z.enum(["git_worktree", "sandbox"]).optional(),
   modelProfile: z.string().optional(),
@@ -52,7 +52,10 @@ proxyTool("fabric_spawn_agents", "Spawn queue-visible Agent Fabric worker lanes 
 proxyTool("fabric_list_agents", "Return Codex-style Agent Fabric background worker cards for a project queue.", {
   queueId: z.string(),
   includeCompleted: z.boolean().optional(),
-  maxEventsPerLane: z.number().int().positive().optional()
+  maxEventsPerLane: z.number().int().positive().optional(),
+  page: z.number().int().positive().optional(),
+  pageSize: z.number().int().positive().max(500).optional(),
+  groupBy: z.enum(["status", "phase", "workstream", "worker", "risk", "category"]).optional()
 });
 proxyTool("fabric_open_agent", "Open one Agent Fabric worker card with transcript, checkpoints, task detail, and artifacts.", {
   queueId: z.string(),
@@ -87,7 +90,7 @@ proxyTool("fabric_senior_start", "Start or attach to a Senior-mode Agent Fabric 
   projectPath: z.string().optional(),
   promptSummary: z.string().optional(),
   title: z.string().optional(),
-  count: z.number().int().positive().max(32).optional(),
+  count: z.number().int().positive().max(1000).optional(),
   worker: z.enum(["deepseek-direct", "jcode-deepseek"]).optional(),
   modelProfile: z.string().optional(),
   approveModelCalls: z.boolean().optional(),
@@ -440,9 +443,16 @@ proxyTool("project_queue_add_tasks", "Add dependency-aware coding tasks to a pro
     z.object({
       clientKey: z.string().optional(),
       title: z.string(),
-      goal: z.string(),
-      phase: z.string().optional(),
-      category: z.string().optional(),
+	      goal: z.string(),
+	      phase: z.string().optional(),
+	      manager: z.string().optional(),
+	      managerId: z.string().optional(),
+	      parentManagerId: z.string().optional(),
+	      parentQueueId: z.string().optional(),
+	      workstream: z.string().optional(),
+	      costCenter: z.string().optional(),
+	      escalationTarget: z.string().optional(),
+	      category: z.string().optional(),
       status: z.enum(["queued", "ready", "running", "blocked", "review", "patch_ready", "completed", "failed", "canceled", "accepted", "done"]).optional(),
       priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
       parallelGroup: z.string().optional(),
@@ -523,7 +533,8 @@ proxyTool("project_queue_approve_model_calls", "Issue one audited queue-scoped m
 });
 proxyTool("project_queue_progress_report", "Return a resumable Senior-mode queue progress report with worker cards, blockers, patch-ready tasks, and next commands.", {
   queueId: z.string(),
-  maxEventsPerLane: z.number().int().positive().optional()
+  maxEventsPerLane: z.number().int().positive().optional(),
+  managerSummaryLimit: z.number().int().positive().max(100).optional()
 });
 proxyTool("project_queue_approval_inbox", "Read queue-scoped tool/context and model-call approvals.", {
   queueId: z.string(),
@@ -549,9 +560,23 @@ proxyTool("project_queue_update_task_metadata", "Edit queue-task planning metada
   queueTaskId: z.string(),
   title: z.string().optional(),
   goal: z.string().optional(),
-  phase: z.string().optional(),
-  clearPhase: z.boolean().optional(),
-  category: z.string().optional(),
+	  phase: z.string().optional(),
+	  clearPhase: z.boolean().optional(),
+	  manager: z.string().optional(),
+	  managerId: z.string().optional(),
+	  clearManager: z.boolean().optional(),
+	  clearManagerId: z.boolean().optional(),
+	  parentManagerId: z.string().optional(),
+	  clearParentManagerId: z.boolean().optional(),
+	  parentQueueId: z.string().optional(),
+	  clearParentQueueId: z.boolean().optional(),
+	  workstream: z.string().optional(),
+	  clearWorkstream: z.boolean().optional(),
+	  costCenter: z.string().optional(),
+	  clearCostCenter: z.boolean().optional(),
+	  escalationTarget: z.string().optional(),
+	  clearEscalationTarget: z.boolean().optional(),
+	  category: z.string().optional(),
   priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
   parallelGroup: z.string().optional(),
   clearParallelGroup: z.boolean().optional(),

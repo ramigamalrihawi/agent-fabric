@@ -10,11 +10,19 @@ describe("project CLI runner", () => {
   const originalSeniorMode = process.env.AGENT_FABRIC_SENIOR_MODE;
   const originalSeniorNonDeepSeek = process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
   const originalSeniorDefaultWorker = process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER;
+  const originalSeniorDefaultLaneCount = process.env.AGENT_FABRIC_SENIOR_DEFAULT_LANE_COUNT;
+  const originalSeniorLaneCount = process.env.AGENT_FABRIC_SENIOR_LANE_COUNT;
+  const originalSeniorMaxLaneCount = process.env.AGENT_FABRIC_SENIOR_MAX_LANE_COUNT;
+  const originalQueueMaxAgents = process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS;
 
   beforeEach(() => {
     delete process.env.AGENT_FABRIC_SENIOR_MODE;
     delete process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
     delete process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER;
+    delete process.env.AGENT_FABRIC_SENIOR_DEFAULT_LANE_COUNT;
+    delete process.env.AGENT_FABRIC_SENIOR_LANE_COUNT;
+    delete process.env.AGENT_FABRIC_SENIOR_MAX_LANE_COUNT;
+    delete process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS;
   });
 
   it("redacts approval tokens from JSON output", () => {
@@ -50,6 +58,14 @@ describe("project CLI runner", () => {
     else process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS = originalSeniorNonDeepSeek;
     if (originalSeniorDefaultWorker === undefined) delete process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER;
     else process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER = originalSeniorDefaultWorker;
+    if (originalSeniorDefaultLaneCount === undefined) delete process.env.AGENT_FABRIC_SENIOR_DEFAULT_LANE_COUNT;
+    else process.env.AGENT_FABRIC_SENIOR_DEFAULT_LANE_COUNT = originalSeniorDefaultLaneCount;
+    if (originalSeniorLaneCount === undefined) delete process.env.AGENT_FABRIC_SENIOR_LANE_COUNT;
+    else process.env.AGENT_FABRIC_SENIOR_LANE_COUNT = originalSeniorLaneCount;
+    if (originalSeniorMaxLaneCount === undefined) delete process.env.AGENT_FABRIC_SENIOR_MAX_LANE_COUNT;
+    else process.env.AGENT_FABRIC_SENIOR_MAX_LANE_COUNT = originalSeniorMaxLaneCount;
+    if (originalQueueMaxAgents === undefined) delete process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS;
+    else process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS = originalQueueMaxAgents;
   });
 
   it("parses create and launch commands", () => {
@@ -563,6 +579,47 @@ describe("project CLI runner", () => {
       process.env.AGENT_FABRIC_SENIOR_DEFAULT_WORKER = "claude";
       parseProjectCliArgs(["run-ready", "--queue", "pqueue_1"]);
     }).toThrow("AGENT_FABRIC_SENIOR_DEFAULT_WORKER must be deepseek-direct or jcode-deepseek");
+  });
+
+  it("keeps high-scale Senior caps separate from default launch counts", () => {
+    process.env.AGENT_FABRIC_SENIOR_MODE = "permissive";
+    process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS = "1000";
+
+    expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1"])).toMatchObject({
+      command: "run-ready",
+      parallel: 10
+    });
+    expect(parseProjectCliArgs(["factory-run", "--queue", "pqueue_1"])).toMatchObject({
+      command: "factory-run",
+      parallel: 10
+    });
+    expect(parseProjectCliArgs(["senior-run", "--project", "/tmp/workspace/app"])).toMatchObject({
+      command: "senior-run",
+      count: 10
+    });
+
+    process.env.AGENT_FABRIC_SENIOR_DEFAULT_LANE_COUNT = "250";
+
+    expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1"])).toMatchObject({
+      command: "run-ready",
+      parallel: 250
+    });
+    expect(parseProjectCliArgs(["senior-run", "--project", "/tmp/workspace/app"])).toMatchObject({
+      command: "senior-run",
+      count: 250
+    });
+
+    delete process.env.AGENT_FABRIC_SENIOR_DEFAULT_LANE_COUNT;
+    process.env.AGENT_FABRIC_SENIOR_MAX_LANE_COUNT = "5";
+
+    expect(parseProjectCliArgs(["run-ready", "--queue", "pqueue_1"])).toMatchObject({
+      command: "run-ready",
+      parallel: 5
+    });
+    expect(parseProjectCliArgs(["senior-run", "--project", "/tmp/workspace/app"])).toMatchObject({
+      command: "senior-run",
+      count: 5
+    });
   });
 
   it("rejects non-DeepSeek execution workers in Senior mode unless explicitly allowed", async () => {

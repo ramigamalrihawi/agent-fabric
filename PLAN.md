@@ -8,6 +8,7 @@ Agent Fabric is currently an early local-first control plane. The implemented ba
 - SQLite migrations and canonical state tables.
 - Collaboration inboxes, asks, replies, decisions, path claims, and live SSE fan-out.
 - Project queue DAGs with readiness, dependencies, risk, concurrency, launch gates, and recovery.
+- High-scale Senior queue orchestration with configurable local caps, manager/workstream metadata, paged worker cards, and bounded manager summaries.
 - Worker lifecycle events, heartbeats, checkpoints, resume packets, and finish records.
 - Model preflight, approval tokens, context inspection, and cost ledgers.
 - Typed memory review, confirmation, invalidation, and outcome hooks.
@@ -23,6 +24,7 @@ Agent Fabric is currently an early local-first control plane. The implemented ba
 - Connection limits and metrics for live fan-out.
 - More queue recipes for common implementation/review workflows.
 - Patch-review UX improvements.
+- First-class manager-run lifecycle entities if task labels and worker-run metadata stop being enough for phase managers.
 
 ## Later
 

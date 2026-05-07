@@ -170,9 +170,15 @@ For `task_generation`, it must return:
   tasks: Array<{
     clientKey?: string;
     title: string;
-    goal: string;
-    phase?: string;
-    category?: string;
+	    goal: string;
+	    phase?: string;
+	    managerId?: string;
+	    parentManagerId?: string;
+	    parentQueueId?: string;
+	    workstream?: string;
+	    costCenter?: string;
+	    escalationTarget?: string;
+	    category?: string;
     priority?: "low" | "normal" | "high" | "urgent";
     risk?: "low" | "medium" | "high" | "breakglass";
     parallelSafe?: boolean;
@@ -260,7 +266,7 @@ Create one project-scoped queue keyed by project folder.
   promptSummary?: string;   // preferred stored summary
   title?: string;
   pipelineProfile?: "fast" | "balanced" | "careful" | "custom";
-  maxParallelAgents?: number; // default 4, hard range 1-32
+  maxParallelAgents?: number; // default 4, configurable range 1-1000
   planChainId?: string;
 }
 ```
@@ -296,7 +302,7 @@ Update mutable queue-level settings after creation. This is the substrate for De
   queueId: string;
   title?: string;
   pipelineProfile?: "fast" | "balanced" | "careful" | "custom";
-  maxParallelAgents?: number; // range 1-32
+  maxParallelAgents?: number; // configurable range 1-1000
   note?: string;
 }
 ```
@@ -330,7 +336,9 @@ Use this as the first Desktop detail-screen call. Use the narrower tools when a 
 - `status`, `severity`, `nextAction`, and machine-readable `reasons`.
 - compact counts for ready/running/blocked/review/done/failed work, stale running tasks, approvals, active workers, and slots.
 - risk summary: highest open risk, high-risk open count, breakglass open count, and risk counts by queue state.
-- model-cost summary from queue-scoped `llm_preflight` rows: preflight count, estimated cost, and aggregates by decision/risk.
+- model-cost summary from queue-scoped `llm_preflight` rows and worker events: preflight count, estimated cost, aggregates by decision/risk, worker cost by senior/manager/worker role when available, and warnings for missing worker cost coverage.
+
+`project_queue_progress_report` also returns a bounded `managerSummary` for senior and phase-manager harnesses. It groups tasks by status, manager, phase, and workstream, highlights blocked, patch-ready, failed, approval-needed, escalation-needed, and evidence-bearing items, and leaves raw worker events behind the lane/task detail tools.
 
 `memorySuggestions` is advisory. It surfaces active memories whose intent keys match ready task metadata, but it does not attach memory automatically. The user should explicitly update task `requiredMemories` and approve any resulting tool/context grant.
 
@@ -658,6 +666,13 @@ Tool/context requirements are separated so approval policy can make precise deci
     title: string;
     goal: string;
     phase?: string;
+    manager?: string;
+    managerId?: string;
+    parentManagerId?: string;
+    parentQueueId?: string;
+    workstream?: string;
+    costCenter?: string;
+    escalationTarget?: string;
     category?: string;
     status?: "queued" | "ready" | "running" | "blocked" | "review" | "patch_ready" | "completed" | "failed" | "canceled" | "accepted" | "done";
     priority?: "low" | "normal" | "high" | "urgent";
@@ -930,7 +945,7 @@ Completed, accepted, done, canceled, and completed-worker lanes are hidden by de
 {
   queueId: string;
   includeCompleted?: boolean;
-  maxEventsPerLane?: number; // default 5, max 50
+  maxEventsPerLane?: number; // default 5, configurable max 500
 }
 ```
 
@@ -941,6 +956,61 @@ Each lane includes:
 - `recentEvents`: newest-first `fabric_task_event` rows.
 - `latestCheckpoint`: newest checkpoint summary when available.
 - `progress`: display-oriented status, label, last activity time, summary, next action, files touched, test refs, and patch refs.
+
+## `project_queue_progress_report`
+
+Read the compact Senior-mode progress packet for one queue. This is the default supervisor context for Codex, Claude Code, desktop, and plugin surfaces that need a high-level state summary without reading every worker transcript.
+
+```ts
+{
+  queueId: string;
+  maxEventsPerLane?: number; // default 5, configurable max 500
+  managerSummaryLimit?: number; // default 10, max 100
+}
+```
+
+Returns:
+
+```ts
+{
+  schema: "agent-fabric.project-queue-progress.v1";
+  queue: unknown;
+  generatedAt: string;
+  summary: {
+    status: string;
+    severity: "ok" | "attention" | "warning" | "error";
+    nextAction: string;
+    reasons: string[];
+    counts: unknown;
+    risk: unknown;
+    cost: unknown; // includes by-role worker spend when reported
+  };
+  managerSummary: {
+    bounded: true;
+    maxItemsPerSection: number;
+    totals: unknown;
+    groups: {
+      byStatus: unknown[];
+      byManager: unknown[];
+      byPhase: unknown[];
+      byWorkstream: unknown[];
+    };
+    attention: unknown;
+    evidence: unknown[];
+  };
+  workers: unknown; // project_queue_agent_lanes response
+  blockers: unknown[];
+  approvals: unknown;
+  patchReadyTasks: unknown[];
+  acceptedTasks: unknown[];
+  failedTasks: unknown[];
+  nextActions: unknown[];
+  nextCommand?: string;
+  verificationChecklist: string[];
+}
+```
+
+Use `managerSummary` for phase-manager handoffs and root-senior review. Use `workers.lanes` or `project_queue_task_detail` only when the summary points to a specific lane that needs deeper inspection.
 
 ## `project_queue_assign_worker`
 
@@ -1001,6 +1071,20 @@ Edit generated queue-task metadata during human queue review before a worker cla
   goal?: string;
   phase?: string;
   clearPhase?: boolean;
+  manager?: string;
+  managerId?: string;
+  clearManager?: boolean;
+  clearManagerId?: boolean;
+  parentManagerId?: string;
+  clearParentManagerId?: boolean;
+  parentQueueId?: string;
+  clearParentQueueId?: boolean;
+  workstream?: string;
+  clearWorkstream?: boolean;
+  costCenter?: string;
+  clearCostCenter?: boolean;
+  escalationTarget?: string;
+  clearEscalationTarget?: boolean;
   category?: string;
   priority?: "low" | "normal" | "high" | "urgent";
   parallelGroup?: string;
