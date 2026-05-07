@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { formatLocalConfigDoctor, runLocalConfigDoctor } from "../src/runtime/local-config-doctor.js";
+import { formatLocalConfigDoctor, localConfigDoctorHelp, runLocalConfigDoctor } from "../src/runtime/local-config-doctor.js";
 
 describe("local config doctor", () => {
   it("reports single-checkout local config without printing secrets", () => {
@@ -66,6 +66,12 @@ describe("local config doctor", () => {
       expect(report.mcpConfigs.every((item) => item.hasAgentFabric && item.bridgePathMatches && item.workspaceRootMatches)).toBe(true);
       expect(formatted).not.toContain("super-secret-key");
       expect(formatted).not.toContain("local-token");
+      expect(formatted).toContain("Onboarding starter surface");
+      expect(formatted).toContain("Essential queue tools");
+      expect(formatted).toContain("agent-fabric-project senior-doctor");
+      expect(formatted).toContain("Senior mode");
+      expect(report.seniorMode).toMatchObject({ configured: true, source: "local-config" });
+      expect(report.elixir).toBeDefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -94,5 +100,19 @@ describe("local config doctor", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("returns onboarding help text covering Senior mode, daemon, command center, and Elixir preview", () => {
+    const help = localConfigDoctorHelp();
+    expect(help).toContain("Onboarding next steps:");
+    expect(help).toContain("agent-fabric.local.env");
+    expect(help).toContain("npm run dev:daemon");
+    expect(help).toContain("npm run dev:desktop");
+    expect(help).toContain("senior-doctor");
+    expect(help).toContain("senior-run --dry-run");
+    expect(help).toContain("Elixir orchestration preview");
+    expect(help).toContain("mix af.status");
+    expect(help).toContain("Quick tools");
+    expect(help).not.toContain("DEEPSEEK_API_KEY");
   });
 });

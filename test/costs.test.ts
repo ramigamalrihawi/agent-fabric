@@ -164,7 +164,7 @@ describe("Phase 0A.3 cost substrate", () => {
   it("fabric_status coverage is based on recent observed cost_events, not only routeable declarations", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload({ agentId: "browser-agent", litellmRouteable: true }));
-    const before = daemon.callTool<FabricStatus>("fabric_status", {}, contextFor(session));
+    const before = daemon.callTool<FabricStatus>("fabric_status", { includeSessions: true }, contextFor(session));
     expect(before.ok).toBe(true);
     if (!before.ok) throw new Error("status failed");
     expect(before.data.coverage.byAgent["browser-agent"]).toBe(0);
@@ -173,7 +173,7 @@ describe("Phase 0A.3 cost substrate", () => {
     daemon.ingestLiteLlmSpendLogs([
       { request_id: "req_status", provider: "openrouter", model: "x-ai/grok-4.1-fast", cost_usd: 0.01, metadata: { agent_id: "browser-agent" } }
     ]);
-    const after = daemon.callTool<FabricStatus>("fabric_status", {}, contextFor(session));
+    const after = daemon.callTool<FabricStatus>("fabric_status", { includeSessions: true }, contextFor(session));
     expect(after.ok).toBe(true);
     if (!after.ok) throw new Error("status failed");
     expect(after.data.coverage.byAgent["browser-agent"]).toBe(100);

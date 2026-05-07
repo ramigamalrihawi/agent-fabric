@@ -33,7 +33,11 @@ defmodule Mix.Tasks.Af.Status do
           stale_after_minutes: :integer,
           workspace_cleanup_dry_run: :boolean,
           workspace_root: :string,
-          workspace_stale_minutes: :integer
+          workspace_stale_minutes: :integer,
+          worker_health: :string,
+          task_tail: :string,
+          patch_review: :boolean,
+          collab_summary: :boolean
         ],
         aliases: [q: :queue]
       )
@@ -42,10 +46,14 @@ defmodule Mix.Tasks.Af.Status do
 
     runtime = runtime_status()
 
-    payload = %{
-      runtime: maybe_put_workspace_cleanup(runtime, opts),
-      queue: queue_status(opts)
-    }
+    payload =
+      %{
+        runtime: maybe_put_workspace_cleanup(runtime, opts),
+        queue: queue_status(opts)
+      }
+      |> maybe_put_worker_health(opts)
+      |> maybe_put_patch_review(opts)
+      |> maybe_put_collab_summary(opts)
 
     if opts[:json] do
       Mix.shell().info(Jason.encode!(payload, pretty: true))
@@ -98,6 +106,7 @@ defmodule Mix.Tasks.Af.Status do
     else
       base
     end
+    |> maybe_put_task_tail(opts)
   end
 
   defp cleanup_preview(opts) do
@@ -209,14 +218,14 @@ defmodule Mix.Tasks.Af.Status do
     call_opts = fabric_call_opts(project_root)
 
     with {:ok, session} <-
-           FabricGateway.Uds.register(socket_path, register_payload(project_root)) do
+           FabricGateway.Uds.register(socket_path, register_payload(project_root), call_opts) do
       result = fun.(socket_path, session, call_opts)
       _ = FabricGateway.Uds.close_session(socket_path, session, call_opts)
       result
     end
   end
 
-  defp emit_text(%{runtime: runtime, queue: queue}) do
+  defp emit_text(%{runtime: runtime, queue: queue} = payload) do
     Mix.shell().info(
       "orchestrator_alive: #{runtime[:orchestrator_alive] || runtime["orchestrator_alive"] || false}"
     )
@@ -267,6 +276,23 @@ defmodule Mix.Tasks.Af.Status do
 
     if cleanup = runtime[:workspace_cleanup] || runtime["workspace_cleanup"] do
       emit_workspace_cleanup(cleanup)
+    end
+
+    if task_tail = queue[:task_tail] do
+      emit_task_tail(task_tail)
+    end
+
+    # Top-level payload keys (worker_health, patch_review, collab_summary)
+    if worker_health = payload[:worker_health] do
+      emit_worker_health(worker_health)
+    end
+
+    if patch_review = payload[:patch_review] do
+      emit_patch_review(patch_review)
+    end
+
+    if collab_summary = payload[:collab_summary] do
+      emit_collab_summary(collab_summary)
     end
   end
 
@@ -321,6 +347,235 @@ defmodule Mix.Tasks.Af.Status do
       env_or_config("AGENT_FABRIC_SOCKET", :socket_path, FabricClient.default_socket_path())
   end
 
+  # --- New emit helpers ---
+
+  defp emit_task_tail(%{error: error}), do: Mix.shell().error("task_tail_error: #{error}")
+
+  defp emit_task_tail(%{event_count: events, checkpoint_count: checkpoints} = task_tail) do
+    Mix.shell().info("task_tail_requested: true")
+    Mix.shell().info("task_tail_task_id: #{task_tail[:task_id] || "unknown"}")
+    Mix.shell().info("task_tail_events: #{events}")
+    Mix.shell().info("task_tail_checkpoints: #{checkpoints}")
+    Mix.shell().info("task_tail_truncated: #{task_tail[:truncated] || false}")
+  end
+
+  defp emit_task_tail(%{task: task, readiness: readiness}) do
+    Mix.shell().info("task_tail_requested: true")
+    Mix.shell().info("task_tail_title: #{task["title"] || task[:title] || "unknown"}")
+    Mix.shell().info("task_tail_status: #{task["status"] || task[:status] || "unknown"}")
+
+    Mix.shell().info(
+      "task_tail_readiness: #{readiness["status"] || readiness[:status] || "unknown"}"
+    )
+  end
+
+  defp emit_task_tail(_task_tail), do: :ok
+
+  defp emit_worker_health(%{error: error}),
+    do: Mix.shell().error("worker_health_error: #{error}")
+
+  defp emit_worker_health(%{total_lanes: total, active_lanes: active} = wh) do
+    Mix.shell().info("worker_health_requested: true")
+    Mix.shell().info("worker_health_queue: #{wh[:queue_id]}")
+    Mix.shell().info("worker_health_total_lanes: #{total}")
+    Mix.shell().info("worker_health_active_lanes: #{active}")
+  end
+
+  defp emit_patch_review(%{error: error}),
+    do: Mix.shell().error("patch_review_error: #{error}")
+
+  defp emit_patch_review(%{counts: counts}) do
+    Mix.shell().info("patch_review_requested: true")
+    Mix.shell().info("patch_review_total: #{counts[:total] || 0}")
+    Mix.shell().info("patch_review_patch_ready: #{counts[:patch_ready] || 0}")
+    Mix.shell().info("patch_review_accepted: #{counts[:accepted] || 0}")
+  end
+
+  defp emit_collab_summary(%{error: error}),
+    do: Mix.shell().error("collab_summary_error: #{error}")
+
+  defp emit_collab_summary(%{group_count: group_count} = summary) do
+    Mix.shell().info("collab_summary_requested: true")
+    Mix.shell().info("collab_summary_queue: #{summary[:queue_id] || "unknown"}")
+    Mix.shell().info("collab_summary_groups: #{group_count}")
+  end
+
+  defp emit_collab_summary(%{messages: msgs, asks: asks, claims: claims}) do
+    Mix.shell().info("collab_summary_requested: true")
+    Mix.shell().info("collab_summary_messages: #{msgs[:total] || 0}")
+    Mix.shell().info("collab_summary_open_asks: #{asks[:open_count] || 0}")
+    Mix.shell().info("collab_summary_active_claims: #{claims[:active_count] || 0}")
+  end
+
+  # --- New maybe_put helpers ---
+
+  defp maybe_put_worker_health(payload, opts) do
+    queue_id = opts[:worker_health]
+
+    if queue_id in [nil, ""] do
+      payload
+    else
+      with {:ok, result} <-
+             with_fabric_session(opts, fn socket_path, session, call_opts ->
+               FabricGateway.Uds.worker_health(socket_path, session, queue_id, call_opts)
+             end) do
+        workers = result["workers"] || result[:workers] || []
+        summary = result["summary"] || result[:summary] || %{}
+
+        compact =
+          Enum.map(workers, fn worker ->
+            status =
+              worker["classification"] || worker[:classification] || worker["status"] ||
+                worker[:status]
+
+            queue_task_id = worker["queueTaskId"] || worker[:queueTaskId]
+
+            %{
+              lane_id: worker["workerRunId"] || worker[:workerRunId],
+              status: status,
+              health_label: worker["healthLabel"] || worker[:healthLabel],
+              worker: worker["worker"] || worker[:worker],
+              queue_task_id: queue_task_id
+            }
+          end)
+
+        Map.put(payload, :worker_health, %{
+          requested: true,
+          queue_id: queue_id,
+          total_lanes: summary["total"] || summary[:total] || length(workers),
+          active_lanes:
+            (summary["healthy"] || summary[:healthy] || 0) +
+              (summary["quiet"] || summary[:quiet] || 0) +
+              (summary["stale"] || summary[:stale] || 0),
+          lanes: compact
+        })
+      else
+        {:error, reason} ->
+          Map.put(payload, :worker_health, %{
+            requested: true,
+            queue_id: queue_id,
+            error: inspect(reason)
+          })
+      end
+    end
+  end
+
+  defp maybe_put_task_tail(queue_map, opts) do
+    queue_id = opts[:queue]
+    queue_task_id = opts[:task_tail]
+
+    if queue_task_id in [nil, ""] or queue_id in [nil, ""] do
+      queue_map
+    else
+      with {:ok, result} <-
+             with_fabric_session(opts, fn socket_path, session, call_opts ->
+               FabricGateway.Uds.task_tail(
+                 socket_path,
+                 session,
+                 queue_id,
+                 queue_task_id,
+                 call_opts
+               )
+             end) do
+        events = result["events"] || result[:events] || []
+        checkpoints = result["checkpoints"] || result[:checkpoints] || []
+
+        Map.put(queue_map, :task_tail, %{
+          requested: true,
+          queue_id: queue_id,
+          queue_task_id: queue_task_id,
+          task_id: result["taskId"] || result[:taskId],
+          worker_run_id: result["workerRunId"] || result[:workerRunId],
+          resolve_mode: result["resolveMode"] || result[:resolveMode],
+          event_count: result["eventCount"] || result[:eventCount] || length(events),
+          checkpoint_count:
+            result["checkpointCount"] || result[:checkpointCount] || length(checkpoints),
+          truncated: result["truncated"] || result[:truncated] || false
+        })
+      else
+        {:error, reason} ->
+          Map.put(queue_map, :task_tail, %{
+            requested: true,
+            queue_id: queue_id,
+            queue_task_id: queue_task_id,
+            error: inspect(reason)
+          })
+      end
+    end
+  end
+
+  defp maybe_put_patch_review(payload, opts) do
+    if opts[:patch_review] do
+      queue_id = opts[:queue]
+
+      if queue_id in [nil, ""] do
+        Map.put(payload, :patch_review, %{
+          requested: true,
+          error: "--patch-review requires --queue"
+        })
+      else
+        with {:ok, result} <-
+               with_fabric_session(opts, fn socket_path, session, call_opts ->
+                 FabricGateway.Uds.patch_review_plan(
+                   socket_path,
+                   session,
+                   queue_id,
+                   call_opts
+                 )
+               end) do
+          Map.put(payload, :patch_review, Map.put(result, :requested, true))
+        else
+          {:error, reason} ->
+            Map.put(payload, :patch_review, %{
+              requested: true,
+              queue_id: queue_id,
+              error: inspect(reason)
+            })
+        end
+      end
+    else
+      payload
+    end
+  end
+
+  defp maybe_put_collab_summary(payload, opts) do
+    if opts[:collab_summary] do
+      queue_id = opts[:queue]
+
+      if queue_id in [nil, ""] do
+        Map.put(payload, :collab_summary, %{
+          requested: true,
+          error: "--collab-summary requires --queue"
+        })
+      else
+        with {:ok, result} <-
+               with_fabric_session(opts, fn socket_path, session, call_opts ->
+                 FabricGateway.Uds.collab_summary(socket_path, session, queue_id, call_opts)
+               end) do
+          groups = result["groups"] || result[:groups] || []
+
+          Map.put(
+            payload,
+            :collab_summary,
+            result
+            |> Map.put(:requested, true)
+            |> Map.put(:queue_id, queue_id)
+            |> Map.put(:group_count, length(groups))
+          )
+        else
+          {:error, reason} ->
+            Map.put(payload, :collab_summary, %{
+              requested: true,
+              queue_id: queue_id,
+              error: inspect(reason)
+            })
+        end
+      end
+    else
+      payload
+    end
+  end
+
   defp project_root(opts) do
     case opts[:project] do
       nil -> nil
@@ -337,8 +592,23 @@ defmodule Mix.Tasks.Af.Status do
     |> put_in([:workspace, :source], "project")
   end
 
-  defp fabric_call_opts(nil), do: []
-  defp fabric_call_opts(project_root), do: [workspace_root: project_root]
+  defp fabric_call_opts(project_root) do
+    []
+    |> maybe_put_workspace_root(project_root)
+    |> maybe_put_test_transport()
+  end
+
+  defp maybe_put_workspace_root(opts, nil), do: opts
+
+  defp maybe_put_workspace_root(opts, project_root),
+    do: Keyword.put(opts, :workspace_root, project_root)
+
+  defp maybe_put_test_transport(opts) do
+    case Application.get_env(:agent_fabric_orchestrator, :fabric_transport) do
+      transport when is_function(transport, 1) -> Keyword.put(opts, :transport, transport)
+      _ -> opts
+    end
+  end
 
   defp cleanup_older_than_days(opts) do
     value = opts[:cleanup_older_than_days] || 7

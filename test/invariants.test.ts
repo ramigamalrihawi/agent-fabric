@@ -12,7 +12,7 @@ describe("Phase 0A substrate invariants", () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload({ transport: "uds", declared: "yes", claimedObserved: "yes" }));
 
-    const status = daemon.callTool<FabricStatus>("fabric_status", {}, contextFor(session));
+    const status = daemon.callTool<FabricStatus>("fabric_status", { includeSessions: true }, contextFor(session));
     expect(status.ok).toBe(true);
     if (!status.ok) throw new Error("status failed");
     expect(status.data.bridgeSessions.sessions[0].notificationsVisibleToAgent).toEqual({
@@ -36,7 +36,7 @@ describe("Phase 0A substrate invariants", () => {
     );
     expect(complete.ok).toBe(true);
 
-    const status = daemon.fabricStatus();
+    const status = daemon.fabricStatus({ includeSessions: true });
     expect(status.bridgeSessions.sessions[0].notificationsVisibleToAgent.observed).toBe("yes");
     daemon.close();
   });
@@ -49,7 +49,7 @@ describe("Phase 0A substrate invariants", () => {
     expect(start.ok).toBe(true);
 
     now = new Date("2026-04-27T10:00:02.000Z");
-    const status = daemon.fabricStatus();
+    const status = daemon.fabricStatus({ includeSessions: true });
     expect(status.bridgeSessions.sessions[0].notificationsVisibleToAgent.observed).toBe("no");
     daemon.close();
   });

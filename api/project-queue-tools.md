@@ -207,7 +207,7 @@ For `task_generation`, it must return:
 	    costCenter?: string;
 	    escalationTarget?: string;
 	    category?: string;
-    priority?: "low" | "normal" | "high" | "urgent";
+    priority?: "low" | "normal" | "medium" | "high" | "urgent";
     risk?: "low" | "medium" | "high" | "breakglass";
     parallelSafe?: boolean;
     expectedFiles?: string[];
@@ -220,6 +220,8 @@ For `task_generation`, it must return:
   }>;
 }
 ```
+
+`priority: "medium"` is accepted as a compatibility synonym and stored as `"normal"`. Callers receive a `warnings` field in the response noting the normalization.
 
 High-risk aliases still go through `llm_preflight`. If the command reports `needs_user_approval`, approve with `agent-fabric-approve` and rerun with `--approval-token <token>`.
 
@@ -725,7 +727,7 @@ Tool/context requirements are separated so approval policy can make precise deci
     escalationTarget?: string;
     category?: string;
     status?: "queued" | "ready" | "running" | "blocked" | "review" | "patch_ready" | "completed" | "failed" | "canceled" | "accepted" | "done";
-    priority?: "low" | "normal" | "high" | "urgent";
+    priority?: "low" | "normal" | "medium" | "high" | "urgent";
     parallelGroup?: string;
     parallelSafe?: boolean;
     risk?: "low" | "medium" | "high" | "breakglass";
@@ -740,7 +742,7 @@ Tool/context requirements are separated so approval policy can make precise deci
 }
 ```
 
-Returns generated `queueTaskId` and linked `fabricTaskId` per task.
+Returns generated `queueTaskId` and linked `fabricTaskId` per task, plus `warnings` when compatiblity normalizations are applied (e.g. `"medium"` priority).
 
 ## `project_queue_add_task_batch`
 
@@ -762,7 +764,7 @@ Validation reports the index of the first failing task.
     escalationTarget?: string;
     category?: string;
     status?: "queued" | "ready" | "running" | "blocked" | "review" | "patch_ready" | "completed" | "failed" | "canceled" | "accepted" | "done";
-    priority?: "low" | "normal" | "high" | "urgent";
+    priority?: "low" | "normal" | "medium" | "high" | "urgent";
     parallelGroup?: string;
     parallelSafe?: boolean;
     risk?: "low" | "medium" | "high" | "breakglass";
@@ -783,7 +785,7 @@ Validation reports the index of the first failing task.
 }
 ```
 
-Returns the same shape as `project_queue_add_tasks`: `{ queueId, created, reused }`.
+Returns the same shape as `project_queue_add_tasks`: `{ queueId, created, reused, warnings? }`.
 
 ## `project_queue_next_ready`
 
@@ -1319,6 +1321,168 @@ List remembered project-level grants, including both approved and rejected toggl
   projectPath?: string;
 }
 ```
+
+## `project_queue_worker_health`
+
+Read-only health classification for every queue worker using durable Agent Fabric evidence. Returns process metadata, heartbeat/checkpoint recency, output/log metadata, patch refs, failure events, and health classification (healthy, quiet, stale, failed, patch_ready, completed, blocked). Includes recommended non-destructive next actions.
+
+```ts
+{
+  queueId: string;
+  staleAfterMinutes?: number; // default 30, range 1-1440
+}
+```
+
+Returns schema `agent-fabric.project-queue-worker-health.v1` with per-worker `queueTaskId`, `fabricTaskId`, `title`, `classification`, `healthLabel`, `reason`, `evidence` (processPresent, pid, lastHeartbeatAt, lastEventAt/kind, lastCheckpointAt, hasRunnerEvidence, runnerLogPath, taskPacketPath, contextFilePath, patchRefs, testRefs, failure, cost), and a `nextActions` array of recommended CLI commands.
+
+## `project_queue_add_task_batch`
+
+Add dependency-aware coding tasks with shared defaults plus per-lane variants. The `defaults` block is applied first; each task can override any default field. The combined task passes the same validation as `project_queue_add_tasks`.
+
+```ts
+{
+  queueId: string;
+  defaults?: {
+    phase?: string;
+    manager?: string;
+    managerId?: string;
+    parentManagerId?: string;
+    parentQueueId?: string;
+    workstream?: string;
+    costCenter?: string;
+    escalationTarget?: string;
+    category?: string;
+    status?: "queued" | "ready" | "running" | "blocked" | "review" | "patch_ready" | "completed" | "failed" | "canceled" | "accepted" | "done";
+    priority?: "low" | "normal" | "high" | "urgent";
+    parallelGroup?: string;
+    parallelSafe?: boolean;
+    risk?: "low" | "medium" | "high" | "breakglass";
+    expectedFiles?: string[];
+    acceptanceCriteria?: string[];
+    requiredTools?: string[];
+    requiredMcpServers?: string[];
+    requiredMemories?: string[];
+    requiredContextRefs?: string[];
+    dependsOn?: string[];
+  };
+  tasks: Array<{
+    clientKey?: string;
+    title: string;
+    goal: string;
+    phase?: string;
+    manager?: string;
+    managerId?: string;
+    parentManagerId?: string;
+    parentQueueId?: string;
+    workstream?: string;
+    costCenter?: string;
+    escalationTarget?: string;
+    category?: string;
+    status?: "queued" | "ready" | "running" | "blocked" | "review" | "patch_ready" | "completed" | "failed" | "canceled" | "accepted" | "done";
+    priority?: "low" | "normal" | "high" | "urgent";
+    parallelGroup?: string;
+    parallelSafe?: boolean;
+    risk?: "low" | "medium" | "high" | "breakglass";
+    expectedFiles?: string[];
+    acceptanceCriteria?: string[];
+    requiredTools?: string[];
+    requiredMcpServers?: string[];
+    requiredMemories?: string[];
+    requiredContextRefs?: string[];
+    dependsOn?: string[];
+  }>;
+}
+```
+
+Returns generated `queueTaskId` and linked `fabricTaskId` per task plus `reused` flag for client-key collision detection.
+
+## `project_queue_task_packet`
+
+Build a copyable queue task or resume packet for worker handoff.
+
+```ts
+{
+  queueId: string;
+  queueTaskId: string;
+  format?: "json" | "markdown"; // default "json"
+  includeResume?: boolean;
+  preferredWorker?: "ramicode" | "local-cli" | "openhands" | "aider" | "smolagents" | "codex-app-server" | "deepseek-direct" | "jcode-deepseek" | "manual";
+  workspaceMode?: "in_place" | "git_worktree" | "clone" | "sandbox";
+  workspacePath?: string;
+  modelProfile?: string; // default "execute.cheap"
+  packetPath?: string;   // auto-generated if omitted
+}
+```
+
+Returns `queue`, `queueTask`, `packetKind` ("task" or "resume"), `format`, `packet`, `handoff`, and `markdown` preview when format is markdown.
+
+## `project_queue_collab_summary`
+
+Return a queue-scoped collab summary grouping open asks, replies, decisions, path claims, and worker handoff notes by queue task.
+
+```ts
+{
+  queueId: string;
+}
+```
+
+Returns schema `agent-fabric.project-queue-collab-summary.v1` with `queue`, `generatedAt`, `groups` (per-task open asks, replies, handoff notes), and `unlinked` summary of queue-scoped items not tied to a specific task.
+
+## `project_queue_approve_model_calls`
+
+Issue one audited queue-scoped model approval token for matching Senior DeepSeek worker calls.
+
+```ts
+{
+  queueId: string;
+  candidateModel?: string;
+  requestedProvider?: string;
+  requestedReasoning?: "low" | "medium" | "high" | "xhigh" | "max";
+  expiresInSeconds?: number;
+  note?: string;
+}
+```
+
+Returns the approval token and its metadata for use by worker preflight gates.
+
+## `project_queue_patch_review_plan`
+
+Read-only review plan for patch-ready, failed-with-artifact, completed, and no-artifact queue tasks. Includes changed files, patch refs, worker worktree/log refs, risk notes, suggested tests, and exact CLI dry-run/apply commands. Does not apply patches.
+
+```ts
+{
+  queueId: string;
+}
+```
+
+Returns a grouped review plan with candidate patches, their files, risk notes from worker checkpoints, suggested test commands, and recommended `review-patches --accept-task --apply-patch` commands for approved candidates.
+
+## `project_queue_validate_links`
+
+Validate ready queue tasks have linked fabric tasks before runner launch.
+
+```ts
+{
+  queueId: string;
+  readyOnly?: boolean;
+}
+```
+
+Returns per-task validation with linked fabric task status.
+
+## `project_queue_validate_context_refs`
+
+Validate required context refs resolve before runner launch.
+
+```ts
+{
+  queueId: string;
+  readyOnly?: boolean;
+  markBlocked?: boolean;
+}
+```
+
+When `markBlocked: true`, ready tasks with missing context refs are moved to `blocked` with a `context_ref_missing` summary. Returns per-task validation with resolved/missing status for each context ref.
 
 ## Model aliases
 

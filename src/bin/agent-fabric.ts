@@ -76,6 +76,7 @@ function rootHelp(): string {
     "Common commands:",
     "  agent-fabric-project senior-doctor --project <path>",
     "  agent-fabric-project senior-run --project <path> --count 10 --approve-model-calls",
+    "  agent-fabric-project dispatch --queue <id> --worker deepseek-direct --parallel 4",
     "  agent-fabric-bridge",
     "",
     localConfigDoctorHelp()

@@ -298,12 +298,15 @@ export function fabricMessageAgent(host: SurfaceHost, input: unknown, context: C
   const ask = getOptionalBoolean(input, "ask") ?? false;
   const resolved = resolveAgentLane(host, queueId, agent, context);
   const task = objectFrom(resolved.lane.queueTask);
+  const queueTaskId = String(task.queueTaskId ?? "");
   const refs = [
+    `project_queue:${queueId}`,
+    queueTaskId ? `project_queue_task:${queueTaskId}` : undefined,
     `queue:${queueId}`,
-    `queueTask:${String(task.queueTaskId ?? "")}`,
+    queueTaskId ? `queueTask:${queueTaskId}` : undefined,
     `workerRun:${resolved.card.agentId}`,
     ...getStringArray(input, "refs")
-  ].filter(Boolean);
+  ].filter((ref): ref is string => Boolean(ref));
   const payload = ask
     ? collabAsk(
         host,
@@ -452,6 +455,14 @@ function laneCard(queueId: string, lane: Record<string, unknown>, index: number)
   const runnerProcessState = runnerState(rawStatus, String(run.status ?? ""), hasRunnerEvidence);
   const noRunner = runnerProcessState === "no_runner";
   const pid = numberFrom(spawnedMetadata.pid);
+  const laneCost = objectFrom(lane.cost);
+  const costByRole = objectFrom(laneCost.byRole) as Record<string, { count: number; costUsd: number }> | undefined;
+  const aggregatedCostRoles: Record<string, unknown> = {};
+  if (costByRole) {
+    for (const [role, entry] of Object.entries(costByRole)) {
+      aggregatedCostRoles[role] = { count: entry.count, costUsd: entry.costUsd };
+    }
+  }
   return {
     agentId,
     handle,
@@ -478,6 +489,14 @@ function laneCard(queueId: string, lane: Record<string, unknown>, index: number)
     patchReady: rawStatus === "patch_ready" && patchRefs.length > 0,
     reviewState: rawStatus === "accepted" ? "accepted_after_review" : rawStatus === "patch_ready" ? "needs_senior_review" : "not_ready",
     sourceOfTruth: "agent-fabric.queue",
+    cost: {
+      sourceLabel: stringFrom(laneCost.sourceLabel) ?? "none",
+      totalCostUsd: numberFrom(laneCost.totalCostUsd),
+      byRole: aggregatedCostRoles,
+      eventCount: numberFrom(laneCost.eventCount),
+      eventsWithCost: numberFrom(laneCost.eventsWithCost),
+      coverageWarning: stringFrom(laneCost.coverageWarning) ?? null
+    },
     task: {
       queueTaskId: task.queueTaskId,
       title: task.title,
@@ -560,6 +579,14 @@ function plannedAgentCard(
     patchReady: false,
     reviewState: "not_ready",
     sourceOfTruth: "agent-fabric.queue",
+    cost: {
+      sourceLabel: "none",
+      totalCostUsd: 0,
+      byRole: {},
+      eventCount: 0,
+      eventsWithCost: 0,
+      coverageWarning: "planned: task has not been claimed by a worker run yet"
+    },
     task: {
       queueTaskId,
       title: task.title,

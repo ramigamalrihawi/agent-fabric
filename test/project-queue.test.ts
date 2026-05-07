@@ -2419,6 +2419,169 @@ describe("project queue substrate", () => {
 
     daemon.close();
   });
+
+  it("accepts priority medium as normal with compatibility warnings across add/update/batch paths", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createQueue(daemon, session, "medium-priority-create");
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error("queue create failed");
+    const queueId = created.data.queueId;
+
+    // 1. add_tasks with medium priority
+    const added = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId,
+        tasks: [
+          {
+            clientKey: "medium-task",
+            title: "Medium-priority task",
+            goal: "Accept priority: medium as normal.",
+            priority: "medium",
+            risk: "low"
+          },
+          {
+            clientKey: "normal-task",
+            title: "Normal-priority task",
+            goal: "Stays normal.",
+            priority: "normal",
+            risk: "low"
+          }
+        ]
+      },
+      contextFor(session, "medium-add-tasks")
+    );
+    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error("add tasks failed");
+    expect(added.data.warnings).toBeDefined();
+    expect(added.data.warnings).toContain('priority "medium" normalized to "normal"');
+
+    const status = daemon.callTool("project_queue_status", { queueId }, contextFor(session, "medium-status"));
+    expect(status.ok).toBe(true);
+    if (!status.ok) throw new Error("status failed");
+    const mediumTask = (status.data.tasks as Array<Record<string, unknown>>).find(
+      (task) => task.clientKey === "medium-task"
+    );
+    expect(mediumTask).toBeDefined();
+    expect(mediumTask.priority).toBe("normal");
+
+    // 2. add_task_batch with medium priority via defaults
+    const batched = daemon.callTool(
+      "project_queue_add_task_batch",
+      {
+        queueId,
+        defaults: { priority: "medium", risk: "low", category: "reviewer" },
+        tasks: [
+          {
+            title: "Batched medium reviewer",
+            goal: "Review with medium priority."
+          }
+        ]
+      },
+      contextFor(session, "medium-batch")
+    );
+    expect(batched.ok).toBe(true);
+    if (!batched.ok) throw new Error("batch add failed");
+    expect(batched.data.warnings).toBeDefined();
+    expect(batched.data.warnings).toContain('priority "medium" normalized to "normal"');
+
+    const status2 = daemon.callTool("project_queue_status", { queueId }, contextFor(session, "medium-status2"));
+    expect(status2.ok).toBe(true);
+    if (!status2.ok) throw new Error("status2 failed");
+    const batchedTask = (status2.data.tasks as Array<Record<string, unknown>>).find(
+      (task) => task.title === "Batched medium reviewer"
+    );
+    expect(batchedTask).toBeDefined();
+    expect(batchedTask.priority).toBe("normal");
+
+    // 3. update_task_metadata with medium priority
+    const mediumQueueTaskId = mediumTask.queueTaskId as string;
+    const updated = daemon.callTool(
+      "project_queue_update_task_metadata",
+      {
+        queueId,
+        queueTaskId: mediumQueueTaskId,
+        priority: "medium",
+        title: "Updated to medium (stored as normal)"
+      },
+      contextFor(session, "medium-update-metadata")
+    );
+    expect(updated.ok).toBe(true);
+    if (!updated.ok) throw new Error("update metadata failed");
+    expect(updated.data.warnings).toBeDefined();
+    expect(updated.data.warnings).toContain('priority "medium" normalized to "normal"');
+    expect(updated.data.task).toBeDefined();
+    expect(updated.data.task.priority).toBe("normal");
+    expect(updated.data.task.title).toBe("Updated to medium (stored as normal)");
+
+    // 4. Verify canonical priorities are preserved
+    const addedHigh = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId,
+        tasks: [
+          {
+            clientKey: "high-task",
+            title: "High priority task",
+            goal: "Stays high.",
+            priority: "high",
+            risk: "medium"
+          },
+          {
+            clientKey: "urgent-task",
+            title: "Urgent task",
+            goal: "Stays urgent.",
+            priority: "urgent",
+            risk: "high"
+          },
+          {
+            clientKey: "low-task",
+            title: "Low priority task",
+            goal: "Stays low.",
+            priority: "low",
+            risk: "low"
+          }
+        ]
+      },
+      contextFor(session, "canonical-priorities")
+    );
+    expect(addedHigh.ok).toBe(true);
+    if (!addedHigh.ok) throw new Error("canonical add failed");
+    expect(addedHigh.data.warnings).toBeUndefined();
+
+    const status3 = daemon.callTool("project_queue_status", { queueId }, contextFor(session, "canonical-status"));
+    expect(status3.ok).toBe(true);
+    if (!status3.ok) throw new Error("canonical status failed");
+    const tasks = status3.data.tasks as Array<Record<string, unknown>>;
+    const highTask = tasks.find((task) => task.clientKey === "high-task");
+    const urgentTask = tasks.find((task) => task.clientKey === "urgent-task");
+    const lowTask = tasks.find((task) => task.clientKey === "low-task");
+    expect(highTask.priority).toBe("high");
+    expect(urgentTask.priority).toBe("urgent");
+    expect(lowTask.priority).toBe("low");
+
+    // 5. Invalid priority still throws
+    const bad = daemon.callTool(
+      "project_queue_add_tasks",
+      {
+        queueId,
+        tasks: [
+          {
+            title: "Bad priority",
+            goal: "Should fail.",
+            priority: "critical",
+            risk: "low"
+          }
+        ]
+      },
+      contextFor(session, "bad-priority")
+    );
+    expect(bad.ok).toBe(false);
+    expect(bad.message).toContain("priority must be one of");
+
+    daemon.close();
+  });
 });
 
 function createQueue(daemon: FabricDaemon, session: { sessionId: string; sessionToken: string }, idempotencyKey: string) {

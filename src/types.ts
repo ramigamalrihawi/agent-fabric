@@ -142,6 +142,21 @@ export type FabricDiagnostic = {
   };
 };
 
+export type FabricStarterKit = {
+  /** Always "agent-fabric". */
+  kit: "agent-fabric";
+  /** Non-exhaustive list of the essential happy-path tools for Codex/Claude bridge callers. */
+  essentialTools: FabricStarterKitTool[];
+};
+
+export type FabricStarterKitTool = {
+  tool: string;
+  description: string;
+  readOnly: boolean;
+  /** Concise one-line happy-path guidance. */
+  guidance: string;
+};
+
 export type DaemonRequest =
   | { id: string | number; type: "register"; payload: BridgeRegister }
   | { id: string | number; type: "call"; tool: string; input: unknown; context: CallContext };

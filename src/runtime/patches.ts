@@ -3,10 +3,297 @@ import { existsSync, lstatSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { FabricError } from "./errors.js";
 
-export function validateGitStylePatch(patch: string, cwd?: string): void {
-  if (!/^diff --git /m.test(patch)) {
-    throw new FabricError("INVALID_PATCH", "patch apply requires a git-style unified diff with diff --git headers", false);
+/* ------------------------------------------------------------------ */
+/*  Types                                                             */
+/* ------------------------------------------------------------------ */
+
+export interface PatchFileEntry {
+  /** Relative path to the target file (new path for renames). */
+  path: string;
+  /** Source path for renames/deletions, otherwise null. */
+  oldPath: string | null;
+  /** Destination path for renames/additions, otherwise null. */
+  newPath: string | null;
+  changeType: "add" | "remove" | "modify" | "rename";
+  additions: number;
+  deletions: number;
+}
+
+export interface PatchDiffSummary {
+  files: PatchFileEntry[];
+  totalAdditions: number;
+  totalDeletions: number;
+  totalFiles: number;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Path safety (exported)                                            */
+/* ------------------------------------------------------------------ */
+
+export function extractPatchPaths(patch: string): string[] {
+  const paths = new Set<string>();
+  for (const line of patch.split(/\r?\n/)) {
+    if (line.startsWith("diff --git ")) {
+      const tokens = line.trim().split(/\s+/);
+      if (tokens.length !== 4) {
+        throw new FabricError("INVALID_PATCH_PATH", `unsupported patch path syntax: ${line}`, false);
+      }
+      paths.add(stripDiffPrefix(tokens[2]));
+      paths.add(stripDiffPrefix(tokens[3]));
+      continue;
+    }
+    if (line.startsWith("--- ") || line.startsWith("+++ ")) {
+      const tokens = line.trim().split(/\s+/);
+      if (tokens.length !== 2) {
+        throw new FabricError("INVALID_PATCH_PATH", `unsupported patch path syntax: ${line}`, false);
+      }
+      if (tokens[1] !== "/dev/null") {
+        paths.add(stripDiffPrefix(tokens[1]));
+      }
+    }
   }
+  return [...paths].filter(Boolean);
+}
+
+export function stripDiffPrefix(path: string): string {
+  if (path === "/dev/null") return "";
+  if (path.startsWith("a/") || path.startsWith("b/")) return path.slice(2);
+  return path;
+}
+
+export function validatePatchPath(path: string): void {
+  if (!path || path.startsWith("/") || path.startsWith("//") || path.includes("\\") || path.includes("\0") || /^[A-Za-z]:/.test(path)) {
+    throw new FabricError("INVALID_PATCH_PATH", `unsafe patch path: ${path}`, false);
+  }
+  const parts = path.split("/");
+  if (parts.includes("..") || parts.includes(".git")) {
+    throw new FabricError("INVALID_PATCH_PATH", `unsafe patch path: ${path}`, false);
+  }
+}
+
+/**
+ * Check whether `path` is inside `root`, resolving symlinks.
+ * Rejects absolute, traversal, symlink, and .git targets.
+ * Returns true only when safe; false when any safety check fails.
+ */
+export function isPathSafeBelow(path: string, root: string): boolean {
+  try {
+    validatePatchPath(path);
+  } catch {
+    return false;
+  }
+  try {
+    const resolvedRoot = resolve(root);
+    if (!existsSync(resolvedRoot)) return false;
+    if (lstatSync(resolvedRoot).isSymbolicLink()) return false;
+    const target = resolve(resolvedRoot, path);
+    if (!isPathInside(target, resolvedRoot)) return false;
+    const relativeTarget = relative(resolvedRoot, target);
+    const segments = relativeTarget.split(sep).filter(Boolean);
+    let current = resolvedRoot;
+    for (const segment of segments) {
+      current = resolve(current, segment);
+      if (!existsSync(current)) continue;
+      if (lstatSync(current).isSymbolicLink()) return false;
+    }
+    for (const segment of segments) {
+      if (segment === ".." || segment === ".git") return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isPathInside(path: string, root: string): boolean {
+  const rel = relative(resolve(root), resolve(path));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Diff summary                                                      */
+/* ------------------------------------------------------------------ */
+
+const PLACEHOLDER_PATTERNS = [
+  /HUNK_PLACEHOLDER/,
+  /PLACEHOLDER/,
+  /\[TODO:?\s*(add|fill|insert|write|implement)/i,
+  /\[placeholder/i,
+  /@@\s*-\d+,\d+\s+\+\d+,\d+\s*@@\s*TODO/i,
+];
+
+/** Detect patches composed entirely of placeholder instructions with no real hunks. */
+export function hasPlaceholderHunks(patch: string): boolean {
+  const lines = patch.split(/\r?\n/);
+  let hunkCount = 0;
+  let placeholderHunkCount = 0;
+
+  for (const line of lines) {
+    if (/^@@\s+-\d+.*\+\d+.*@@/.test(line)) {
+      hunkCount++;
+      for (const pattern of PLACEHOLDER_PATTERNS) {
+        if (pattern.test(line)) {
+          placeholderHunkCount++;
+          break;
+        }
+      }
+    }
+  }
+
+  // If every hunk is a placeholder, reject the entire patch.
+  return hunkCount > 0 && hunkCount === placeholderHunkCount;
+}
+
+/**
+ * Parse a git-style unified diff into a structured summary.
+ * Returns null if the patch is malformed.
+ */
+export function summarizeDiff(patch: string): PatchDiffSummary | null {
+  try {
+    validateGitStylePatchHeader(patch);
+  } catch {
+    return null;
+  }
+
+  // Split into per-file sections by "diff --git" lines.
+  const sections = splitDiffSections(patch);
+  const files: PatchFileEntry[] = [];
+
+  for (const section of sections) {
+    const entry = parseFileSection(section);
+    if (entry) files.push(entry);
+  }
+
+  if (files.length === 0) return null;
+
+  const totalAdditions = files.reduce((sum, f) => sum + f.additions, 0);
+  const totalDeletions = files.reduce((sum, f) => sum + f.deletions, 0);
+
+  return {
+    files,
+    totalAdditions,
+    totalDeletions,
+    totalFiles: files.length,
+  };
+}
+
+function validateGitStylePatchHeader(patch: string): void {
+  if (!/^diff --git /m.test(patch)) {
+    throw new FabricError("INVALID_PATCH", "not a git-style unified diff", false);
+  }
+}
+
+function splitDiffSections(patch: string): string[] {
+  const lines = patch.split(/\r?\n/);
+  const sections: string[] = [];
+  let current: string[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ") && current.length > 0) {
+      sections.push(current.join("\n"));
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) {
+    sections.push(current.join("\n"));
+  }
+
+  return sections;
+}
+
+function parseFileSection(section: string): PatchFileEntry | null {
+  const lines = section.split(/\r?\n/);
+
+  // Extract header paths. Use raw (unprefixed) values from ---/+++ lines
+  // for /dev/null detection.
+  let oldPath: string | null = null;
+  let newPath: string | null = null;
+  let isRename = false;
+
+  for (const line of lines) {
+    if (line.startsWith("rename from ")) {
+      oldPath = line.slice("rename from ".length).trim();
+      isRename = true;
+    } else if (line.startsWith("rename to ")) {
+      newPath = line.slice("rename to ".length).trim();
+      isRename = true;
+    } else if (line.startsWith("diff --git ")) {
+      const tokens = line.trim().split(/\s+/);
+      if (tokens.length === 4 && !isRename) {
+        const a = stripDiffPrefix(tokens[2]);
+        const b = stripDiffPrefix(tokens[3]);
+        if (a !== b) isRename = true;
+        oldPath = a || null;
+        newPath = b || null;
+      }
+    } else if (line.startsWith("--- ")) {
+      const tokens = line.trim().split(/\s+/);
+      if (tokens.length === 2) {
+        oldPath = tokens[1] === "/dev/null" ? null : stripDiffPrefix(tokens[1]) || null;
+      }
+    } else if (line.startsWith("+++ ")) {
+      const tokens = line.trim().split(/\s+/);
+      if (tokens.length === 2) {
+        newPath = tokens[1] === "/dev/null" ? null : stripDiffPrefix(tokens[1]) || null;
+      }
+    }
+  }
+
+  // Determine change type
+  let changeType: PatchFileEntry["changeType"];
+  if (isRename) {
+    changeType = "rename";
+  } else if (oldPath === null && newPath !== null) {
+    changeType = "add";
+  } else if (newPath === null && oldPath !== null) {
+    changeType = "remove";
+  } else {
+    changeType = "modify";
+  }
+
+  // Count additions/deletions from hunk lines
+  let additions = 0;
+  let deletions = 0;
+  let inHunk = false;
+
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      additions++;
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      deletions++;
+    }
+  }
+
+  const targetPath = newPath ?? oldPath ?? "";
+
+  return {
+    path: targetPath,
+    oldPath: oldPath === "/dev/null" ? null : oldPath,
+    newPath: newPath === "/dev/null" ? null : newPath,
+    changeType,
+    additions,
+    deletions,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Validation                                                        */
+/* ------------------------------------------------------------------ */
+
+export function validateGitStylePatch(patch: string, cwd?: string): void {
+  validateGitStylePatchHeader(patch);
+
+  // Reject patches with placeholder hunks (no real diff content).
+  if (hasPlaceholderHunks(patch)) {
+    throw new FabricError("INVALID_PATCH", "patch contains placeholder hunks instead of real diff content", false);
+  }
+
   const paths = extractPatchPaths(patch);
   if (paths.length === 0) {
     throw new FabricError("INVALID_PATCH", "patch contained no file paths", false);
@@ -49,6 +336,99 @@ export function resolvePatchFilePath(requestedPatchFile: string | undefined, out
   return target;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Artifact resolution                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Defines the possible shapes of a DeepSeek worker result artifact.
+ */
+export interface DeepSeekWorkerArtifact {
+  schema?: string;
+  status?: string;
+  patchMode?: string;
+  patchFile?: string;
+  result?: {
+    status?: string;
+    summary?: string;
+    proposedPatch?: string;
+    changedFilesSuggested?: string[];
+    testsSuggested?: string[];
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+export interface ResolvedArtifactPatch {
+  /** The actual diff text, if resolvable. */
+  patchText: string | null;
+  /** Path to an on-disk patch file, if patchMode is "write" or "apply". */
+  patchFilePath: string | null;
+  /** The patch mode: report, write, or apply. */
+  patchMode: string | null;
+  /** Human-readable reason for resolution failure. */
+  error: string | null;
+}
+
+/**
+ * Extract patch content from a worker result artifact, supporting three
+ * common shapes:
+ *
+ *  1. report mode: artifact.result.proposedPatch is inline text.
+ *  2. write mode:  artifact.patchFile points to an on-disk path.
+ *  3. apply mode:  artifact.patchFile points to an on-disk path.
+ *
+ * All resolved paths are checked for safety via `isPathSafeBelow`.
+ */
+export function resolveArtifactPatch(
+  artifact: DeepSeekWorkerArtifact,
+  cwd: string
+): ResolvedArtifactPatch {
+  const mode = artifact.patchMode ?? null;
+
+  // Inline proposedPatch (report mode)
+  const inlinePatch = artifact.result?.proposedPatch;
+  if (typeof inlinePatch === "string" && inlinePatch.length > 0) {
+    return {
+      patchText: inlinePatch,
+      patchFilePath: null,
+      patchMode: mode,
+      error: null,
+    };
+  }
+
+  // On-disk patchFile (write/apply modes)
+  const patchFile = artifact.patchFile;
+  if (typeof patchFile === "string" && patchFile.length > 0) {
+    if (!isPathSafeBelow(patchFile, cwd)) {
+      return {
+        patchText: null,
+        patchFilePath: null,
+        patchMode: mode,
+        error: `Patch file path is unsafe or outside cwd: ${patchFile}`,
+      };
+    }
+    const resolvedPath = resolve(cwd, patchFile);
+    return {
+      patchText: null,
+      patchFilePath: resolvedPath,
+      patchMode: mode,
+      error: null,
+    };
+  }
+
+  return {
+    patchText: null,
+    patchFilePath: null,
+    patchMode: mode,
+    error: "No patch content or file path found in artifact",
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Private helpers                                                   */
+/* ------------------------------------------------------------------ */
+
 function runPatch(patch: string, cwd: string, checkOnly: boolean): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const args = ["-p1", "-N", "-t", "-s", "-F", "0"];
@@ -87,47 +467,6 @@ function runPatch(patch: string, cwd: string, checkOnly: boolean): Promise<Recor
   });
 }
 
-function extractPatchPaths(patch: string): string[] {
-  const paths = new Set<string>();
-  for (const line of patch.split(/\r?\n/)) {
-    if (line.startsWith("diff --git ")) {
-      const tokens = line.trim().split(/\s+/);
-      if (tokens.length !== 4) {
-        throw new FabricError("INVALID_PATCH_PATH", `unsupported patch path syntax: ${line}`, false);
-      }
-      paths.add(stripDiffPrefix(tokens[2]));
-      paths.add(stripDiffPrefix(tokens[3]));
-      continue;
-    }
-    if (line.startsWith("--- ") || line.startsWith("+++ ")) {
-      const tokens = line.trim().split(/\s+/);
-      if (tokens.length !== 2) {
-        throw new FabricError("INVALID_PATCH_PATH", `unsupported patch path syntax: ${line}`, false);
-      }
-      if (tokens[1] !== "/dev/null") {
-        paths.add(stripDiffPrefix(tokens[1]));
-      }
-    }
-  }
-  return [...paths].filter(Boolean);
-}
-
-function stripDiffPrefix(path: string): string {
-  if (path === "/dev/null") return "";
-  if (path.startsWith("a/") || path.startsWith("b/")) return path.slice(2);
-  return path;
-}
-
-function validatePatchPath(path: string): void {
-  if (!path || path.startsWith("/") || path.startsWith("//") || path.includes("\\") || path.includes("\0") || /^[A-Za-z]:/.test(path)) {
-    throw new FabricError("INVALID_PATCH_PATH", `unsafe patch path: ${path}`, false);
-  }
-  const parts = path.split("/");
-  if (parts.includes("..") || parts.includes(".git")) {
-    throw new FabricError("INVALID_PATCH_PATH", `unsafe patch path: ${path}`, false);
-  }
-}
-
 function validatePatchTargetUnderCwd(path: string, cwd: string): void {
   const resolvedCwd = resolve(cwd);
   if (!existsSync(resolvedCwd)) {
@@ -152,7 +491,45 @@ function validatePatchTargetUnderCwd(path: string, cwd: string): void {
   }
 }
 
-function isPathInside(path: string, root: string): boolean {
-  const rel = relative(resolve(root), resolve(path));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+/* ------------------------------------------------------------------ */
+/*  Lightweight diff stats for dry-run output                         */
+/* ------------------------------------------------------------------ */
+
+export interface PatchDiffStats {
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+  affectedFiles: string[];
+}
+
+/**
+ * Compute diff stats from a patch without full file-entry parsing.
+ * Returns basic counts and affected sorted paths for quick dry-run output.
+ */
+export function computePatchDiffStats(patch: string): PatchDiffStats {
+  const paths = new Set<string>();
+  let insertions = 0;
+  let deletions = 0;
+  for (const line of patch.split(/\r?\n/)) {
+    if (line.startsWith("diff --git ")) {
+      const tokens = line.trim().split(/\s+/);
+      if (tokens.length === 4) {
+        paths.add(stripDiffPrefix(tokens[2]));
+      }
+    } else if (line.startsWith("+++") || line.startsWith("---")) {
+      continue;
+    } else if (line.startsWith("@@")) {
+      continue;
+    } else if (line.startsWith("+")) {
+      insertions += 1;
+    } else if (line.startsWith("-")) {
+      deletions += 1;
+    }
+  }
+  return {
+    filesChanged: paths.size,
+    insertions,
+    deletions,
+    affectedFiles: [...paths].sort()
+  };
 }

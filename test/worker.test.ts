@@ -324,6 +324,205 @@ describe("worker/task substrate", () => {
     expect(resume.data).toMatchObject({ workspacePath: "/tmp/worktrees/codex-app-server", modelProfile: "codex.app-server", contextPolicy: "workflow:linear" });
     daemon.close();
   });
+
+  it("tails worker events and checkpoints by task, worker run, or queue task", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createTask(daemon, session, "tail-task-create");
+    if (!created.ok) throw new Error("task create failed");
+
+    const runA = daemon.callTool(
+      "fabric_task_start_worker",
+      {
+        taskId: created.data.taskId,
+        worker: "local-cli",
+        projectPath: "/tmp/workspace",
+        workspaceMode: "git_worktree",
+        workspacePath: "/tmp/workspace/task-a",
+        modelProfile: "deepseek-api",
+        command: ["local-cli", "run"]
+      },
+      contextFor(session, "tail-worker-a")
+    );
+    const runB = daemon.callTool(
+      "fabric_task_start_worker",
+      {
+        taskId: created.data.taskId,
+        worker: "manual",
+        projectPath: "/tmp/workspace",
+        workspaceMode: "sandbox",
+        workspacePath: "/tmp/workspace/task-b",
+        modelProfile: "manual-review",
+        command: ["manual", "run"]
+      },
+      contextFor(session, "tail-worker-b")
+    );
+    expect(runA.ok).toBe(true);
+    expect(runB.ok).toBe(true);
+    if (!runA.ok || !runB.ok) throw new Error("worker start failed");
+
+    for (let i = 0; i < 3; i += 1) {
+      daemon.callTool(
+        "fabric_task_event",
+        {
+          taskId: created.data.taskId,
+          workerRunId: runA.data.workerRunId,
+          kind: "command_finished",
+          body: `run a event ${i}`,
+          metadata: { stdoutTail: `line ${i}`, cwd: "/tmp/workspace/task-a" }
+        },
+        contextFor(session, `tail-worker-a-event-${i}`)
+      );
+    }
+    daemon.callTool(
+      "fabric_task_event",
+      {
+        taskId: created.data.taskId,
+        workerRunId: runB.data.workerRunId,
+        kind: "thought_summary",
+        body: "run b event"
+      },
+      contextFor(session, "tail-worker-b-event")
+    );
+    daemon.callTool(
+      "fabric_task_checkpoint",
+      {
+        taskId: created.data.taskId,
+        workerRunId: runA.data.workerRunId,
+        summary: { nextAction: "review", stdoutTail: "latest output" }
+      },
+      contextFor(session, "tail-checkpoint")
+    );
+
+    const byTask = daemon.callTool("fabric_task_tail", { taskId: created.data.taskId }, contextFor(session, "tail-by-task"));
+    expect(byTask.ok).toBe(true);
+    if (!byTask.ok) throw new Error("task tail failed");
+    expect(byTask.data).toMatchObject({
+      resolveMode: "taskId",
+      taskId: created.data.taskId,
+      eventCount: 4,
+      checkpointCount: 1,
+      totalEventCount: 4,
+      totalCheckpointCount: 1,
+      truncated: false
+    });
+
+    const byRun = daemon.callTool("fabric_task_tail", { workerRunId: runA.data.workerRunId }, contextFor(session, "tail-by-run"));
+    expect(byRun.ok).toBe(true);
+    if (!byRun.ok) throw new Error("worker run tail failed");
+    expect(byRun.data.resolveMode).toBe("workerRunId");
+    expect(byRun.data.workerRunId).toBe(runA.data.workerRunId);
+    expect(byRun.data.eventCount).toBe(3);
+    expect(byRun.data.totalEventCount).toBe(3);
+    expect(byRun.data.checkpointCount).toBe(1);
+
+    const queue = daemon.callTool(
+      "project_queue_create",
+      { projectPath: "/tmp/workspace", promptSummary: "Tail queue.", pipelineProfile: "fast", maxParallelAgents: 1 },
+      contextFor(session, "tail-queue-create")
+    );
+    expect(queue.ok).toBe(true);
+    if (!queue.ok) throw new Error("queue create failed");
+    const added = daemon.callTool(
+      "project_queue_add_tasks",
+      { queueId: queue.data.queueId, tasks: [{ title: "Queue tail task", goal: "Exercise queue lookup." }] },
+      contextFor(session, "tail-queue-add")
+    );
+    expect(added.ok).toBe(true);
+    if (!added.ok) throw new Error("queue add failed");
+    const queueTask = (added.data.created as Array<{ queueTaskId: string; fabricTaskId: string }>)[0];
+    const queueRun = daemon.callTool(
+      "fabric_task_start_worker",
+      {
+        taskId: queueTask.fabricTaskId,
+        worker: "local-cli",
+        projectPath: "/tmp/workspace",
+        workspaceMode: "git_worktree",
+        workspacePath: "/tmp/workspace/queue-tail",
+        modelProfile: "deepseek-api",
+        command: ["local-cli", "run"]
+      },
+      contextFor(session, "tail-queue-worker")
+    );
+    expect(queueRun.ok).toBe(true);
+    if (!queueRun.ok) throw new Error("queue worker start failed");
+    daemon.callTool(
+      "fabric_task_event",
+      { taskId: queueTask.fabricTaskId, workerRunId: queueRun.data.workerRunId, kind: "command_finished", body: "queue event" },
+      contextFor(session, "tail-queue-event")
+    );
+
+    const byQueue = daemon.callTool(
+      "fabric_task_tail",
+      { queueId: queue.data.queueId, queueTaskId: queueTask.queueTaskId },
+      contextFor(session, "tail-by-queue")
+    );
+    expect(byQueue.ok).toBe(true);
+    if (!byQueue.ok) throw new Error("queue tail failed");
+    expect(byQueue.data).toMatchObject({ resolveMode: "queueId", taskId: queueTask.fabricTaskId, eventCount: 1 });
+    daemon.close();
+  });
+
+  it("bounds task tail output and redacts structured paths outside the workspace", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createTask(daemon, session, "tail-limits-create");
+    if (!created.ok) throw new Error("task create failed");
+    const started = daemon.callTool(
+      "fabric_task_start_worker",
+      {
+        taskId: created.data.taskId,
+        worker: "local-cli",
+        projectPath: "/tmp/workspace",
+        workspaceMode: "git_worktree",
+        workspacePath: "/tmp/workspace/tail-limits",
+        modelProfile: "deepseek-api",
+        command: ["local-cli", "run"]
+      },
+      contextFor(session, "tail-limits-worker")
+    );
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error("worker start failed");
+
+    for (let i = 0; i < 5; i += 1) {
+      daemon.callTool(
+        "fabric_task_event",
+        {
+          taskId: created.data.taskId,
+          workerRunId: started.data.workerRunId,
+          kind: "command_finished",
+          body: `event ${i}`,
+          refs: ["/tmp/workspace/inside.txt", "/private/other/secret.txt"],
+          metadata: {
+            inside: "/tmp/workspace/inside.txt",
+            outside: "/private/other/secret.txt",
+            nested: { outside: "/Users/someone/.env" }
+          }
+        },
+        contextFor(session, `tail-limit-event-${i}`)
+      );
+    }
+
+    const limited = daemon.callTool("fabric_task_tail", { taskId: created.data.taskId, maxLines: 2 }, contextFor(session, "tail-limited"));
+    expect(limited.ok).toBe(true);
+    if (!limited.ok) throw new Error("limited tail failed");
+    expect(limited.data.eventCount).toBe(2);
+    expect(limited.data.totalEventCount).toBe(5);
+    expect(limited.data.truncated).toBe(true);
+    expect(limited.data.events[0].metadata.inside).toBe("/tmp/workspace/inside.txt");
+    expect(limited.data.events[0].metadata.outside).toBe("[REDACTED: path outside workspace]");
+    expect(limited.data.events[0].metadata.nested.outside).toBe("[REDACTED: path outside workspace]");
+    expect(limited.data.events[0].refs).toEqual(["/tmp/workspace/inside.txt", "[REDACTED: path outside workspace]"]);
+
+    const ambiguous = daemon.callTool(
+      "fabric_task_tail",
+      { taskId: created.data.taskId, workerRunId: started.data.workerRunId },
+      contextFor(session, "tail-ambiguous")
+    );
+    expect(ambiguous.ok).toBe(false);
+    expect(ambiguous.code).toBe("INVALID_INPUT");
+    daemon.close();
+  });
 });
 
 function createTask(daemon: FabricDaemon, session: { sessionId: string; sessionToken: string }, idempotencyKey: string) {

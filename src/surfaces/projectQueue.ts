@@ -1068,7 +1068,7 @@ export function projectQueueAddTaskBatch(host: SurfaceHost, input: unknown, cont
 function addTasksCore(
   host: SurfaceHost,
   queue: ProjectQueueRow,
-  session: { id: string; agent_id: string; host_name: string | null; test_mode: 0 | 1 },
+  session: { id: string; agent_id: string; host_name: string | null; workspace_root: string; test_mode: 0 | 1 },
   context: CallContext,
   prepared: Array<{
     queueTaskId: string;
@@ -1085,6 +1085,7 @@ function addTasksCore(
     category: string;
     status: string;
     priority: string;
+    warnings: string[];
     parallelGroup: string | null;
     parallelSafe: boolean;
     risk: string;
@@ -5961,9 +5962,7 @@ export function projectQueueWorkerHealth(host: SurfaceHost, input: unknown, cont
 
   const tasks = taskRows(host, queue.id);
   const taskByFabricId = new Map<string, ProjectQueueTaskRow>();
-  const taskById = new Map<string, ProjectQueueTaskRow>();
   for (const task of tasks) {
-    taskById.set(task.id, task);
     if (task.fabric_task_id) taskByFabricId.set(task.fabric_task_id, task);
   }
 
@@ -5974,11 +5973,6 @@ export function projectQueueWorkerHealth(host: SurfaceHost, input: unknown, cont
     runs = host.db.db
       .prepare(`SELECT * FROM worker_runs WHERE task_id IN (${placeholders}) ORDER BY ts_updated DESC, ts_started DESC`)
       .all(...fabricTaskIds) as WorkerRunRow[];
-  }
-
-  const runByTaskId = new Map<string, WorkerRunRow>();
-  for (const run of runs) {
-    runByTaskId.set(run.task_id, run);
   }
 
   const allRunsByTaskId = new Map<string, WorkerRunRow[]>();

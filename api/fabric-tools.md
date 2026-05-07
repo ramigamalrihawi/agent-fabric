@@ -11,7 +11,8 @@ Fast status for agents and humans. Should be safe to call at session start and a
 **Input:**
 ```ts
 {
-  includeSessions?: boolean; // default true
+  includeSessions?: boolean; // default false — sessions and runtime only included when true or verbose
+  verbose?: boolean;         // default false — implies includeSessions:true, dedupeWarnings:false
   sessionLimit?: number;     // default 50, max 500
   sessionOffset?: number;    // default 0
   dedupeWarnings?: boolean;  // default true
@@ -113,6 +114,25 @@ Examples:
 - "LiteLLM coverage is 23% because Cursor is not routeable."
 - "Claude Code declares notifications, but observed delivery is unknown; run notification self-test."
 - "Azure billing poll has never succeeded; `AZURE_SUBSCRIPTION_ID` missing."
+
+## `fabric_starter_kit`
+
+Read-only happy-path tool discovery for Codex and Claude bridge callers. Returns a non-exhaustive list of essential queue tools with concise one-line guidance.
+
+**Input:** `{}` (no parameters required)
+
+**Output:**
+```ts
+{
+  kit: "agent-fabric";
+  essentialTools: {
+    tool: string;
+    description: string;
+    readOnly: boolean;
+    guidance: string;
+  }[];
+}
+```
 
 ## `fabric_explain_memory`
 
@@ -298,6 +318,62 @@ Human-glanceable aggregate of post-call route feedback. This is intentionally de
     avgLatencyMs: number | null;
     totalRetries: number;
   }[];
+}
+```
+
+## `fabric_session_close`
+
+Close this Agent Fabric bridge session so status output does not accumulate stale short-lived clients. Safe to call at session end.
+
+**Input:** `{}` (no parameters required)
+
+**Output:**
+```ts
+{
+  sessionId: string;
+  closed: true;
+}
+```
+
+## `fabric_notification_self_test_start`
+
+Create a notification visibility challenge for this bridge session. The bridge receives a challenge string that it should display for the agent; call `fabric_notification_self_test_complete` after agent-visible delivery is confirmed.
+
+**Input:**
+```ts
+{
+  ttlSeconds?: number;
+}
+```
+
+**Output:**
+```ts
+{
+  testId: string;
+  challenge: string;
+}
+```
+
+## `fabric_notification_self_test_complete`
+
+Complete a notification visibility challenge after agent-visible delivery is confirmed.
+
+**Input:**
+```ts
+{
+  testId: string;
+  observed: "yes" | "no" | "unknown";
+  detail?: string;
+}
+```
+
+**Output:**
+```ts
+{
+  testId: string;
+  sessionId: string;
+  observed: "yes" | "no" | "unknown";
+  completed: true;
 }
 ```
 

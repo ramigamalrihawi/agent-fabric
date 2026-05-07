@@ -12,7 +12,7 @@ describe("UDS daemon transport", () => {
     await withServer(async ({ socketPath }) => {
       const client = new FabricClient(socketPath);
       const session = await client.register(registerPayload());
-      const status = await client.call<FabricStatus>("fabric_status", {}, {
+      const status = await client.call<FabricStatus>("fabric_status", { includeSessions: true }, {
         sessionId: session.sessionId,
         sessionToken: session.sessionToken
       });
@@ -73,11 +73,11 @@ describe("UDS daemon transport", () => {
       expect(sessionA.sessionId).not.toBe(sessionB.sessionId);
 
       const [statusA, statusB] = await Promise.all([
-        clientA.call<FabricStatus>("fabric_status", {}, {
+        clientA.call<FabricStatus>("fabric_status", { includeSessions: true }, {
           sessionId: sessionA.sessionId,
           sessionToken: sessionA.sessionToken
         }),
-        clientB.call<FabricStatus>("fabric_status", {}, {
+        clientB.call<FabricStatus>("fabric_status", { includeSessions: true }, {
           sessionId: sessionB.sessionId,
           sessionToken: sessionB.sessionToken
         })

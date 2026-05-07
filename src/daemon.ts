@@ -168,7 +168,8 @@ import {
   fabricTaskHeartbeat,
   fabricTaskResume,
   fabricTaskStartWorker,
-  fabricTaskStatus
+  fabricTaskStatus,
+  fabricTaskTail
 } from "./surfaces/worker.js";
 
 export { FabricError } from "./runtime/errors.js";
@@ -287,6 +288,7 @@ const SUPPORTED_TOOLS = new Set([
   "fabric_task_heartbeat",
   "fabric_task_status",
   "fabric_task_resume",
+  "fabric_task_tail",
   "fabric_task_finish"
 ]);
 
@@ -750,6 +752,9 @@ export class FabricDaemon {
       if (tool === "fabric_task_resume") {
         return { ok: true, tool, data: fabricTaskResume(this, input, context) as T };
       }
+      if (tool === "fabric_task_tail") {
+        return { ok: true, tool, data: fabricTaskTail(this, input, context) as T };
+      }
       if (tool === "fabric_task_finish") {
         return { ok: true, tool, data: fabricTaskFinish(this, input, context) as T };
       }
@@ -1068,6 +1073,12 @@ export class FabricDaemon {
           description: "Read durable task, worker run, event, and checkpoint state.",
           readOnly: true,
           guidance: "Use includeEvents:true and includeCheckpoints:true for full task history."
+        },
+        {
+          tool: "fabric_task_tail",
+          description: "Tail bounded worker events and checkpoints by workerRunId, taskId, or queue task reference.",
+          readOnly: true,
+          guidance: "Use when a coordinator needs recent worker output without pulling full session dumps."
         },
         {
           tool: "fabric_task_event",

@@ -47,6 +47,12 @@ defmodule AgentFabricOrchestrator.FabricGateway do
   @callback checkpoint(socket_path(), session(), map(), keyword()) :: result()
   @callback finish(socket_path(), session(), map(), keyword()) :: result()
   @callback task_status(socket_path(), session(), String.t(), keyword()) :: result()
+
+  # --- Read-only wrappers for new queue APIs ---
+  @callback worker_health(socket_path(), session(), String.t(), keyword()) :: result()
+  @callback task_tail(socket_path(), session(), String.t(), String.t(), keyword()) :: result()
+  @callback patch_review_plan(socket_path(), session(), String.t(), keyword()) :: result()
+  @callback collab_summary(socket_path(), session(), String.t(), keyword()) :: result()
 end
 
 defmodule AgentFabricOrchestrator.FabricGateway.Uds do
@@ -210,6 +216,50 @@ defmodule AgentFabricOrchestrator.FabricGateway.Uds do
     }
 
     call(socket_path, session, "fabric_task_status", input, opts)
+  end
+
+  # --- Read-only wrappers for new queue APIs ---
+
+  @impl true
+  def worker_health(socket_path, session, queue_id, opts \\ []) do
+    payload =
+      %{
+        queueId: queue_id,
+        staleAfterMinutes: Keyword.get(opts, :stale_after_minutes)
+      }
+      |> compact_payload()
+
+    call(socket_path, session, "project_queue_worker_health", payload, opts)
+  end
+
+  @impl true
+  def task_tail(socket_path, session, queue_id, queue_task_id, opts \\ []) do
+    payload =
+      %{
+        queueId: queue_id,
+        queueTaskId: queue_task_id,
+        maxLines: Keyword.get(opts, :max_lines, Keyword.get(opts, :max_events_per_run, 200)),
+        maxBytes: Keyword.get(opts, :max_bytes)
+      }
+      |> compact_payload()
+
+    call(socket_path, session, "fabric_task_tail", payload, opts)
+  end
+
+  @impl true
+  def patch_review_plan(socket_path, session, queue_id, opts \\ []) do
+    call(socket_path, session, "project_queue_patch_review_plan", %{queueId: queue_id}, opts)
+  end
+
+  @impl true
+  def collab_summary(socket_path, session, queue_id, opts \\ []) do
+    call(socket_path, session, "project_queue_collab_summary", %{queueId: queue_id}, opts)
+  end
+
+  defp compact_payload(payload) do
+    payload
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
   end
 
   defp call(socket_path, session, tool, input, opts) do

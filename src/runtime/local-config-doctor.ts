@@ -62,6 +62,15 @@ export type LocalConfigDoctorReport = {
     exists?: boolean;
     executable?: boolean;
   };
+  elixir?: {
+    present: boolean;
+    mixfilePath?: string;
+    depsReady?: boolean;
+  };
+  seniorMode?: {
+    configured: boolean;
+    source?: "env" | "local-config";
+  };
   mcpConfigs: LocalConfigDoctorMcpConfig[];
   checks: LocalConfigDoctorCheck[];
   recommendations: string[];
@@ -130,6 +139,8 @@ export function runLocalConfigDoctor(options: LocalConfigDoctorOptions = {}): Lo
 
   checks.push(jcodeDispatcherCheck(jcode));
 
+  const elixir = elixirStatus(projectPath);
+  const seniorMode = seniorModeStatus(env, localConfig);
   const recommendations = recommendationsFor(checks, jcode, localConfig);
   return {
     schema: "agent-fabric.local-config-doctor.v1",
@@ -157,6 +168,8 @@ export function runLocalConfigDoctor(options: LocalConfigDoctorOptions = {}): Lo
       baseUrl: env.DEEPSEEK_BASE_URL
     },
     jcodeDispatcher: jcode,
+    elixir,
+    seniorMode,
     mcpConfigs,
     checks,
     recommendations
@@ -199,6 +212,23 @@ export function formatLocalConfigDoctor(report: LocalConfigDoctorReport): string
     lines.push("", "Recommendations:");
     for (const recommendation of report.recommendations) lines.push(`- ${recommendation}`);
   }
+  lines.push("", "Onboarding starter surface:");
+  lines.push("  Essential queue tools:");
+  lines.push("    agent-fabric-project senior-doctor --project .          — daemon/Senior bridge readiness");
+  lines.push("    agent-fabric-project senior-run --dry-run --project .  — preview worker shape");
+  lines.push("    npm run dev:desktop -- --port 4573                      — local command center");
+  lines.push("  Where next after doctor passes:");
+  lines.push("    1. Create a demo queue (click 'Seed Demo Queue' in the command center)");
+  lines.push("    2. Review the [2-minute demo script](docs/demo-script.md)");
+  lines.push("    3. Explore Senior mode with 10 DeepSeek workers: see README > Senior Mode");
+  if (report.elixir?.present) {
+    lines.push(`  Elixir orchestrator preview: mixfile found at ${report.elixir.mixfilePath}`);
+    if (report.elixir.depsReady) {
+      lines.push("    cd elixir && mix compile && mix af.status");
+    } else {
+      lines.push("    cd elixir && mix deps.get && mix compile && mix af.status");
+    }
+  }
   return lines.join("\n");
 }
 
@@ -209,8 +239,46 @@ export function localConfigDoctorHelp(): string {
     "  agent-fabric-project doctor local-config [--project <path>] [--json]",
     "",
     "Reports active checkout wiring, local ignored config, Agent Fabric runtime state, MCP config paths, DeepSeek key presence, and optional Jcode dispatcher state.",
-    "The report never prints API key or bearer token values."
+    "The report never prints API key or bearer token values.",
+    "",
+    "Onboarding next steps:",
+    "  1. Create a local config:  echo 'export AGENT_FABRIC_SENIOR_MODE=permissive' > agent-fabric.local.env",
+    "  2. Install, build, and test: npm install && npm run build && npm test",
+    "  3. Start the daemon:      AGENT_FABRIC_COST_INGEST_TOKEN=\"$(openssl rand -base64 32)\" npm run dev:daemon",
+    "  4. Run the doctor again:  agent-fabric doctor local-config --project .",
+    "  5. Open command center:   npm run dev:desktop -- --port 4573  →  open http://127.0.0.1:4573/",
+    "  6. Try Senior mode path:  AGENT_FABRIC_SENIOR_MODE=permissive agent-fabric-project senior-doctor --project <path>",
+    "",
+    "Elixir orchestration preview (optional):",
+    "  cd elixir && mix deps.get && mix compile && mix af.status",
+    "",
+    "Quick tools:",
+    "  agent-fabric doctor local-config --json  | jq .  — machine-readable wiring report",
+    "  agent-fabric-project senior-doctor        — daemon/Senior bridge readiness",
+    "  agent-fabric-project senior-run --dry-run — preview queue shape without launching workers",
+    ""
   ].join("\n");
+}
+
+function elixirStatus(projectPath: string): LocalConfigDoctorReport["elixir"] {
+  const mixfilePath = join(projectPath, "elixir", "mix.exs");
+  if (!existsSync(mixfilePath)) return { present: false };
+  const depsPath = join(projectPath, "elixir", "deps");
+  return {
+    present: true,
+    mixfilePath,
+    depsReady: existsSync(depsPath) && statSync(depsPath).isDirectory()
+  };
+}
+
+function seniorModeStatus(env: NodeJS.ProcessEnv, localConfig: Record<string, string>): LocalConfigDoctorReport["seniorMode"] {
+  const envValue = env.AGENT_FABRIC_SENIOR_MODE?.trim();
+  const localValue = localConfig.AGENT_FABRIC_SENIOR_MODE?.trim();
+  const configured = envValue === "permissive" || localValue === "permissive";
+  return {
+    configured,
+    source: configured ? (envValue === "permissive" ? "env" : "local-config") : undefined
+  };
 }
 
 function check(id: string, pass: unknown, detail: string, recommendation?: string): LocalConfigDoctorCheck {

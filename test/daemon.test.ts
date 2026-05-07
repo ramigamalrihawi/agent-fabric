@@ -24,7 +24,7 @@ describe("FabricDaemon Phase 0A.1", () => {
     expect(tableCount(daemon, "audit")).toBe(1);
     expect(tableCount(daemon, "events")).toBe(1);
 
-    const status = daemon.fabricStatus();
+    const status = daemon.fabricStatus({ includeSessions: true });
     expect(status.bridgeSessions.active).toBe(1);
     expect(status.bridgeSessions.sessions[0].notificationsVisibleToAgent).toEqual({
       declared: "yes",
@@ -42,7 +42,7 @@ describe("FabricDaemon Phase 0A.1", () => {
       daemon.registerBridge(registerPayload({ agentId: "codex" }));
     }
 
-    const bounded = daemon.callTool("fabric_status", { sessionLimit: 3 }, contextFor(session));
+    const bounded = daemon.callTool("fabric_status", { includeSessions: true, sessionLimit: 3 }, contextFor(session));
     expect(bounded.ok).toBe(true);
     if (!bounded.ok) throw new Error("fabric_status failed");
     expect(bounded.data.bridgeSessions).toMatchObject({ active: 8, returned: 3, limit: 3 });
@@ -94,7 +94,7 @@ describe("FabricDaemon Phase 0A.1", () => {
 
     const closed = daemon.callTool("fabric_session_close", {}, contextFor(session, "close-session"));
     expect(closed.ok).toBe(true);
-    const status = daemon.fabricStatus();
+    const status = daemon.fabricStatus({ includeSessions: true });
     expect(status.bridgeSessions.active).toBe(0);
     daemon.close();
   });
@@ -191,7 +191,7 @@ describe("FabricDaemon Phase 0A.1", () => {
       agent: "codex",
       currentTask: "implement daemon"
     });
-    expect(daemon.fabricStatus().bridgeSessions.sessions[0].lastHeartbeatAt).toBeTruthy();
+    expect(daemon.fabricStatus({ includeSessions: true }).bridgeSessions.sessions[0].lastHeartbeatAt).toBeTruthy();
     daemon.close();
   });
 

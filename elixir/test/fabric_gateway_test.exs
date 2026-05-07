@@ -254,4 +254,171 @@ defmodule AgentFabricOrchestrator.FabricGatewayTest do
                        }}
     end
   end
+
+  describe "read-only wrappers for new queue APIs" do
+    test "worker_health calls project_queue_worker_health" do
+      parent = self()
+
+      transport = fn encoded ->
+        {:ok, request} = Jason.decode(encoded)
+        send(parent, {:tool_call, request["tool"], request["input"]})
+
+        {:ok,
+         %{
+           "ok" => true,
+           "result" => %{
+             "summary" => %{"total" => 1, "healthy" => 1},
+             "workers" => [
+               %{
+                 "workerRunId" => "wrun_1",
+                 "classification" => "healthy",
+                 "worker" => "deepseek-direct"
+               }
+             ]
+           }
+         }}
+      end
+
+      opts = [transport: transport]
+
+      assert {:ok, result} =
+               FabricGateway.Uds.worker_health("/tmp/fake.sock", @session, "pqueue_1", opts)
+
+      workers = result["workers"]
+      assert length(workers) == 1
+      assert hd(workers)["workerRunId"] == "wrun_1"
+
+      assert_received {:tool_call, "project_queue_worker_health", %{"queueId" => "pqueue_1"}}
+    end
+
+    test "worker_health forwards stale threshold when requested" do
+      parent = self()
+
+      transport = fn encoded ->
+        {:ok, request} = Jason.decode(encoded)
+        send(parent, {:tool_call, request["tool"], request["input"]})
+        {:ok, %{"ok" => true, "result" => %{"workers" => []}}}
+      end
+
+      opts = [transport: transport, stale_after_minutes: 5]
+
+      FabricGateway.Uds.worker_health("/tmp/fake.sock", @session, "pqueue_2", opts)
+
+      assert_received {:tool_call, "project_queue_worker_health",
+                       %{"queueId" => "pqueue_2", "staleAfterMinutes" => 5}}
+    end
+
+    test "task_tail calls fabric_task_tail" do
+      parent = self()
+
+      transport = fn encoded ->
+        {:ok, request} = Jason.decode(encoded)
+        send(parent, {:tool_call, request["tool"], request["input"]})
+
+        {:ok,
+         %{
+           "ok" => true,
+           "result" => %{
+             "taskId" => "task_1",
+             "eventCount" => 2,
+             "checkpointCount" => 1,
+             "events" => [%{"kind" => "command_finished"}],
+             "checkpoints" => [%{"checkpointId" => "wchk_1"}]
+           }
+         }}
+      end
+
+      opts = [transport: transport]
+
+      assert {:ok, result} =
+               FabricGateway.Uds.task_tail(
+                 "/tmp/fake.sock",
+                 @session,
+                 "pqueue_1",
+                 "pqtask_xyz",
+                 opts
+               )
+
+      assert result["taskId"] == "task_1"
+      assert result["eventCount"] == 2
+
+      assert_received {:tool_call, "fabric_task_tail",
+                       %{"queueId" => "pqueue_1", "queueTaskId" => "pqtask_xyz"}}
+    end
+
+    test "task_tail forwards max line and byte limits" do
+      parent = self()
+
+      transport = fn encoded ->
+        {:ok, request} = Jason.decode(encoded)
+        send(parent, {:tool_call, request["tool"], request["input"]})
+        {:ok, %{"ok" => true, "result" => %{"events" => []}}}
+      end
+
+      opts = [transport: transport, max_lines: 5, max_bytes: 1024]
+
+      FabricGateway.Uds.task_tail("/tmp/fake.sock", @session, "pq", "pqt", opts)
+
+      assert_received {:tool_call, "fabric_task_tail",
+                       %{
+                         "queueId" => "pq",
+                         "queueTaskId" => "pqt",
+                         "maxLines" => 5,
+                         "maxBytes" => 1024
+                       }}
+    end
+
+    test "patch_review_plan calls project_queue_patch_review_plan" do
+      parent = self()
+
+      transport = fn encoded ->
+        {:ok, request} = Jason.decode(encoded)
+        send(parent, {:tool_call, request["tool"], request["input"]})
+
+        {:ok,
+         %{
+           "ok" => true,
+           "result" => %{
+             "schema" => "agent-fabric.project-queue-patch-review-plan.v1",
+             "entries" => [%{"queueTaskId" => "pqt_1", "status" => "patch_ready"}]
+           }
+         }}
+      end
+
+      opts = [transport: transport]
+
+      assert {:ok, result} =
+               FabricGateway.Uds.patch_review_plan("/tmp/fake.sock", @session, "pqueue_1", opts)
+
+      assert result["schema"] == "agent-fabric.project-queue-patch-review-plan.v1"
+      assert length(result["entries"]) == 1
+      assert_received {:tool_call, "project_queue_patch_review_plan", %{"queueId" => "pqueue_1"}}
+    end
+
+    test "collab_summary calls project_queue_collab_summary" do
+      parent = self()
+
+      transport = fn encoded ->
+        {:ok, request} = Jason.decode(encoded)
+        send(parent, {:tool_call, request["tool"], request["input"]})
+
+        {:ok,
+         %{
+           "ok" => true,
+           "result" => %{
+             "schema" => "agent-fabric.project-queue-collab-summary.v1",
+             "groups" => [%{"queueTask" => %{"queueTaskId" => "pqtask_1"}}]
+           }
+         }}
+      end
+
+      assert {:ok, result} =
+               FabricGateway.Uds.collab_summary("/tmp/fake.sock", @session, "pqueue_1",
+                 transport: transport
+               )
+
+      assert result["schema"] == "agent-fabric.project-queue-collab-summary.v1"
+      assert_received {:tool_call, "project_queue_collab_summary", %{"queueId" => "pqueue_1"}}
+    end
+  end
 end

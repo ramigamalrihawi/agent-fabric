@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { FabricError } from "./errors.js";
 import { formatLocalConfigDoctor, runLocalConfigDoctor } from "./local-config-doctor.js";
 import { defaultMaxEventsPerLane, seniorDefaultLaneCount, seniorMaxLaneCount } from "./limits.js";
-import { applyPatchWithSystemPatch, checkPatchWithSystemPatch, validateGitStylePatch } from "./patches.js";
+import { applyPatchWithSystemPatch, checkPatchWithSystemPatch, computePatchDiffStats, validateGitStylePatch } from "./patches.js";
 
 type WorkerKind =
   | "ramicode"
@@ -471,6 +471,21 @@ export type ProjectCliCommand =
       grantKind: string;
       value: string;
       status: "approved" | "rejected";
+    }
+  | {
+      command: "merge-worker";
+      json: boolean;
+      queueId: string;
+      queueTaskId?: string;
+      workerRunId?: string;
+      taskId?: string;
+      applyCwd?: string;
+      agent?: string;
+      apply?: boolean;
+      cwd?: string;
+      runTests?: boolean;
+      reviewedBy?: string;
+      reviewSummary?: string;
     }
   | { command: "help"; json: boolean };
 
@@ -1661,6 +1676,41 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
     };
   }
 
+  if (command === "merge-worker") {
+    const flags = parseFlags(args);
+    const hasRef = !!(flags.queueTaskId || flags.workerRunId || flags.taskId);
+    const isDryRun = hasRef && !flags.apply;
+    if (isDryRun) {
+      if (!hasRef) {
+        throw new FabricError("INVALID_INPUT", "merge-worker requires one of --queue-task, --worker-run, or --task for dry-run", false);
+      }
+      return {
+        command: "merge-worker",
+        json: flags.json,
+        queueId: required(flags.queueId, "merge-worker requires --queue <id>"),
+        queueTaskId: flags.queueTaskId,
+        workerRunId: flags.workerRunId,
+        taskId: flags.taskId,
+        applyCwd: flags.applyCwd
+      };
+    }
+    const apply = flags.apply;
+    if (apply && (!flags.reviewedBy || !flags.reviewSummary)) {
+      throw new FabricError("INVALID_INPUT", "merge-worker --apply requires --reviewed-by <name> and --review-summary <text> for senior review metadata", false);
+    }
+    return {
+      command: "merge-worker",
+      json: flags.json,
+      queueId: required(flags.queueId, "merge-worker requires --queue <id>"),
+      agent: required(flags.agent, "merge-worker requires --agent <@af/handle>"),
+      apply,
+      cwd: flags.cwd,
+      runTests: flags.runTests,
+      reviewedBy: flags.reviewedBy,
+      reviewSummary: flags.reviewSummary
+    };
+  }
+
   throw new FabricError("INVALID_INPUT", `Unknown project CLI command: ${command}`, false);
 }
 
@@ -1996,6 +2046,12 @@ export async function runProjectCommand(
   if (command.command === "set-tool-policy") {
     return setToolPolicy(command, call);
   }
+  if (command.command === "merge-worker") {
+    if (command.queueTaskId || command.workerRunId || command.taskId) {
+      return mergeWorkerDryRun(command, call);
+    }
+    return mergeWorker(command, call);
+  }
   return decideToolProposal(command, call);
 }
 
@@ -2070,6 +2126,7 @@ export function projectHelp(): string {
     "  agent-fabric-project approve-tool <proposalId> [--remember] [--note <text>] [--json]",
     "  agent-fabric-project decide-tool <proposalId> --decision approve|reject|revise [--remember] [--note <text>] [--json]",
     "  agent-fabric-project set-tool-policy --project <path> --kind mcp_server|tool|memory|context --value <value> --status approved|rejected [--json]",
+    "  agent-fabric-project merge-worker --queue <id> --queue-task <queueTaskId>|--worker-run <workerRunId>|--task-id <fabricTaskId> [--apply-cwd <path>] [--json]",
     "",
     `Environment: set ${SENIOR_MODE_ENV}=permissive to default worker execution to queue-backed ${SENIOR_DEFAULT_WORKER} lanes (${SENIOR_DEFAULT_WORKSPACE_MODE}, ${SENIOR_DEFAULT_MODEL_PROFILE}, ${SENIOR_DEFAULT_LANE_COUNT} parallel lanes) and allow task-relevant sensitive context for DeepSeek workers by default. Set ${SENIOR_DEFAULT_WORKER_ENV}=jcode-deepseek locally when large implementation lanes should use Jcode by default.`,
     `Escape hatch: set ${SENIOR_ALLOW_NON_DEEPSEEK_WORKERS_ENV}=1 only when a human explicitly wants non-DeepSeek worker execution in Senior mode.`
@@ -2833,6 +2890,10 @@ async function applyReviewedPatch(
     includeCheckpoints: true
   });
   const candidate = resolveReviewedPatchCandidate(task, fabricStatus);
+  const candidateWorkerRunId = candidate.workerRunId;
+  if (!candidateWorkerRunId) {
+    throw new FabricError("PATCH_NOT_APPLYABLE", "No worker run is available for reviewed patch application", false);
+  }
   if (candidate.structuredResult?.patchMode !== "write") {
     throw new FabricError("PATCH_NOT_APPLYABLE", "review-patches --apply-patch requires a worker artifact from --patch-mode write", false);
   }
@@ -2843,7 +2904,7 @@ async function applyReviewedPatch(
   const patchApply = await applyPatchWithSystemPatch(patch, cwd);
   await call("fabric_task_event", {
     taskId: task.fabricTaskId,
-    workerRunId: candidate.workerRunId,
+    workerRunId: candidateWorkerRunId,
     kind: "checkpoint",
     body: `Applied reviewed patch ${patchFile}.`,
     metadata: {
@@ -2857,7 +2918,7 @@ async function applyReviewedPatch(
   });
   await call("fabric_task_checkpoint", {
     taskId: task.fabricTaskId,
-    workerRunId: candidate.workerRunId,
+    workerRunId: candidateWorkerRunId,
     summary: {
       currentGoal: task.goal,
       filesTouched: uniqueStrings([...stringArray(task.patchRefs), patchFile]),
@@ -2874,7 +2935,7 @@ async function applyReviewedPatch(
   });
   await call("fabric_task_finish", {
     taskId: task.fabricTaskId,
-    workerRunId: candidate.workerRunId,
+    workerRunId: candidateWorkerRunId,
     status: "completed",
     summary: `Applied reviewed patch ${patchFile}.`,
     patchRefs: uniqueStrings([...stringArray(task.patchRefs), patchFile]),
@@ -2883,7 +2944,7 @@ async function applyReviewedPatch(
   return {
     queueTaskId: task.queueTaskId,
     fabricTaskId: task.fabricTaskId,
-    workerRunId: candidate.workerRunId,
+    workerRunId: candidateWorkerRunId,
     patchFile,
     cwd,
     patchApply
@@ -2892,15 +2953,16 @@ async function applyReviewedPatch(
 
 function resolveReviewedPatchCandidate(
   task: QueueTask,
-  fabricStatus: FabricTaskStatusResult
-): { workerRunId: string; patchFile: string; workspacePath?: string; structuredResult?: StructuredWorkerResult } {
+  fabricStatus: FabricTaskStatusResult,
+  options: { requireWorkerRun?: boolean } = {}
+): { workerRunId?: string; patchFile: string; workspacePath?: string; structuredResult?: StructuredWorkerResult } {
   const structured = latestStructuredResultFromCheckpoints(fabricStatus);
   const patchFile = structured?.patchFile ?? stringArray(task.patchRefs).find((ref) => ref.endsWith(".patch"));
   if (!patchFile) {
     throw new FabricError("PATCH_NOT_APPLYABLE", "No reviewed patch file is available for this task", false);
   }
   const workerRunId = checkpointWorkerRunIdForStructuredResult(fabricStatus, structured) ?? task.assignedWorkerRunId;
-  if (!workerRunId) {
+  if (!workerRunId && options.requireWorkerRun !== false) {
     throw new FabricError("PATCH_NOT_APPLYABLE", "No worker run is available for reviewed patch application", false);
   }
   const workspacePath = fabricStatus.workerRuns?.find((run) => run.workerRunId === workerRunId)?.workspacePath;
@@ -3980,6 +4042,280 @@ async function setToolPolicy(
     action: "tool_context_policy_set",
     message: `Set ${command.grantKind}:${command.value} to ${command.status} for ${command.projectPath}.`,
     data: result
+  };
+}
+
+async function mergeWorkerDryRun(
+  command: Extract<ProjectCliCommand, { command: "merge-worker" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const status = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  let task: QueueTask | undefined;
+  if (command.queueTaskId) {
+    task = status.tasks.find((entry) => entry.queueTaskId === command.queueTaskId);
+  } else if (command.workerRunId) {
+    task = status.tasks.find((entry) => entry.assignedWorkerRunId === command.workerRunId);
+  } else if (command.taskId) {
+    task = status.tasks.find((entry) => entry.fabricTaskId === command.taskId);
+  }
+  if (!task) {
+    throw new FabricError("PROJECT_QUEUE_TASK_NOT_FOUND", "No queue task matched the merge-worker dry-run reference", false);
+  }
+  if (!task.fabricTaskId) {
+    throw new FabricError("FABRIC_TASK_NOT_FOUND", `Queue task has no linked fabric task: ${task.queueTaskId}`, false);
+  }
+  if (!["patch_ready", "review", "accepted"].includes(task.status)) {
+    throw new FabricError("PATCH_NOT_APPLYABLE", `Task ${task.queueTaskId} is not patch-ready`, false);
+  }
+
+  const fabricStatus = await call<FabricTaskStatusResult>("fabric_task_status", {
+    taskId: task.fabricTaskId,
+    includeEvents: true,
+    includeCheckpoints: true
+  });
+  const candidate = resolveReviewedPatchCandidate(task, fabricStatus);
+  const cwd = command.applyCwd ?? candidate.workspacePath ?? fabricStatus.projectPath ?? status.queue.projectPath;
+  const patchFile = resolveReviewPatchFile(candidate.patchFile, cwd);
+  if (!existsSync(patchFile)) {
+    throw new FabricError("PATCH_ARTIFACT_MISSING", `PATCH_ARTIFACT_MISSING: Patch artifact not found: ${patchFile}`, false);
+  }
+  const patch = readFileSync(patchFile, "utf8");
+  validateGitStylePatch(patch, cwd);
+
+  let conflictCheck: Record<string, unknown> | undefined;
+  let conflictMessage: string | undefined;
+  try {
+    conflictCheck = await checkPatchWithSystemPatch(patch, cwd);
+  } catch (error) {
+    conflictMessage = error instanceof Error ? error.message : String(error);
+  }
+  const diffStats = computePatchDiffStats(patch);
+  const clean = conflictMessage === undefined;
+  const nextCommand = clean
+    ? `agent-fabric-project review-patches --queue ${command.queueId} --accept-task ${task.queueTaskId} --apply-patch --apply-cwd ${cwd}`
+    : `Review conflicts for ${patchFile}`;
+
+  return {
+    action: clean ? "merge_worker_clean" : "merge_worker_conflicts_detected",
+    message: [
+      `merge-worker --dry-run for ${task.queueTaskId}`,
+      `Patch: ${patchFile}`,
+      `CWD: ${cwd}`,
+      `Diff stats: ${diffStats.filesChanged} files, +${diffStats.insertions} -${diffStats.deletions}`,
+      clean ? "Clean: no conflicts detected." : `Conflicts detected: ${conflictMessage}`,
+      `Next: ${nextCommand}`
+    ].join("\n"),
+    data: {
+      queueId: command.queueId,
+      queueTaskId: task.queueTaskId,
+      fabricTaskId: task.fabricTaskId,
+      workerRunId: candidate.workerRunId,
+      cwd,
+      patchFile,
+      clean,
+      conflictsDetected: !clean,
+      conflictMessage,
+      conflictCheck,
+      diffStats,
+      nextCommands: [nextCommand]
+    }
+  };
+}
+
+async function mergeWorker(
+  command: Extract<ProjectCliCommand, { command: "merge-worker" }>,
+  call: ProjectToolCaller
+): Promise<ProjectRunResult> {
+  const status = await call<QueueStatus>("project_queue_status", { queueId: command.queueId });
+  const agentId = command.agent!;
+
+  let task: QueueTask | undefined;
+  if (agentId.startsWith("@af/")) {
+    try {
+      const agent = await call<Record<string, unknown>>("fabric_open_agent", {
+        queueId: command.queueId,
+        agent: agentId,
+        maxEventsPerRun: 5
+      });
+      const detail = objectFrom(agent.detail);
+      const resolvedTask = objectFrom(detail.task);
+      const queueTaskId = stringFrom(resolvedTask.queueTaskId);
+      if (queueTaskId) {
+        task = status.tasks.find((entry) => entry.queueTaskId === queueTaskId);
+      }
+    } catch {
+      // Fall back to direct task lookup
+    }
+  }
+  if (!task) {
+    task = status.tasks.find((entry) => entry.queueTaskId === agentId);
+  }
+  if (!task) {
+    task = status.tasks.find((entry) =>
+      entry.title === agentId || entry.summary === agentId || (entry.assignedWorkerRunId === agentId)
+    );
+  }
+  if (!task) {
+    throw new FabricError("MERGE_WORKER_NO_TASK", `Agent ${agentId} has no associated queue task`, false);
+  }
+  const queueTaskId = task.queueTaskId;
+  if (!task.fabricTaskId) {
+    throw new FabricError("FABRIC_TASK_NOT_FOUND", `Queue task has no linked fabric task: ${queueTaskId}`, false);
+  }
+  const fabricStatus = await call<FabricTaskStatusResult>("fabric_task_status", {
+    taskId: task.fabricTaskId,
+    includeEvents: true,
+    includeCheckpoints: true
+  });
+  const candidate = resolveReviewedPatchCandidate(task, fabricStatus, { requireWorkerRun: false });
+  const cwd = command.cwd ?? candidate.workspacePath ?? fabricStatus.projectPath ?? status.queue.projectPath;
+  if (!cwd) {
+    throw new FabricError("MERGE_WORKER_NO_CWD", `No workspace or --cwd available for agent ${agentId}`, false);
+  }
+  if (!existsSync(cwd)) {
+    throw new FabricError("MERGE_WORKER_CWD_MISSING", `Workspace cwd does not exist: ${cwd}`, false);
+  }
+
+  const patchPath = resolveReviewPatchFile(candidate.patchFile, cwd);
+  if (!existsSync(patchPath)) {
+    throw new FabricError("PATCH_ARTIFACT_MISSING", `PATCH_ARTIFACT_MISSING: Patch artifact not found: ${patchPath}`, false);
+  }
+  const patch = readFileSync(patchPath, "utf8");
+  validateGitStylePatch(patch, cwd);
+
+  let dryRun: Record<string, unknown> | undefined;
+  let conflictMessage: string | undefined;
+  try {
+    dryRun = await checkPatchWithSystemPatch(patch, cwd);
+  } catch (error) {
+    conflictMessage = error instanceof Error ? error.message : String(error);
+  }
+
+  let testResults: Record<string, unknown> | undefined;
+  const testRefs = stringArray(task.testRefs).filter((ref): ref is string => typeof ref === "string");
+  if (command.runTests && testRefs.length > 0) {
+    const testOutputs: Array<{ command: string; exitCode: number; stdout: string; stderr: string }> = [];
+    for (const testCmd of testRefs) {
+      try {
+        const result = await runShellCommand(testCmd, cwd, 8_000, undefined, {}, {});
+        testOutputs.push({
+          command: testCmd,
+          exitCode: result.exitCode ?? -1,
+          stdout: tailText(result.stdout ?? "", 4_000),
+          stderr: tailText(result.stderr ?? "", 4_000)
+        });
+      } catch (error) {
+        testOutputs.push({
+          command: testCmd,
+          exitCode: -1,
+          stdout: "",
+          stderr: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+    testResults = { outputs: testOutputs, allPassed: testOutputs.every((entry) => entry.exitCode === 0) };
+  }
+
+  if (command.apply) {
+    const reviewedBy = command.reviewedBy as string;
+    const reviewSummary = command.reviewSummary as string;
+
+    if (conflictMessage) {
+      throw new FabricError("MERGE_WORKER_CONFLICTS", conflictMessage, false);
+    }
+
+    if (testResults && !testResults.allPassed) {
+      return {
+        action: "merge_worker_test_failed",
+        message: `Test failures prevent merge-worker apply for ${agentId}. Fix tests before applying.`,
+        data: {
+          queueId: command.queueId,
+          agent: agentId,
+          queueTaskId,
+          cwd,
+          patchFile: patchPath,
+          dryRun: dryRun ?? {},
+          testResults,
+          applyBlocked: true,
+          blockReason: "test_failures"
+        }
+      };
+    }
+
+    const patchApply = await applyPatchWithSystemPatch(patch, cwd);
+
+    let acceptResult: Record<string, unknown> = {};
+    try {
+      acceptResult = await call<Record<string, unknown>>("fabric_accept_patch", {
+        queueId: command.queueId,
+        agent: agentId,
+        reviewedBy,
+        reviewSummary
+      });
+    } catch {
+      await call("project_queue_update_task", {
+        queueId: command.queueId,
+        queueTaskId,
+        status: "accepted",
+        summary: `Accepted patch from ${agentId}. Reviewed by ${reviewedBy}: ${reviewSummary}`,
+        patchRefs: uniqueStrings([...stringArray(task.patchRefs), candidate.patchFile]),
+        testRefs: stringArray(task.testRefs).filter((ref): ref is string => typeof ref === "string")
+      });
+      acceptResult = { accepted: true, queueTaskId };
+    }
+
+    return {
+      action: "merge_worker_applied",
+      message: `Applied and accepted merge-worker patch for ${agentId}. Reviewed by ${reviewedBy}: ${reviewSummary}.${testResults ? ` Tests: ${testResults.allPassed ? "passed" : "failed"}.` : ""}`,
+      data: {
+        queueId: command.queueId,
+        agent: agentId,
+        queueTaskId,
+        cwd,
+        patchFile: patchPath,
+        dryRun: dryRun ?? {},
+        patchApply,
+        testResults,
+        acceptance: acceptResult
+      }
+    };
+  }
+
+  if (conflictMessage) {
+    return {
+      action: "merge_worker_conflicts_detected",
+      message: `Merge-worker dry-run for ${agentId}: CONFLICTS DETECTED: ${conflictMessage}`,
+      data: {
+        queueId: command.queueId,
+        agent: agentId,
+        queueTaskId,
+        cwd,
+        patchFile: patchPath,
+        dryRun: dryRun ?? {},
+        clean: false,
+        conflictsDetected: true,
+        conflictMessage,
+        testResults,
+        readyToApply: false
+      }
+    };
+  }
+
+  return {
+    action: "merge_worker_dry_run",
+    message: `Merge-worker dry-run for ${agentId}: patch ${patchPath} checked cleanly.${testResults ? ` Tests: ${testResults.allPassed ? "passed" : "failed"}.` : ""}`,
+    data: {
+      queueId: command.queueId,
+      agent: agentId,
+      queueTaskId,
+      cwd,
+      patchFile: patchPath,
+      dryRun: dryRun ?? {},
+      clean: true,
+      conflictsDetected: false,
+      testResults,
+      readyToApply: !testResults || testResults.allPassed
+    }
   };
 }
 
@@ -5930,6 +6266,7 @@ type ParsedFlags = {
   queueId?: string;
   task?: string;
   taskFile?: string;
+  taskId?: string;
   planFile?: string;
   maxRounds?: number;
   budgetUsd?: number;
@@ -6013,6 +6350,7 @@ type ParsedFlags = {
   progressFile?: string;
   reviewedBy?: string;
   reviewSummary?: string;
+  runTests?: boolean;
   reason?: string;
   note?: string;
   rewriteContextRefs?: string[];
@@ -6066,6 +6404,7 @@ function parseFlags(args: string[]): ParsedFlags {
     else if (arg === "--max-agents") flags.maxAgents = positiveInt(requiredValue(args, ++i, arg), "max-agents");
     else if (arg === "--queue") flags.queueId = requiredValue(args, ++i, arg);
     else if (arg === "--task") flags.task = requiredValue(args, ++i, arg);
+    else if (arg === "--task-id") flags.taskId = requiredValue(args, ++i, arg);
     else if (arg === "--task-file") flags.taskFile = requiredValue(args, ++i, arg);
     else if (arg === "--plan-file") flags.planFile = requiredValue(args, ++i, arg);
     else if (arg === "--max-rounds") flags.maxRounds = positiveInt(requiredValue(args, ++i, arg), "max-rounds");
@@ -6153,6 +6492,7 @@ function parseFlags(args: string[]): ParsedFlags {
     else if (arg === "--rewrite-context-ref") flags.rewriteContextRefs = [...(flags.rewriteContextRefs ?? []), requiredValue(args, ++i, arg)];
     else if (arg === "--remember") flags.remember = true;
     else if (arg === "--note") flags.note = requiredValue(args, ++i, arg);
+    else if (arg === "--run-tests") flags.runTests = true;
     else if (arg.startsWith("-")) throw new FabricError("INVALID_INPUT", `Unknown flag: ${arg}`, false);
     else if (!flags.proposalId) flags.proposalId = arg;
     else throw new FabricError("INVALID_INPUT", `Unexpected argument: ${arg}`, false);

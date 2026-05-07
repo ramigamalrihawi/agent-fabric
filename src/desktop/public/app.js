@@ -874,6 +874,7 @@ function renderDashboard() {
       ${metric("Workers", `${dashboard.activeWorkers || 0}/${dashboard.queue?.maxParallelAgents || 0}`, "active/max")}
       ${metric("Risk", summary.risk?.highestOpenRisk || "none", `${summary.risk?.highRiskOpenCount || 0} high`)}
       ${metric("Estimate", money(summary.cost?.estimatedCostUsd || 0), `${summary.cost?.preflightCount || 0} preflights`)}
+      ${workerCostCoverageMetric()}
     </div>
     ${operatorBriefPanelHtml()}
     ${liveLanesPanelHtml()}
@@ -3052,6 +3053,15 @@ function liveLaneCardHtml(lane = {}) {
   const handle = codexLaneHandle(lane);
   const workerDetail = [run.worker || "worker", run.modelProfile, run.workspaceMode].filter(Boolean).join(" / ");
   const summary = progress.summary || checkpointSummary.nextAction || lane.latestEvent?.body || "Waiting for worker events.";
+  const laneCost = lane.cost || {};
+  const costText = laneCost.totalCostUsd > 0 ? `$${Number(laneCost.totalCostUsd).toFixed(4)}` : (laneCost.coverageWarning ? "no cost data" : "");
+  const costPill = laneCost.totalCostUsd > 0
+    ? `<span class="pill green">${esc(costText)}</span>`
+    : laneCost.coverageWarning
+      ? `<span class="pill amber" title="${esc(laneCost.coverageWarning)}">no cost</span>`
+      : laneCost.eventCount > 0
+        ? `<span class="pill">no cost</span>`
+        : "";
   return `
     <div class="live-lane-card ${activity.severity}">
       <div class="live-lane-card-head">
@@ -3063,6 +3073,7 @@ function liveLaneCardHtml(lane = {}) {
         <div class="live-lane-pills">
           <span class="pill ${statusClass(status)}">${esc(progress.label || run.status || task.status || "active")}</span>
           <span class="pill ${activity.severity}">${esc(activity.label)}</span>
+          ${costPill}
         </div>
       </div>
       <div class="live-lane-progress" aria-label="Lane progress"><span style="width: ${percent}%"></span></div>
@@ -3243,6 +3254,25 @@ function costRiskStripHtml() {
         <button data-action-tab="approvals" type="button">Model Approvals</button>
         ${firstRequest ? `<button data-cost-inspect-request data-request-id="${esc(firstRequest)}" type="button">Inspect Context</button>` : ""}
       </div>
+    </div>
+  `;
+}
+
+function workerCostCoverageMetric() {
+  const dashboard = state.dashboard || {};
+  const summary = dashboard.summaryStrip || {};
+  const cost = summary.cost || {};
+  const byRole = cost.byRole || {};
+  const roleKeys = Object.keys(byRole);
+  if (!roleKeys.length) return "";
+  const workerCost = Number(byRole.worker?.costUsd || 0);
+  const warnings = cost.roleWarnings || [];
+  const label = "Worker Cost";
+  const detail = warnings.length ? warnings.join(", ") : (workerCost > 0 ? `$${workerCost.toFixed(4)} tracked` : "No worker cost recorded");
+  return `
+    <div class="metric">
+      <div class="metric-value">$${workerCost.toFixed(4)}</div>
+      <div class="metric-label" title="${esc(detail)}">${esc(label)} - ${esc(detail.slice(0, 60))}</div>
     </div>
   `;
 }
@@ -4162,6 +4192,7 @@ function renderTaskDetail() {
   const task = detail.task || {};
   const readiness = detail.readiness || {};
   const graph = detail.graph || {};
+  const taskCost = detail.cost || {};
   root.innerHTML = `
     <div class="panel">
       <div class="section-head">
@@ -4191,6 +4222,7 @@ function renderTaskDetail() {
       </div>
       <div id="task-context-result"></div>
       ${taskBriefPanelHtml(detail)}
+      ${taskCostHtml(taskCost)}
       <div class="grid detail-grid">
         ${detailPanel("Acceptance", listItems(task.acceptanceCriteria))}
         ${detailPanel("Dependencies", linkItems(graph.dependencies))}
@@ -4398,6 +4430,40 @@ function taskBriefData(detail = state.taskDetail || {}) {
   };
 }
 
+function taskCostHtml(cost = {}) {
+  const sourceLabel = cost.sourceLabel || "none";
+  const totalCostUsd = Number(cost.totalCostUsd || 0);
+  const byRole = cost.byRole || {};
+  const eventCount = Number(cost.eventCount || 0);
+  const eventsWithCost = Number(cost.eventsWithCost || 0);
+  const coverageWarning = cost.coverageWarning || null;
+  const roles = Object.keys(byRole);
+  let severity = "blue";
+  if (totalCostUsd > 0) severity = "green";
+  if (coverageWarning) severity = "amber";
+  const roleLines = roles.map((role) => {
+    const entry = byRole[role] || {};
+    return `<div class="checkline"><span class="pill">${esc(role)}</span> <strong>$${Number(entry.costUsd || 0).toFixed(6)}</strong> <span class="muted">(${num(entry.count)} events)</span></div>`;
+  });
+  return `
+    <div class="cost-risk-strip ${severity}">
+      <div class="cost-risk-main">
+        <div class="section-head compact-head">
+          <h2>Cost</h2>
+          <span class="pill ${severity}">${esc(cost.sourceLabel || "none")}</span>
+        </div>
+        <div class="grid metrics" style="margin-bottom:4px">
+          ${metric("Total Cost", `$${totalCostUsd.toFixed(6)}`, `${eventsWithCost} of ${eventCount} events with cost`)}
+          ${metric("Events", eventCount, "total worker events")}
+          ${roles.length ? metric("Roles", roles.length, roles.join(", ")) : ""}
+        </div>
+        ${roleLines.length ? `<div style="display:flex;flex-wrap:wrap;gap:6px">${roleLines.join("")}</div>` : ""}
+        ${coverageWarning ? `<div class="muted" style="margin-top:6px">Coverage: ${esc(coverageWarning)}</div>` : eventCount > 0 && eventsWithCost === eventCount ? `<div class="muted" style="margin-top:6px">All ${eventCount} events report cost data.</div>` : ""}
+      </div>
+    </div>
+  `;
+}
+
 function taskBriefText(mode = "worker", options = {}) {
   const detail = state.taskDetail || {};
   const data = taskBriefData(detail);
@@ -4453,6 +4519,31 @@ function taskBriefText(mode = "worker", options = {}) {
       `- Next action: ${checkpointSummary.nextAction || checkpointSummary.summary || ""}`,
       ""
     );
+  }
+
+  const taskCost = detail.cost || {};
+  if (taskCost.sourceLabel !== "none" || taskCost.coverageWarning) {
+    lines.push(`Task cost: $${Number(taskCost.totalCostUsd || 0).toFixed(6)} (source: ${taskCost.sourceLabel || "none"})`);
+    const byRole = taskCost.byRole || {};
+    const roleKeys = Object.keys(byRole);
+    for (const role of roleKeys) {
+      const entry = byRole[role] || {};
+      lines.push(`  ${role}: $${Number(entry.costUsd || 0).toFixed(6)} (${num(entry.count)} events)`);
+    }
+    if (taskCost.coverageWarning) {
+      lines.push(`Coverage: ${taskCost.coverageWarning}`);
+    }
+    lines.push("");
+  }
+
+  if (latestRun) {
+    const runCost = latestRun.cost || {};
+    if (runCost.sourceLabel !== "none" && runCost.sourceLabel !== "none") {
+      lines.push(`Latest run cost: $${Number(runCost.totalCostUsd || 0).toFixed(6)}`);
+    }
+    if (runCost.coverageWarning) {
+      lines.push(`Run coverage: ${runCost.coverageWarning}`);
+    }
   }
 
   if (mode === "review" || mode === "recovery") {
@@ -5245,6 +5336,20 @@ function laneBriefText(lane = {}) {
     lines.push("Recent events:");
     for (const item of events.slice(0, 8)) {
       lines.push(`- ${item.kind || item.summary || "event"}${item.body ? `: ${item.body}` : ""}`);
+    }
+    lines.push("");
+  }
+  const laneCost = lane.cost || {};
+  if (laneCost.sourceLabel !== "none" || laneCost.coverageWarning) {
+    lines.push(`Cost: $${Number(laneCost.totalCostUsd || 0).toFixed(6)} (source: ${laneCost.sourceLabel || "none"})`);
+    const byRole = laneCost.byRole || {};
+    const roleKeys = Object.keys(byRole);
+    for (const role of roleKeys) {
+      const entry = byRole[role] || {};
+      lines.push(`  ${role}: $${Number(entry.costUsd || 0).toFixed(6)} (${num(entry.count)} events)`);
+    }
+    if (laneCost.coverageWarning) {
+      lines.push(`Coverage: ${laneCost.coverageWarning}`);
     }
     lines.push("");
   }

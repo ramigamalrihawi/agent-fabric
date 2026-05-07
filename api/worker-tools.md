@@ -119,6 +119,7 @@ Append one worker event. This is the core write path for OpenHands/Local CLI wor
     | "started"
     | "thought_summary"
     | "file_changed"
+    | "command_spawned"
     | "command_started"
     | "command_finished"
     | "test_result"
@@ -143,6 +144,24 @@ Append one worker event. This is the core write path for OpenHands/Local CLI wor
   workerRunId: string;
 }
 ```
+
+For `command_started` and `command_finished` events emitted by shell-backed workers (`run-task`, `run-ready`, `factory-run`, Senior lanes), the metadata SHOULD include:
+
+```ts
+{
+  cwd: string;              // working directory
+  pid?: number;             // process id of the spawned shell
+  command?: string;         // the command line executed
+  exitCode?: number;        // command exit code (command_finished only)
+  durationMs?: number;      // elapsed wall-clock ms (command_finished only)
+  stdoutTail?: string;      // bounded tail of stdout (command_finished only)
+  stderrTail?: string;      // bounded tail of stderr (command_finished only)
+  stdoutLogPath?: string;   // path to persisted stdout log file (command_finished only)
+  stderrLogPath?: string;   // path to persisted stderr log file (command_finished only)
+}
+```
+
+Log files are written under `.agent-fabric/logs/` in the worker workspace directory with the pattern `<queueTaskId>-<workerRunId>-stdout.log` and `<queueTaskId>-<workerRunId>-stderr.log`. Log file content is bounded to the same `maxOutputChars` limit as the in-memory tails and does not contain environment variable dumps or secret material. Log persistence is best-effort; consumers should gracefully handle missing log paths.
 
 ## `fabric_task_checkpoint`
 
@@ -239,6 +258,45 @@ Read current task and worker state.
 ```
 
 `fabric_task_status` is read-only. It can include events and checkpoints when requested; queue views should leave both false.
+
+## `fabric_task_tail`
+
+Read a bounded recent tail of worker events and checkpoints without returning a full task/session dump.
+
+**Input:**
+
+```ts
+{
+  workerRunId?: string;
+  taskId?: string;
+  queueId?: string;
+  queueTaskId?: string;
+  maxLines?: number; // default 200, capped at 200
+  maxBytes?: number; // default 65536, capped at 65536
+}
+```
+
+Exactly one lookup mode must be supplied: `workerRunId`, `taskId`, or `queueId` plus `queueTaskId`.
+
+**Output:**
+
+```ts
+{
+  resolveMode: "workerRunId" | "taskId" | "queueId";
+  taskId: string;
+  workerRunId?: string;
+  events: unknown[];
+  checkpoints: unknown[];
+  truncated: boolean;
+  limits: { maxLines: number; maxBytes: number };
+  eventCount: number;
+  checkpointCount: number;
+  totalEventCount: number;
+  totalCheckpointCount: number;
+}
+```
+
+`fabric_task_tail` is read-only. Rows are newest-first, line/byte bounded, workspace scoped, and structured metadata paths outside the caller workspace are redacted.
 
 ## `fabric_task_resume`
 

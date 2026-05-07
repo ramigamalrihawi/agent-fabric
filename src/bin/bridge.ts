@@ -797,6 +797,14 @@ proxyTool("fabric_task_finish", "Mark a durable fabric task completed, failed, o
   testRefs: z.array(z.string()).optional(),
   followups: z.array(z.string()).optional()
 });
+proxyTool("fabric_task_tail", "Tail worker events and checkpoints by workerRunId, taskId, or queueId+queueTaskId with bounded read-only output.", {
+  workerRunId: z.string().optional(),
+  taskId: z.string().optional(),
+  queueId: z.string().optional(),
+  queueTaskId: z.string().optional(),
+  maxLines: z.number().int().positive().optional(),
+  maxBytes: z.number().int().positive().optional()
+});
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

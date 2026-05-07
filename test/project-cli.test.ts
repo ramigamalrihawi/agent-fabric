@@ -2536,6 +2536,480 @@ describe("project CLI runner", () => {
     expect(readFileSync(join(projectPath, "deepseek-args.txt"), "utf8")).toContain(`--fabric-task\n${task.fabricTaskId}`);
     daemon.close();
   });
+
+  it("parses merge-worker command and enforces review metadata for --apply", () => {
+    expect(parseProjectCliArgs([
+      "merge-worker", "--queue", "pqueue_1", "--agent", "@af/rami-abc123", "--json"
+    ])).toMatchObject({
+      command: "merge-worker",
+      queueId: "pqueue_1",
+      agent: "@af/rami-abc123",
+      apply: false,
+      json: true
+    });
+
+    expect(parseProjectCliArgs([
+      "merge-worker", "--queue", "pqueue_1", "--agent", "@af/rami-abc123",
+      "--apply", "--reviewed-by", "Codex", "--review-summary", "Reviewed.", "--run-tests"
+    ])).toMatchObject({
+      command: "merge-worker",
+      queueId: "pqueue_1",
+      agent: "@af/rami-abc123",
+      apply: true,
+      runTests: true,
+      reviewedBy: "Codex",
+      reviewSummary: "Reviewed."
+    });
+
+    expect(() =>
+      parseProjectCliArgs([
+        "merge-worker", "--queue", "pqueue_1", "--agent", "@af/rami-abc123", "--apply"
+      ])
+    ).toThrow("merge-worker --apply requires --reviewed-by");
+  });
+
+  it("merge-worker dry-run validates patch and returns conflict info", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-project-cli-merge-dry-"));
+    const tasksFile = join(projectPath, "tasks.json");
+    writeFileSync(
+      tasksFile,
+      JSON.stringify({
+        tasks: [
+          {
+            clientKey: "merge",
+            title: "Merge test task",
+            goal: "Produce a patch for merge.",
+            risk: "low",
+            priority: "normal",
+            expectedFiles: ["hello.txt"],
+            acceptanceCriteria: ["Patch applies cleanly."]
+          }
+        ]
+      })
+    );
+    const created = await runProjectCommand(
+      {
+        command: "create",
+        json: false,
+        projectPath,
+        promptSummary: "Merge dry-run test.",
+        pipelineProfile: "balanced",
+        maxParallelAgents: 4
+      },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    writeFileSync(join(projectPath, "hello.txt"), "old\n", "utf8");
+
+    const patch = [
+      "diff --git a/hello.txt b/hello.txt",
+      "--- a/hello.txt",
+      "+++ b/hello.txt",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new"
+    ].join("\n");
+    const patchFile = join(projectPath, "result.patch");
+    writeFileSync(patchFile, patch, "utf8");
+
+    await call("project_queue_update_task", {
+      queueId,
+      queueTaskId: task.queueTaskId,
+      status: "patch_ready",
+      summary: "Patch is ready.",
+      patchRefs: [patchFile],
+      testRefs: ["node -e \"process.exit(0)\""]
+    });
+
+    const agent = task.queueTaskId;
+
+    const dryRun = await runProjectCommand(
+      { command: "merge-worker", json: false, queueId, agent, apply: false, runTests: false, cwd: projectPath },
+      call
+    );
+    expect(dryRun.action).toBe("merge_worker_dry_run");
+    expect(readFileSync(join(projectPath, "hello.txt"), "utf8")).toBe("old\n");
+
+    const withTests = await runProjectCommand(
+      { command: "merge-worker", json: false, queueId, agent, apply: false, runTests: true, cwd: projectPath },
+      call
+    );
+    expect(withTests.data.readyToApply).toBe(true);
+
+    daemon.close();
+  });
+
+  it("merge-worker --apply applies patch and records acceptance", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-project-cli-merge-apply-"));
+    const tasksFile = join(projectPath, "tasks.json");
+    writeFileSync(
+      tasksFile,
+      JSON.stringify({
+        tasks: [
+          {
+            clientKey: "merge",
+            title: "Merge apply test task",
+            goal: "Produce a patch for merge apply.",
+            risk: "low",
+            priority: "normal",
+            expectedFiles: ["hello.txt"],
+            acceptanceCriteria: ["Patch applies cleanly."]
+          }
+        ]
+      })
+    );
+    const created = await runProjectCommand(
+      {
+        command: "create",
+        json: false,
+        projectPath,
+        promptSummary: "Merge apply test.",
+        pipelineProfile: "balanced",
+        maxParallelAgents: 4
+      },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    writeFileSync(join(projectPath, "hello.txt"), "old\n", "utf8");
+
+    const patch = [
+      "diff --git a/hello.txt b/hello.txt",
+      "--- a/hello.txt",
+      "+++ b/hello.txt",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new"
+    ].join("\n");
+    const patchFile = join(projectPath, "result.patch");
+    writeFileSync(patchFile, patch, "utf8");
+
+    await call("project_queue_update_task", {
+      queueId,
+      queueTaskId: task.queueTaskId,
+      status: "patch_ready",
+      summary: "Patch is ready.",
+      patchRefs: [patchFile],
+      testRefs: ["node -e \"process.exit(0)\""]
+    });
+
+    const agent = task.queueTaskId;
+
+    const apply = await runProjectCommand(
+      {
+        command: "merge-worker",
+        json: false,
+        queueId,
+        agent,
+        apply: true,
+        runTests: true,
+        cwd: projectPath,
+        reviewedBy: "Codex",
+        reviewSummary: "Tests pass, diff is correct."
+      },
+      call
+    );
+    expect(apply.action).toBe("merge_worker_applied");
+    expect(readFileSync(join(projectPath, "hello.txt"), "utf8")).toMatch("new");
+
+    const qs = await call<{ tasks: Array<{ queueTaskId: string; status: string }> }>("project_queue_status", { queueId });
+    const accepted = qs.tasks.find((entry) => entry.queueTaskId === task.queueTaskId);
+    expect(accepted?.status).toBe("accepted");
+
+    daemon.close();
+  });
+
+  it("merge-worker --apply blocks on test failure", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-project-cli-merge-testfail-"));
+    const tasksFile = join(projectPath, "tasks.json");
+    writeFileSync(
+      tasksFile,
+      JSON.stringify({
+        tasks: [
+          {
+            clientKey: "merge",
+            title: "Merge test-fail task",
+            goal: "Produce a patch for merge with failing tests.",
+            risk: "low",
+            priority: "normal",
+            expectedFiles: ["hello.txt"],
+            acceptanceCriteria: ["Tests must pass before applying."]
+          }
+        ]
+      })
+    );
+    const created = await runProjectCommand(
+      {
+        command: "create",
+        json: false,
+        projectPath,
+        promptSummary: "Merge test fail test.",
+        pipelineProfile: "balanced",
+        maxParallelAgents: 4
+      },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    writeFileSync(join(projectPath, "hello.txt"), "old\n", "utf8");
+
+    const patch = [
+      "diff --git a/hello.txt b/hello.txt",
+      "--- a/hello.txt",
+      "+++ b/hello.txt",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new"
+    ].join("\n");
+    const patchFile = join(projectPath, "result.patch");
+    writeFileSync(patchFile, patch, "utf8");
+
+    await call("project_queue_update_task", {
+      queueId,
+      queueTaskId: task.queueTaskId,
+      status: "patch_ready",
+      summary: "Patch is ready.",
+      patchRefs: [patchFile],
+      testRefs: ["node -e \"process.exit(1)\""]
+    });
+
+    const agent = task.queueTaskId;
+
+    const apply = await runProjectCommand(
+      {
+        command: "merge-worker",
+        json: false,
+        queueId,
+        agent,
+        apply: true,
+        runTests: true,
+        cwd: projectPath,
+        reviewedBy: "Codex",
+        reviewSummary: "Should be blocked."
+      },
+      call
+    );
+    expect(apply.action).toBe("merge_worker_test_failed");
+    expect(readFileSync(join(projectPath, "hello.txt"), "utf8")).toBe("old\n");
+
+    daemon.close();
+  });
+
+  it("parses and runs merge-worker dry-run for a clean patch with diff stats", async () => {
+    expect(
+      parseProjectCliArgs(["merge-worker", "--queue", "pqueue_1", "--agent", "pqtask_1"])
+    ).toMatchObject({ command: "merge-worker", queueId: "pqueue_1", agent: "pqtask_1" });
+
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-merge-clean-"));
+    const tasksFile = writeTasksFile(projectPath);
+    writeFileSync(join(projectPath, "hello.txt"), "old\n", "utf8");
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Merge clean test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    const imported = await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    const task = (imported.data.created as Array<{ queueTaskId: string; fabricTaskId: string }>)[0];
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+    const proposedPatch = [
+      "diff --git a/hello.txt b/hello.txt",
+      "--- a/hello.txt",
+      "+++ b/hello.txt",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new"
+    ].join("\n");
+    const artifact = {
+      schema: "agent-fabric.deepseek-worker-result.v1",
+      status: "patch_ready",
+      patchMode: "write",
+      patchFile: "result.patch",
+      result: { status: "patch_ready", summary: "Ready.", proposedPatch, changedFilesSuggested: ["hello.txt"], testsSuggested: ["npm test"] }
+    };
+    const artifactInput = join(projectPath, "artifact-input.json");
+    const patchInput = join(projectPath, "patch-input.patch");
+    writeFileSync(artifactInput, JSON.stringify(artifact), "utf8");
+    writeFileSync(patchInput, proposedPatch, "utf8");
+    const commandLine = `node -e "const fs=require('node:fs');fs.writeFileSync('deepseek-result.json', fs.readFileSync(process.argv[1], 'utf8'));fs.writeFileSync('result.patch', fs.readFileSync(process.argv[2], 'utf8'))" ${artifactInput} ${patchInput}`;
+    await runProjectCommand(
+      { command: "run-task", json: false, queueId, queueTaskId: task.queueTaskId, commandLine, cwd: projectPath, worker: "manual", workspaceMode: "in_place", modelProfile: "deepseek-v4-pro:max", successStatus: "patch_ready", maxOutputChars: 4_000, approveToolContext: true, rememberToolContext: false },
+      call
+    );
+
+    const result = await runProjectCommand(
+      { command: "merge-worker", json: false, queueId, agent: task.queueTaskId, apply: false, runTests: false, cwd: projectPath },
+      call
+    );
+
+    expect(result.action).toBe("merge_worker_dry_run");
+    // Verify no mutation
+    expect(readFileSync(join(projectPath, "hello.txt"), "utf8")).toBe("old\n");
+    daemon.close();
+  });
+
+  it("detects merge-worker conflicts without mutating", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-merge-conflict-"));
+    const tasksFile = writeTasksFile(projectPath);
+    writeFileSync(join(projectPath, "hello.txt"), "unexpected\n", "utf8");
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Merge conflict test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    const imported = await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    const task = (imported.data.created as Array<{ queueTaskId: string; fabricTaskId: string }>)[0];
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+    const proposedPatch = [
+      "diff --git a/hello.txt b/hello.txt",
+      "--- a/hello.txt",
+      "+++ b/hello.txt",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new"
+    ].join("\n");
+    const artifact = {
+      schema: "agent-fabric.deepseek-worker-result.v1",
+      status: "patch_ready",
+      patchMode: "write",
+      patchFile: "result.patch",
+      result: { status: "patch_ready", summary: "Ready.", proposedPatch, changedFilesSuggested: ["hello.txt"], testsSuggested: ["npm test"] }
+    };
+    const artifactInput = join(projectPath, "artifact-input.json");
+    const patchInput = join(projectPath, "patch-input.patch");
+    writeFileSync(artifactInput, JSON.stringify(artifact), "utf8");
+    writeFileSync(patchInput, proposedPatch, "utf8");
+    const commandLine = `node -e "const fs=require('node:fs');fs.writeFileSync('deepseek-result.json', fs.readFileSync(process.argv[1], 'utf8'));fs.writeFileSync('result.patch', fs.readFileSync(process.argv[2], 'utf8'))" ${artifactInput} ${patchInput}`;
+    await runProjectCommand(
+      { command: "run-task", json: false, queueId, queueTaskId: task.queueTaskId, commandLine, cwd: projectPath, worker: "manual", workspaceMode: "in_place", modelProfile: "deepseek-v4-pro:max", successStatus: "patch_ready", maxOutputChars: 4_000, approveToolContext: true, rememberToolContext: false },
+      call
+    );
+
+    const result = await runProjectCommand(
+      { command: "merge-worker", json: false, queueId, agent: task.queueTaskId, apply: false, runTests: false, cwd: projectPath },
+      call
+    );
+
+    expect(result.action).toBe("merge_worker_conflicts_detected");
+    expect(result.message).toContain("CONFLICTS DETECTED");
+    expect(result.data).toMatchObject({ clean: false, conflictsDetected: true });
+    expect(readFileSync(join(projectPath, "hello.txt"), "utf8")).toBe("unexpected\n");
+    daemon.close();
+  });
+
+  it("reports missing merge-worker artifact cleanly", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-merge-missing-"));
+    const tasksFile = writeTasksFile(projectPath);
+    writeFileSync(join(projectPath, "hello.txt"), "old\n", "utf8");
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Merge missing test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    const imported = await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    const task = (imported.data.created as Array<{ queueTaskId: string; fabricTaskId: string }>)[0];
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+    const artifact = {
+      schema: "agent-fabric.deepseek-worker-result.v1",
+      status: "patch_ready",
+      patchMode: "write",
+      patchFile: "result.patch",
+      result: { status: "patch_ready", summary: "Ready." }
+    };
+    const artifactInput = join(projectPath, "artifact-input.json");
+    writeFileSync(artifactInput, JSON.stringify(artifact), "utf8");
+    const commandLine = `node -e "const fs=require('node:fs');fs.writeFileSync('deepseek-result.json', fs.readFileSync(process.argv[1], 'utf8'))" ${artifactInput}`;
+    await runProjectCommand(
+      { command: "run-task", json: false, queueId, queueTaskId: task.queueTaskId, commandLine, cwd: projectPath, worker: "manual", workspaceMode: "in_place", modelProfile: "deepseek-v4-pro:max", successStatus: "patch_ready", maxOutputChars: 4_000, approveToolContext: true, rememberToolContext: false },
+      call
+    );
+
+    await expect(
+      runProjectCommand({ command: "merge-worker", json: false, queueId, queueTaskId: task.queueTaskId }, call)
+    ).rejects.toThrow("PATCH_ARTIFACT_MISSING");
+    daemon.close();
+  });
+
+  it("resolves merge-worker by workerRunId", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-merge-worker-"));
+    const tasksFile = writeTasksFile(projectPath);
+    writeFileSync(join(projectPath, "hello.txt"), "old\n", "utf8");
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Merge worker run test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    const imported = await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    const task = (imported.data.created as Array<{ queueTaskId: string; fabricTaskId: string }>)[0];
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+    const proposedPatch = [
+      "diff --git a/hello.txt b/hello.txt",
+      "--- a/hello.txt",
+      "+++ b/hello.txt",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new"
+    ].join("\n");
+    const artifact = {
+      schema: "agent-fabric.deepseek-worker-result.v1",
+      status: "patch_ready",
+      patchMode: "write",
+      patchFile: "result.patch",
+      result: { status: "patch_ready", summary: "Ready.", proposedPatch, changedFilesSuggested: ["hello.txt"], testsSuggested: ["npm test"] }
+    };
+    const artifactInput = join(projectPath, "artifact-input.json");
+    const patchInput = join(projectPath, "patch-input.patch");
+    writeFileSync(artifactInput, JSON.stringify(artifact), "utf8");
+    writeFileSync(patchInput, proposedPatch, "utf8");
+    const commandLine = `node -e "const fs=require('node:fs');fs.writeFileSync('deepseek-result.json', fs.readFileSync(process.argv[1], 'utf8'));fs.writeFileSync('result.patch', fs.readFileSync(process.argv[2], 'utf8'))" ${artifactInput} ${patchInput}`;
+    const ran = await runProjectCommand(
+      { command: "run-task", json: false, queueId, queueTaskId: task.queueTaskId, commandLine, cwd: projectPath, worker: "manual", workspaceMode: "in_place", modelProfile: "deepseek-v4-pro:max", successStatus: "patch_ready", maxOutputChars: 4_000, approveToolContext: true, rememberToolContext: false },
+      call
+    );
+
+    const workerRunId = (ran.data as Record<string, unknown>).workerRunId as string;
+    const result = await runProjectCommand(
+      { command: "merge-worker", json: false, queueId, workerRunId },
+      call
+    );
+
+    expect(result.action).toBe("merge_worker_clean");
+    daemon.close();
+  });
 });
 
 function caller(daemon: FabricDaemon, session: BridgeSession): ProjectToolCaller {

@@ -96,6 +96,8 @@ const EVENT_KINDS = new Set([
   "completed"
 ]);
 const FINAL_STATUSES = new Set(["completed", "failed", "canceled"]);
+const DEFAULT_TAIL_MAX_LINES = 200;
+const DEFAULT_TAIL_MAX_BYTES = 64 * 1024;
 
 export function fabricTaskCreate(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const title = getString(input, "title");
@@ -342,6 +344,82 @@ export function fabricTaskResume(host: SurfaceHost, input: unknown, context: Cal
   };
 }
 
+export function fabricTaskTail(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
+  const session = host.requireSession(context);
+  const workerRunId = getOptionalString(input, "workerRunId");
+  const taskId = getOptionalString(input, "taskId");
+  const queueId = getOptionalString(input, "queueId");
+  const queueTaskId = getOptionalString(input, "queueTaskId");
+
+  const byWorkerRun = Boolean(workerRunId);
+  const byTask = Boolean(taskId);
+  const byQueue = Boolean(queueId && queueTaskId);
+  const modeCount = Number(byWorkerRun) + Number(byTask) + Number(byQueue);
+  if (modeCount !== 1) {
+    throw new FabricError("INVALID_INPUT", "Specify exactly one lookup mode: workerRunId, taskId, or queueId + queueTaskId", false);
+  }
+
+  let resolvedTaskId = taskId;
+  let resolvedWorkerRunId = workerRunId;
+  if (byWorkerRun) {
+    const run = requireWorkerRunById(host, workerRunId!);
+    resolvedTaskId = run.task_id;
+    resolvedWorkerRunId = run.id;
+  } else if (byQueue) {
+    const row = host.db.db
+      .prepare("SELECT fabric_task_id FROM project_queue_tasks WHERE queue_id = ? AND id = ?")
+      .get(queueId!, queueTaskId!) as { fabric_task_id: string | null } | undefined;
+    if (!row?.fabric_task_id) {
+      throw new FabricError("PROJECT_QUEUE_TASK_NOT_FOUND", `Queue task not found or has no linked fabric task: ${queueId}/${queueTaskId}`, false);
+    }
+    resolvedTaskId = row.fabric_task_id;
+  }
+
+  if (!resolvedTaskId) {
+    throw new FabricError("FABRIC_TASK_NOT_FOUND", "Unable to resolve fabric task for tail request", false);
+  }
+  requireTask(host, resolvedTaskId, session.workspace_root);
+
+  const maxLines = clampTailLimit(getOptionalNumber(input, "maxLines"), DEFAULT_TAIL_MAX_LINES);
+  const maxBytes = clampTailLimit(getOptionalNumber(input, "maxBytes"), DEFAULT_TAIL_MAX_BYTES);
+  const params = resolvedWorkerRunId ? [resolvedTaskId, resolvedWorkerRunId] : [resolvedTaskId];
+  const filter = resolvedWorkerRunId ? " AND worker_run_id = ?" : "";
+
+  const eventRows = host.db.db
+    .prepare(`SELECT * FROM worker_events WHERE task_id = ?${filter} ORDER BY ts DESC`)
+    .all(...params) as WorkerEventRow[];
+  const checkpointRows = host.db.db
+    .prepare(`SELECT * FROM worker_checkpoints WHERE task_id = ?${filter} ORDER BY ts DESC`)
+    .all(...params) as WorkerCheckpointRow[];
+
+  const [events, eventTruncated] = applyTailLimits(
+    eventRows,
+    maxLines,
+    maxBytes,
+    (row) => JSON.stringify(formatEvent(row))
+  );
+  const [checkpoints, checkpointTruncated] = applyTailLimits(
+    checkpointRows,
+    maxLines,
+    maxBytes,
+    (row) => JSON.stringify(formatCheckpoint(row))
+  );
+
+  return {
+    resolveMode: byWorkerRun ? "workerRunId" : byTask ? "taskId" : "queueId",
+    taskId: resolvedTaskId,
+    workerRunId: resolvedWorkerRunId,
+    events: events.map((row) => redactUnsafePaths(formatEvent(row), session.workspace_root)),
+    checkpoints: checkpoints.map((row) => redactUnsafePaths(formatCheckpoint(row), session.workspace_root)),
+    truncated: eventTruncated || checkpointTruncated,
+    limits: { maxLines, maxBytes },
+    eventCount: events.length,
+    checkpointCount: checkpoints.length,
+    totalEventCount: eventRows.length,
+    totalCheckpointCount: checkpointRows.length
+  };
+}
+
 export function fabricTaskFinish(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const taskId = getString(input, "taskId");
   const workerRunId = getOptionalString(input, "workerRunId");
@@ -414,6 +492,14 @@ function requireWorkerRun(host: SurfaceHost, workerRunId: string, taskId: string
   return row;
 }
 
+function requireWorkerRunById(host: SurfaceHost, workerRunId: string): WorkerRunRow {
+  const row = host.db.db.prepare("SELECT * FROM worker_runs WHERE id = ?").get(workerRunId) as WorkerRunRow | undefined;
+  if (!row) {
+    throw new FabricError("FABRIC_WORKER_RUN_NOT_FOUND", `Worker run not found: ${workerRunId}`, false);
+  }
+  return row;
+}
+
 function ensureNotFinal(task: TaskRow): void {
   if (FINAL_STATUSES.has(task.status)) {
     throw new FabricError("FABRIC_TASK_FINAL", `Task ${task.id} is already ${task.status}`, false);
@@ -449,6 +535,28 @@ function latestCheckpoint(host: SurfaceHost, taskId: string, workerRunId?: strin
   return host.db.db
     .prepare("SELECT * FROM worker_checkpoints WHERE task_id = ? ORDER BY ts DESC LIMIT 1")
     .get(taskId) as WorkerCheckpointRow | undefined;
+}
+
+function clampTailLimit(value: number | undefined, max: number): number {
+  if (value === undefined) return max;
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new FabricError("INVALID_INPUT", "tail limits must be positive finite numbers", false);
+  }
+  return Math.min(Math.floor(value), max);
+}
+
+function applyTailLimits<T>(rows: T[], maxLines: number, maxBytes: number, serialize: (row: T) => string): [T[], boolean] {
+  const result: T[] = [];
+  let bytes = 0;
+  for (const row of rows) {
+    const nextBytes = Buffer.byteLength(serialize(row), "utf8");
+    if (result.length >= maxLines || bytes + nextBytes > maxBytes) {
+      return [result, true];
+    }
+    result.push(row);
+    bytes += nextBytes;
+  }
+  return [result, false];
 }
 
 function taskStatus(
@@ -526,6 +634,35 @@ function formatCheckpoint(row: WorkerCheckpointRow): Record<string, unknown> {
     summary: safeJsonRecord(row.summary_json),
     agentId: row.agent_id
   };
+}
+
+function redactUnsafePaths(value: unknown, workspaceRoot: string): unknown {
+  if (typeof value === "string") {
+    return redactStringIfPath(value, workspaceRoot);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactUnsafePaths(item, workspaceRoot));
+  }
+  if (value && typeof value === "object") {
+    const record: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      record[key] = redactUnsafePaths(entry, workspaceRoot);
+    }
+    return record;
+  }
+  return value;
+}
+
+function redactStringIfPath(value: string, workspaceRoot: string): string {
+  const normalized = value.replace(/\\/g, "/");
+  const normalizedRoot = workspaceRoot.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (!looksLikePath(normalized)) return value;
+  if (normalized === normalizedRoot || normalized.startsWith(`${normalizedRoot}/`)) return value;
+  return "[REDACTED: path outside workspace]";
+}
+
+function looksLikePath(value: string): boolean {
+  return value.startsWith("/") || value.startsWith("./") || value.startsWith("../") || /^[A-Za-z]:[\\/]/.test(value);
 }
 
 function buildResumePrompt(task: TaskRow, run: WorkerRunRow | undefined, checkpoint: WorkerCheckpointRow | undefined): string {

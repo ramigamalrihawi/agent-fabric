@@ -55,6 +55,7 @@ const API_CALL_TOOLS = new Set([
   "project_queue_agent_lanes",
   "project_queue_approve_model_calls",
   "project_queue_progress_report",
+  "project_queue_collab_summary",
   "project_queue_prepare_ready",
   "project_queue_launch_plan",
   "project_queue_validate_links",
@@ -853,6 +854,7 @@ async function desktopQueueHealth(
     summary: progress.summary,
     counts: progress.counts,
     managerSummary: progress.managerSummary,
+    taskCostCoverage: progress.taskCostCoverage,
     nextActions: progress.nextActions,
     verificationChecklist: progress.verificationChecklist
   };
