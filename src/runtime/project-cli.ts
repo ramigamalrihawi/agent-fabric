@@ -2131,6 +2131,7 @@ export function projectHelp(): string {
     "  agent-fabric-project factory-run --queue <id> [--start-execution] [--dry-run] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--task-packet-dir <dir>] [--cwd-template <path>] [--deepseek-worker-command <cmd>] [--deepseek-role auto|implementer|reviewer|risk-reviewer|adjudicator|planner] [--sensitive-context-mode basic|strict|off] [--patch-mode report|write] [--approval-token <token>|--approve-model-calls] [--approve-tool-context] [--allow-sensitive-context] [--allow-concurrent-runner] [--continue-on-failure] [--no-adaptive-rate-limit] [--json]",
     "  agent-fabric-project launch-plan --queue <id> [--limit <n>] [--json]",
     "  agent-fabric-project status --queue <id> [--json]",
+    "  agent-fabric-project collab-summary --queue <id> [--json]",
     "  agent-fabric-project launch --queue <id> [--limit <n>] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--workspace-mode in_place|git_worktree|clone|sandbox] [--model-profile <alias>] [--workspace-path <path>] [--max-runtime-minutes <n>] [--json]",
     "  agent-fabric-project approve-tool <proposalId> [--remember] [--note <text>] [--json]",
     "  agent-fabric-project decide-tool <proposalId> --decision approve|reject|revise [--remember] [--note <text>] [--json]",
@@ -3822,7 +3823,7 @@ async function seniorRun(
 
   return {
     action: "senior_run_completed",
-    message: formatSeniorRun(queueId, count, run, progressFile),
+    message: formatSeniorRun(queueId, count, run, progressFile, progress),
     data: {
       schema: "agent-fabric.senior-run.v1",
       queueId,
@@ -5096,15 +5097,51 @@ function formatProgressMarkdown(report: Record<string, unknown>): string {
   ].join("\n");
 }
 
-function formatSeniorRun(queueId: string, requested: number, run: ProjectRunResult, progressFile: string): string {
-  return [
+export function formatSeniorRun(
+  queueId: string,
+  requested: number,
+  run: ProjectRunResult,
+  progressFile: string,
+  progress?: Record<string, unknown>
+): string {
+  const counts = recordFrom(progress?.counts);
+  const nextActions = arrayRecords(progress?.nextActions);
+  const patchReadyTasks = arrayRecords(progress?.patchReadyTasks);
+  const runData = recordFrom(run.data ?? {});
+
+  const ran = typeof runData.runCount === "number" ? String(runData.runCount) : "n/a";
+  const failed = counts.failed ?? 0;
+  const stale = counts.stale ?? 0;
+  const completed = counts.completed ?? 0;
+  const running = counts.running ?? 0;
+  const patchReadyCount = counts.patch_ready ?? patchReadyTasks.length;
+
+  const lines = [
     `Senior-run queue ${queueId}.`,
-    `Requested lanes: ${requested}.`,
-    `Run action: ${run.action}.`,
-    `Progress file: ${progressFile}`,
-    "",
-    run.message
-  ].join("\n");
+    `Lanes: ${requested} requested, ${ran} ran.`,
+    `Status: completed=${completed}, failed=${failed}, running=${running}, stale=${stale}, patch-ready=${patchReadyCount}.`
+  ];
+
+  if (Number(failed) > 0) lines.push(`Failed: ${failed} task(s) — review queue and retry.`);
+  if (Number(stale) > 0) lines.push(`Stale: ${stale} task(s) — run recover-stale.`);
+  if (patchReadyTasks.length > 0) {
+    const summary = patchReadyTasks
+      .slice(0, 5)
+      .map((t) => `${String(t.queueTaskId ?? "")} ${String(t.title ?? "")}`.trim())
+      .join(", ");
+    lines.push(`Patch-ready: ${patchReadyTasks.length} task(s): ${summary}`);
+    if (patchReadyTasks.length > 5) lines.push(`  ...and ${patchReadyTasks.length - 5} more`);
+  }
+
+  if (nextActions.length > 0) {
+    lines.push("Next:");
+    for (const action of nextActions.slice(0, 3)) {
+      lines.push(`  \`${String(action.command ?? "")}\``);
+    }
+  }
+
+  lines.push(`Progress: ${progressFile}`);
+  return lines.join("\n");
 }
 
 function formatProgressReport(report: Record<string, unknown>, progressFile?: string): string {
