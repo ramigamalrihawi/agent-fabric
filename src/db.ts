@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 // Migration metadata. The SQL bodies live next to this file under
 // `migrations/<version>-<name>.sql`. Adding a new migration means dropping a
