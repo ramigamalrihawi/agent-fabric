@@ -17,6 +17,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node -e \"const fs=require('node:fs');fs.rmSync('dist/migrations',{recursive:true,force:true});fs.cpSync('src/migrations','dist/migrations',{recursive:true});fs.rmSync('dist/desktop',{recursive:true,force:true});fs.cpSync('src/desktop','dist/desktop',{recursive:true})\"",
+    "privacy:check": "vitest run test/privacy-guard.test.ts",
     "test": "vitest run",
     "cost:poll": "tsx src/bin/cost-poll.ts",
     "dev:approve": "tsx src/bin/approve.ts",
