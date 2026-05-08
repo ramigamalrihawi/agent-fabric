@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { FabricDaemon } from "../src/daemon.js";
 import type { BridgeRegister } from "../src/types.js";
@@ -523,15 +526,155 @@ describe("worker/task substrate", () => {
     expect(ambiguous.code).toBe("INVALID_INPUT");
     daemon.close();
   });
+
+  it("reads log files from command_finished metadata when includeLogs is true", () => {
+    const dir = mkdtempSync(join(tmpdir(), "af-tlog-"));
+    const workspaceDir = join(dir, "ws");
+    try {
+      const daemon = new FabricDaemon({ dbPath: ":memory:" });
+      const session = daemon.registerBridge(registerPayloadWithWorkspace(workspaceDir));
+      const created = createTask(daemon, session, "tl-c", workspaceDir);
+      if (!created.ok) throw new Error("task create failed");
+      const started = daemon.callTool("fabric_task_start_worker", {
+        taskId: created.data.taskId, worker: "local-cli", projectPath: workspaceDir,
+        workspaceMode: "in_place", workspacePath: workspaceDir, modelProfile: "deepseek-api",
+        command: ["local-cli", "run"]
+      }, contextFor(session, "tl-w"));
+      expect(started.ok).toBe(true);
+      if (!started.ok) throw new Error("worker start failed");
+
+      const logDir = join(workspaceDir, ".agent-fabric", "logs");
+      mkdirSync(logDir, { recursive: true });
+      const stdoutPath = join(logDir, "stdout.log");
+      const stderrPath = join(logDir, "stderr.log");
+      writeFileSync(stdoutPath, "hello stdout\n", { encoding: "utf8" });
+      writeFileSync(stderrPath, "error: fail\n", { encoding: "utf8" });
+
+      daemon.callTool("fabric_task_event", {
+        taskId: created.data.taskId, workerRunId: started.data.workerRunId,
+        kind: "command_finished", body: "ran", metadata: { stdoutLogPath: stdoutPath, stderrLogPath: stderrPath }
+      }, contextFor(session, "tl-e"));
+
+      const tail = daemon.callTool("fabric_task_tail",
+        { taskId: created.data.taskId, includeLogs: true },
+        contextFor(session, "tl-call"));
+      expect(tail.ok).toBe(true);
+      if (!tail.ok) throw new Error("tail with logs failed");
+      expect(tail.data.logs).toHaveLength(2);
+      expect(tail.data.logs[0]).toMatchObject({ kind: "stdoutLogPath", content: "hello stdout\n", truncated: false });
+      expect(tail.data.logs[1]).toMatchObject({ kind: "stderrLogPath", content: "error: fail\n", truncated: false });
+      expect(tail.data.logErrors).toBeUndefined();
+      daemon.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns logErrors for unsafe path and missing log files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "af-tlerr-"));
+    const workspaceDir = join(dir, "ws");
+    try {
+      const daemon = new FabricDaemon({ dbPath: ":memory:" });
+      const session = daemon.registerBridge(registerPayloadWithWorkspace(workspaceDir));
+      const created = createTask(daemon, session, "tle-c", workspaceDir);
+      if (!created.ok) throw new Error("task create failed");
+      const started = daemon.callTool("fabric_task_start_worker", {
+        taskId: created.data.taskId, worker: "local-cli", projectPath: workspaceDir,
+        workspaceMode: "in_place", workspacePath: workspaceDir, modelProfile: "deepseek-api",
+        command: ["local-cli", "run"]
+      }, contextFor(session, "tle-w"));
+      expect(started.ok).toBe(true);
+      if (!started.ok) throw new Error("worker start failed");
+
+      const missingPath = join(workspaceDir, ".agent-fabric", "logs", "gone.log");
+      const outsidePath = "/private/secret.log";
+
+      daemon.callTool("fabric_task_event", {
+        taskId: created.data.taskId, workerRunId: started.data.workerRunId,
+        kind: "command_finished", body: "ran", metadata: { stdoutLogPath: missingPath, stderrLogPath: outsidePath }
+      }, contextFor(session, "tle-e"));
+
+      const tail = daemon.callTool("fabric_task_tail",
+        { taskId: created.data.taskId, includeLogs: true },
+        contextFor(session, "tle-call"));
+      expect(tail.ok).toBe(true);
+      if (!tail.ok) throw new Error("tail with log errors failed");
+      expect(tail.data.logs).toHaveLength(0);
+      expect(tail.data.logErrors).toHaveLength(2);
+      expect(tail.data.logErrors[0]).toMatchObject({ kind: "stdoutLogPath", path: missingPath, error: "not_found" });
+      expect(tail.data.logErrors[1]).toMatchObject({ kind: "stderrLogPath", path: outsidePath, error: "unsafe_path" });
+      daemon.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves relative log paths under the workspace root only", () => {
+    const dir = mkdtempSync(join(tmpdir(), "af-tlrel-"));
+    const workspaceDir = join(dir, "ws");
+    try {
+      const daemon = new FabricDaemon({ dbPath: ":memory:" });
+      const session = daemon.registerBridge(registerPayloadWithWorkspace(workspaceDir));
+      const created = createTask(daemon, session, "tlr-c", workspaceDir);
+      if (!created.ok) throw new Error("task create failed");
+      const started = daemon.callTool("fabric_task_start_worker", {
+        taskId: created.data.taskId, worker: "local-cli", projectPath: workspaceDir,
+        workspaceMode: "in_place", workspacePath: workspaceDir, modelProfile: "deepseek-api",
+        command: ["local-cli", "run"]
+      }, contextFor(session, "tlr-w"));
+      expect(started.ok).toBe(true);
+      if (!started.ok) throw new Error("worker start failed");
+
+      const logDir = join(workspaceDir, ".agent-fabric", "logs");
+      mkdirSync(logDir, { recursive: true });
+      writeFileSync(join(logDir, "relative.log"), "relative stdout\n", { encoding: "utf8" });
+
+      daemon.callTool("fabric_task_event", {
+        taskId: created.data.taskId, workerRunId: started.data.workerRunId,
+        kind: "command_finished",
+        body: "ran",
+        metadata: {
+          stdoutLogPath: ".agent-fabric/logs/relative.log",
+          stderrLogPath: "agent-fabric.local.env"
+        }
+      }, contextFor(session, "tlr-e"));
+
+      const tail = daemon.callTool("fabric_task_tail",
+        { taskId: created.data.taskId, includeLogs: true },
+        contextFor(session, "tlr-call"));
+      expect(tail.ok).toBe(true);
+      if (!tail.ok) throw new Error("tail with relative logs failed");
+      expect(tail.data.logs[0]).toMatchObject({ kind: "stdoutLogPath", content: "relative stdout\n", truncated: false });
+      expect(tail.data.logErrors[0]).toMatchObject({ kind: "stderrLogPath", path: "agent-fabric.local.env", error: "not_found" });
+      daemon.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("omits logs when includeLogs is not set", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const created = createTask(daemon, session, "tnl-c");
+    if (!created.ok) throw new Error("task create failed");
+    const tail = daemon.callTool("fabric_task_tail",
+      { taskId: created.data.taskId },
+      contextFor(session, "tnl-call"));
+    expect(tail.ok).toBe(true);
+    if (!tail.ok) throw new Error("tail without logs failed");
+    expect(tail.data.logs).toBeUndefined();
+    expect(tail.data.logErrors).toBeUndefined();
+    daemon.close();
+  });
 });
 
-function createTask(daemon: FabricDaemon, session: { sessionId: string; sessionToken: string }, idempotencyKey: string) {
+function createTask(daemon: FabricDaemon, session: { sessionId: string; sessionToken: string }, idempotencyKey: string, projectPath?: string) {
   return daemon.callTool(
     "fabric_task_create",
     {
       title: "Implement task lifecycle",
       goal: "Exercise worker task state.",
-      projectPath: "/tmp/workspace",
+      projectPath: projectPath ?? "/tmp/workspace",
       priority: "normal"
     },
     contextFor(session, idempotencyKey)
@@ -539,11 +682,15 @@ function createTask(daemon: FabricDaemon, session: { sessionId: string; sessionT
 }
 
 function registerPayload(): BridgeRegister {
+  return registerPayloadWithWorkspace("/tmp/workspace");
+}
+
+function registerPayloadWithWorkspace(workspaceRoot: string): BridgeRegister {
   return {
     bridgeVersion: "0.1.0",
     agent: { id: "worker-test", displayName: "Worker Test", vendor: "test" },
     host: { name: "Worker Test Host", transport: "simulator" },
-    workspace: { root: "/tmp/workspace", source: "explicit" },
+    workspace: { root: workspaceRoot, source: "explicit" },
     capabilities: {
       roots: true,
       notifications: true,

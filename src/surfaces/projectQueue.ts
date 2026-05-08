@@ -610,6 +610,8 @@ export function projectQueueDashboard(host: SurfaceHost, input: unknown, context
     { queueId: queue.id, includeCompleted: includeCompletedLanes, maxEventsPerLane },
     context
   ) as { count: number; lanes: unknown[] };
+  const laneRows = Array.isArray(lanes.lanes) ? lanes.lanes.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)) : [];
+  const taskCostCoverage = queueTaskCostCoverage(tasks, laneRows);
 
   return {
     queue: formatQueue(queue),
@@ -628,6 +630,7 @@ export function projectQueueDashboard(host: SurfaceHost, input: unknown, context
       preflights,
       workerCosts
     }),
+    taskCostCoverage,
     activeWorkers,
     availableSlots: Math.max(0, queue.max_parallel_agents - activeWorkers),
     pipeline: stages.map(formatStage),
@@ -2599,11 +2602,22 @@ export function projectQueueCollabSummary(host: SurfaceHost, input: unknown, con
     .prepare(`SELECT * FROM asks WHERE workspace_root = ? AND status = 'open' AND (${refClauses}) ORDER BY ts_created ASC`)
     .all(...askParams) as Record<string, unknown>[];
 
+  const decisionParams: string[] = [session.workspace_root, ...refPatterns];
   const decisions = host.db.db
+    .prepare(`SELECT * FROM decisions WHERE workspace_root = ? AND (${refClauses}) ORDER BY ts DESC LIMIT 50`)
+    .all(...decisionParams) as Record<string, unknown>[];
+
+  const claimParams: string[] = [session.workspace_root, ...refPatterns];
+  const claims = host.db.db
+    .prepare(`SELECT * FROM claims WHERE workspace_root = ? AND released = 0 AND (ts_expires IS NULL OR datetime(ts_expires) > CURRENT_TIMESTAMP) AND (${refClauses}) ORDER BY ts_created DESC`)
+    .all(...claimParams) as Record<string, unknown>[];
+
+  // All-decision and all-claims fallback (workspace-wide, for unlinked)
+  const allDecisions = host.db.db
     .prepare("SELECT * FROM decisions WHERE workspace_root = ? ORDER BY ts DESC LIMIT 50")
     .all(session.workspace_root) as Record<string, unknown>[];
 
-  const claims = host.db.db
+  const allClaims = host.db.db
     .prepare(`SELECT * FROM claims WHERE workspace_root = ? AND released = 0 AND (ts_expires IS NULL OR datetime(ts_expires) > CURRENT_TIMESTAMP) ORDER BY ts_created DESC`)
     .all(session.workspace_root) as Record<string, unknown>[];
 
@@ -2622,10 +2636,14 @@ export function projectQueueCollabSummary(host: SurfaceHost, input: unknown, con
   const taskAsks = new Map<string, Record<string, unknown>[]>();
   const taskReplies = new Map<string, Record<string, unknown>[]>();
   const taskHandoffs = new Map<string, Record<string, unknown>[]>();
+  const taskDecisions = new Map<string, Record<string, unknown>[]>();
+  const taskPathClaims = new Map<string, Record<string, unknown>[]>();
   for (const tid of taskIds) {
     taskAsks.set(tid, []);
     taskReplies.set(tid, []);
     taskHandoffs.set(tid, []);
+    taskDecisions.set(tid, []);
+    taskPathClaims.set(tid, []);
   }
 
   for (const row of messages) {
@@ -2646,14 +2664,54 @@ export function projectQueueCollabSummary(host: SurfaceHost, input: unknown, con
     }
   }
 
+  for (const row of decisions) {
+    const fmtd: Record<string, unknown> = {
+      id: row.id,
+      ts: row.ts,
+      title: row.title,
+      decided: row.decided,
+      recordedBy: row.recorded_by_agent_id,
+      participants: safeJsonArray(row.participants_json),
+      rationale: row.rationale ?? undefined,
+      supersedes: row.supersedes ?? undefined,
+      refs: safeJsonArray(row.refs_json)
+    };
+    for (const tid of matchingTaskIds(row.refs_json)) {
+      taskDecisions.get(tid)?.push(fmtd);
+    }
+  }
+
+  for (const row of claims) {
+    const fmtd = formatClaim(row);
+    for (const tid of matchingTaskIds(row.refs_json)) {
+      taskPathClaims.get(tid)?.push(fmtd);
+    }
+  }
+
   const groups: Array<Record<string, unknown>> = [];
   for (const task of tasks) {
     const tid = task.id;
     const a = taskAsks.get(tid) ?? [];
     const r = taskReplies.get(tid) ?? [];
     const h = taskHandoffs.get(tid) ?? [];
-    if (a.length === 0 && r.length === 0 && h.length === 0) continue;
-    groups.push({ queueTask: formatQueueTask(task), openAsks: a, replies: r, decisions: [], pathClaims: [], handoffNotes: h, summary: { openAskCount: a.filter((x) => x.status === "open").length, resolvedCount: r.length, hasHandoff: h.length > 0 } });
+    const d = taskDecisions.get(tid) ?? [];
+    const p = taskPathClaims.get(tid) ?? [];
+    if (a.length === 0 && r.length === 0 && h.length === 0 && d.length === 0 && p.length === 0) continue;
+    groups.push({
+      queueTask: formatQueueTask(task),
+      openAsks: a,
+      replies: r,
+      decisions: d,
+      pathClaims: p,
+      handoffNotes: h,
+      summary: {
+        openAskCount: a.filter((x) => x.status === "open").length,
+        resolvedCount: r.length,
+        decisionCount: d.length,
+        activeClaimCount: p.length,
+        hasHandoff: h.length > 0
+      }
+    });
   }
 
   function scopeToQueue(refsStr: unknown): boolean {
@@ -2662,6 +2720,8 @@ export function projectQueueCollabSummary(host: SurfaceHost, input: unknown, con
 
   const qMessages = messages.filter((r) => scopeToQueue(r.refs_json) && matchingTaskIds(r.refs_json).length === 0);
   const qAsks = asks.filter((r) => scopeToQueue(r.refs_json) && matchingTaskIds(r.refs_json).length === 0);
+  const qDecisions = allDecisions.filter((r) => !decisions.some((d) => d.id === r.id));
+  const qClaims = allClaims.filter((r) => !claims.some((c) => c.id === r.id));
 
   return {
     schema: "agent-fabric.project-queue-collab-summary.v1",
@@ -2671,8 +2731,8 @@ export function projectQueueCollabSummary(host: SurfaceHost, input: unknown, con
     unlinked: {
       openAsks: qAsks.map(formatAsk),
       replies: qMessages.filter((r) => Boolean(r.ask_id)).map(formatMessage),
-      decisions: decisions.map((r) => ({ id: r.id, ts: r.ts, title: r.title, decided: r.decided, recordedBy: r.recorded_by_agent_id, participants: safeJsonArray(r.participants_json) })),
-      pathClaims: claims.map(formatClaim),
+      decisions: qDecisions.map((r) => ({ id: r.id, ts: r.ts, title: r.title, decided: r.decided, recordedBy: r.recorded_by_agent_id, participants: safeJsonArray(r.participants_json) })),
+      pathClaims: qClaims.map(formatClaim),
       handoffNotes: qMessages.filter((r) => !r.ask_id && typeof r.kind === "string" && r.kind === "dm" && typeof r.body === "string" && (r.body.includes("handoff") || r.body.includes("checkpoint") || r.body.includes("resume"))).map(formatMessage)
     }
   };

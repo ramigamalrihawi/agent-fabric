@@ -653,6 +653,7 @@ function desktopActionInbox(input: {
   const reviewTasks = arrayFromUnknown(queueBoard.review);
   const readyTasks = arrayFromUnknown(queueBoard.ready);
   const blockedTasks = arrayFromUnknown(queueBoard.blocked);
+  const taskCostCoverage = asObject(dashboard.taskCostCoverage);
   const items: Array<Record<string, unknown>> = [];
 
   const addItem = (item: Record<string, unknown>) => {
@@ -674,6 +675,21 @@ function desktopActionInbox(input: {
       detail: `${staleRunning} running task(s) appear stale.`,
       tab: "dashboard",
       actionLabel: "Open Recovery"
+    });
+  }
+
+  const tasksWithoutCost = numberFromUnknown(taskCostCoverage.tasksWithoutCostEvents) ?? 0;
+  if (tasksWithoutCost > 0) {
+    const pct = numberFromUnknown(taskCostCoverage.costCoveragePercent) ?? 0;
+    addItem({
+      id: "cost-coverage",
+      kind: "cost_coverage",
+      priority: 6,
+      severity: "warning",
+      title: "Worker cost data missing",
+      detail: `${tasksWithoutCost} of ${numberFromUnknown(taskCostCoverage.tasksWithWorkerRuns) ?? "?"} task(s) with worker runs lack cost-attributed events (${pct}% coverage).`,
+      tab: "dashboard",
+      actionLabel: "Inspect Cost"
     });
   }
 

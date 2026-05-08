@@ -45,7 +45,7 @@ agent-fabric-project senior-run \
   --progress-file .agent-fabric/progress.md
 
 # 4. Monitor progress
-agent-fabric-project project_queue_progress_report --queue <queueId>
+agent-fabric-project progress-report --queue <queueId>
 # or via Codex/Claude bridge
 fabric_senior_status --queue <queueId>
 ```
@@ -58,8 +58,6 @@ agent-fabric-project factory-run \
   --queue <queueId> \
   --start-execution \
   --parallel 20 \
-  --worker deepseek-direct \
-  --workspace-mode git_worktree \
   --task-packet-dir .agent-fabric/task-packets \
   --cwd-template ".agent-fabric/worktrees/{{queueTaskId}}" \
   --approve-model-calls \
@@ -502,13 +500,11 @@ agent-fabric-project cleanup-queues --project <path> --older-than-days 7 --apply
 # Stale recovery
 agent-fabric-project recover-stale --queue <queueId> --stale-after-minutes 30 --dry-run
 
-# Worker health
-agent-fabric-project worker-health --queue <queueId>
-# or via bridge
+# Worker health (via bridge)
 project_queue_worker_health { queueId: "<queueId>" }
 
-# Batch task
-agent-fabric-project add-task-batch --queue <queueId> --batch-file batch.json
+# Batch task import
+agent-fabric-project import-tasks --queue <queueId> --tasks-file tasks.json --approve-queue
 ```
 
 ---

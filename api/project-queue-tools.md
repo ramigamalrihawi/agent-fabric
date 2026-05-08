@@ -1335,66 +1335,9 @@ Read-only health classification for every queue worker using durable Agent Fabri
 
 Returns schema `agent-fabric.project-queue-worker-health.v1` with per-worker `queueTaskId`, `fabricTaskId`, `title`, `classification`, `healthLabel`, `reason`, `evidence` (processPresent, pid, lastHeartbeatAt, lastEventAt/kind, lastCheckpointAt, hasRunnerEvidence, runnerLogPath, taskPacketPath, contextFilePath, patchRefs, testRefs, failure, cost), and a `nextActions` array of recommended CLI commands.
 
-## `project_queue_add_task_batch`
+## `project_queue_add_task_batch` — see earlier section for full schema
 
-Add dependency-aware coding tasks with shared defaults plus per-lane variants. The `defaults` block is applied first; each task can override any default field. The combined task passes the same validation as `project_queue_add_tasks`.
-
-```ts
-{
-  queueId: string;
-  defaults?: {
-    phase?: string;
-    manager?: string;
-    managerId?: string;
-    parentManagerId?: string;
-    parentQueueId?: string;
-    workstream?: string;
-    costCenter?: string;
-    escalationTarget?: string;
-    category?: string;
-    status?: "queued" | "ready" | "running" | "blocked" | "review" | "patch_ready" | "completed" | "failed" | "canceled" | "accepted" | "done";
-    priority?: "low" | "normal" | "high" | "urgent";
-    parallelGroup?: string;
-    parallelSafe?: boolean;
-    risk?: "low" | "medium" | "high" | "breakglass";
-    expectedFiles?: string[];
-    acceptanceCriteria?: string[];
-    requiredTools?: string[];
-    requiredMcpServers?: string[];
-    requiredMemories?: string[];
-    requiredContextRefs?: string[];
-    dependsOn?: string[];
-  };
-  tasks: Array<{
-    clientKey?: string;
-    title: string;
-    goal: string;
-    phase?: string;
-    manager?: string;
-    managerId?: string;
-    parentManagerId?: string;
-    parentQueueId?: string;
-    workstream?: string;
-    costCenter?: string;
-    escalationTarget?: string;
-    category?: string;
-    status?: "queued" | "ready" | "running" | "blocked" | "review" | "patch_ready" | "completed" | "failed" | "canceled" | "accepted" | "done";
-    priority?: "low" | "normal" | "high" | "urgent";
-    parallelGroup?: string;
-    parallelSafe?: boolean;
-    risk?: "low" | "medium" | "high" | "breakglass";
-    expectedFiles?: string[];
-    acceptanceCriteria?: string[];
-    requiredTools?: string[];
-    requiredMcpServers?: string[];
-    requiredMemories?: string[];
-    requiredContextRefs?: string[];
-    dependsOn?: string[];
-  }>;
-}
-```
-
-Returns generated `queueTaskId` and linked `fabricTaskId` per task plus `reused` flag for client-key collision detection.
+This tool is documented above at `## `project_queue_add_task_batch`` (line ~747).
 
 ## `project_queue_task_packet`
 

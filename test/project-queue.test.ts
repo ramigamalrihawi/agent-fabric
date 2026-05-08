@@ -2101,29 +2101,46 @@ describe("project queue substrate", () => {
     expect(legacyAsk.ok).toBe(true);
     if (!legacyAsk.ok) throw new Error("legacy collab ask failed");
 
-    // Send a message scoped to a task
+    // Send a message scoped to a task (handoff note)
     const message = daemon.callTool("collab_send", {
       to: "other-agent",
-      body: "Handoff note for task.",
+      body: "Handoff checkpoint note for task.",
       refs: [`project_queue:${queueId}`, `project_queue_task:${firstTaskId}`],
       kind: "dm"
     }, contextFor(session, "collab-message"));
     expect(message.ok).toBe(true);
 
-    // Record a collab decision
+    // Record a collab decision scoped to the queue task via refs
     const decision = daemon.callTool("collab_decision", {
-      title: "Approach decision",
+      title: "Approach decision for task",
       decided: "Use streaming for collab fan-out.",
-      participants: ["codex", "claude"]
-    }, contextFor(session, "collab-decision"));
+      participants: ["codex", "claude"],
+      refs: [`project_queue:${queueId}`, `project_queue_task:${firstTaskId}`]
+    }, contextFor(session, "collab-decision-scoped"));
     expect(decision.ok).toBe(true);
 
-    // Claim a path
+    // Record an unscoped decision (should appear in unlinked)
+    const unscopedDecision = daemon.callTool("collab_decision", {
+      title: "Workspace-wide decision",
+      decided: "All agents use structured checkpoints.",
+      participants: ["codex"]
+    }, contextFor(session, "collab-decision-unscoped"));
+    expect(unscopedDecision.ok).toBe(true);
+
+    // Claim a path scoped to the queue task via refs
     const claim = daemon.callTool("claim_path", {
       paths: ["src/surfaces/collab.ts"],
-      note: "Working on collab summary feature."
-    }, contextFor(session, "collab-claim"));
+      note: "Working on collab summary feature.",
+      refs: [`project_queue:${queueId}`, `project_queue_task:${firstTaskId}`]
+    }, contextFor(session, "collab-claim-scoped"));
     expect(claim.ok).toBe(true);
+
+    // Claim an unscoped path (should appear in unlinked)
+    const unscopedClaim = daemon.callTool("claim_path", {
+      paths: ["src/surfaces/unlinked.ts"],
+      note: "Unlinked workspace claim."
+    }, contextFor(session, "collab-claim-unscoped"));
+    expect(unscopedClaim.ok).toBe(true);
 
     // Now query the collab summary
     const summary = daemon.callTool("project_queue_collab_summary", { queueId }, contextFor(session, "collab-summary"));
@@ -2155,17 +2172,62 @@ describe("project queue substrate", () => {
       ])
     );
 
-    // Unlinked should have decisions and path claims
+    // Task decisions should contain the scoped decision
+    const taskDecisions = taskGroup.decisions as Array<Record<string, unknown>>;
+    expect(taskDecisions.length).toBeGreaterThanOrEqual(1);
+    expect(taskDecisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          title: "Approach decision for task",
+          decided: "Use streaming for collab fan-out."
+        })
+      ])
+    );
+
+    // Task path claims should contain the scoped claim
+    const taskClaims = taskGroup.pathClaims as Array<Record<string, unknown>>;
+    expect(taskClaims.length).toBeGreaterThanOrEqual(1);
+    expect(taskClaims).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          note: "Working on collab summary feature."
+        })
+      ])
+    );
+
+    // Handoff notes should contain the handoff message
+    const handoffNotes = taskGroup.handoffNotes as Array<Record<string, unknown>>;
+    expect(handoffNotes.length).toBeGreaterThanOrEqual(1);
+
+    // Summary should include decision/claim counts
+    expect(taskGroup.summary).toMatchObject({
+      decisionCount: expect.any(Number),
+      activeClaimCount: expect.any(Number),
+      hasHandoff: true
+    });
+
+    // Unlinked should have the unscoped decision and claim
     const unlinked = summary.data.unlinked as Record<string, unknown>;
     const unlinkedDecisions = unlinked.decisions as Array<Record<string, unknown>>;
     expect(unlinkedDecisions.length).toBeGreaterThanOrEqual(1);
-    expect(unlinkedDecisions[0]).toMatchObject({
-      title: "Approach decision",
-      decided: "Use streaming for collab fan-out."
-    });
+    expect(unlinkedDecisions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          title: "Workspace-wide decision",
+          decided: "All agents use structured checkpoints."
+        })
+      ])
+    );
 
     const unlinkedClaims = unlinked.pathClaims as Array<Record<string, unknown>>;
     expect(unlinkedClaims.length).toBeGreaterThanOrEqual(1);
+    expect(unlinkedClaims).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          note: "Unlinked workspace claim."
+        })
+      ])
+    );
 
     // Verify task packets include collab refs
     const packet = daemon.callTool("project_queue_task_packet", {

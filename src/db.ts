@@ -27,7 +27,8 @@ export const MIGRATIONS: readonly { version: number; name: string }[] = [
   { version: 13, name: "project-queues" },
   { version: 14, name: "project-task-context-requirements" },
   { version: 15, name: "project-task-orchestration-metadata" },
-  { version: 16, name: "project-task-client-key" }
+  { version: 16, name: "project-task-client-key" },
+  { version: 17, name: "collab-queue-refs" }
 ];
 
 const MIGRATIONS_DIR = (() => {

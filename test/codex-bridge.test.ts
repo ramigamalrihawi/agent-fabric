@@ -896,3 +896,100 @@ describe("project_queue_worker_health", () => {
     daemon.close();
   });
 });
+
+describe("Dashboard-level cost coverage visibility", () => {
+
+  it("project_queue_dashboard includes taskCostCoverage with source label, coverage percent, and bounded missing-tasks list", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const queueId = createQueue(daemon, session, "dash-cost-create", 4);
+    const tasks = addReadyTasks(daemon, session, queueId, 3);
+    startExecution(daemon, session, queueId, "dash-cost-start");
+
+    // Claim task 0 with cost data
+    const claim0 = daemon.callTool(
+      "project_queue_claim_next",
+      { queueId, worker: "deepseek-direct", workspaceMode: "git_worktree", modelProfile: "deepseek-v4-pro:max", metadata: { costRole: "worker" } },
+      contextFor(session, "dash-cost-claim-0")
+    );
+    expect(claim0.ok).toBe(true);
+    const c0 = claim0.data.claimed as { fabricTaskId: string };
+    const r0 = claim0.data.workerRun as { workerRunId: string };
+
+    daemon.callTool("fabric_task_event", {
+      taskId: c0.fabricTaskId, workerRunId: r0.workerRunId, kind: "command_started", body: "started", costUsd: 0.02
+    }, contextFor(session, "dash-cost-ev-0"));
+
+    // Claim task 1 WITHOUT cost data
+    const claim1 = daemon.callTool(
+      "project_queue_claim_next",
+      { queueId, worker: "jcode-deepseek", workspaceMode: "git_worktree", modelProfile: "deepseek-v4-pro:max", metadata: { costRole: "worker" } },
+      contextFor(session, "dash-cost-claim-1")
+    );
+    expect(claim1.ok).toBe(true);
+    const c1 = claim1.data.claimed as { fabricTaskId: string };
+    const r1 = claim1.data.workerRun as { workerRunId: string };
+
+    daemon.callTool("fabric_task_event", {
+      taskId: c1.fabricTaskId, workerRunId: r1.workerRunId, kind: "command_started", body: "started without cost"
+    }, contextFor(session, "dash-cost-ev-1"));
+
+    const dash = daemon.callTool(
+      "project_queue_dashboard",
+      { queueId },
+      contextFor(session, "dash-cost-fetch")
+    );
+    expect(dash.ok).toBe(true);
+    if (!dash.ok) throw new Error("dashboard failed");
+
+    expect(dash.data.taskCostCoverage).toBeDefined();
+    const cov = dash.data.taskCostCoverage as Record<string, unknown>;
+    expect(cov.sourceLabel).toBe("worker_event_details");
+    expect(cov.totalTasks).toBe(3);
+    expect(cov.tasksWithCost).toBe(1);
+    expect(cov.tasksWithWorkerRuns).toBe(2);
+    expect(cov.tasksWithoutCostEvents).toBe(1);
+    expect(cov.costCoveragePercent).toBe(50);
+    expect(cov.coverageWarning).toEqual(expect.stringContaining("no cost-attributed events"));
+    expect(Array.isArray(cov.tasksMissingCost)).toBe(true);
+    expect((cov.tasksMissingCost as Array<Record<string, unknown>>).length).toBe(1);
+
+    daemon.close();
+  });
+
+  it("dashboard taskCostCoverage shows 100% when all worker tasks have cost data, with no warning", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const queueId = createQueue(daemon, session, "dash-full-cost-create", 4);
+    const tasks = addReadyTasks(daemon, session, queueId, 2);
+    startExecution(daemon, session, queueId, "dash-full-cost-start");
+
+    for (let i = 0; i < 2; i += 1) {
+      const claim = daemon.callTool(
+        "project_queue_claim_next",
+        { queueId, worker: "deepseek-direct", workspaceMode: "git_worktree", modelProfile: "deepseek-v4-pro:max", metadata: { costRole: "worker" } },
+        contextFor(session, `dash-full-cost-claim-${i}`)
+      );
+      expect(claim.ok).toBe(true);
+      const claimed = claim.data.claimed as { fabricTaskId: string };
+      const run = claim.data.workerRun as { workerRunId: string };
+      daemon.callTool("fabric_task_event", {
+        taskId: claimed.fabricTaskId, workerRunId: run.workerRunId, kind: "command_started", body: `task ${i}`, costUsd: 0.01
+      }, contextFor(session, `dash-full-cost-ev-${i}`));
+    }
+
+    const dash = daemon.callTool(
+      "project_queue_dashboard",
+      { queueId },
+      contextFor(session, "dash-full-cost-fetch")
+    );
+    expect(dash.ok).toBe(true);
+    const cov = dash.data.taskCostCoverage as Record<string, unknown>;
+    expect(cov.tasksWithCost).toBe(2);
+    expect(cov.tasksWithWorkerRuns).toBe(2);
+    expect(cov.costCoveragePercent).toBe(100);
+    expect(cov.coverageWarning).toBeNull();
+
+    daemon.close();
+  });
+});

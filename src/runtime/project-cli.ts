@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { FabricError } from "./errors.js";
 import { formatLocalConfigDoctor, runLocalConfigDoctor } from "./local-config-doctor.js";
 import { defaultMaxEventsPerLane, seniorDefaultLaneCount, seniorMaxLaneCount } from "./limits.js";
-import { applyPatchWithSystemPatch, checkPatchWithSystemPatch, computePatchDiffStats, validateGitStylePatch } from "./patches.js";
+import { applyPatchWithSystemPatch, checkPatchWithSystemPatch, computePatchDiffStats, validateGitStylePatch, resolveArtifactIgnoreGlobs, shouldIgnoreArtifact } from "./patches.js";
 
 type WorkerKind =
   | "ramicode"
@@ -227,6 +227,7 @@ export type ProjectCliCommand =
       maxOutputChars: number;
       approveToolContext: boolean;
       rememberToolContext: boolean;
+      artifactIgnoreGlobs?: string[];
     }
   | {
       command: "run-ready";
@@ -255,6 +256,7 @@ export type ProjectCliCommand =
       adaptiveRateLimit?: boolean;
       minParallel?: number;
       allowConcurrentRunner?: boolean;
+      artifactIgnoreGlobs?: string[];
     }
   | {
       command: "factory-run";
@@ -281,6 +283,7 @@ export type ProjectCliCommand =
       allowSensitiveContext: boolean;
       approveModelCalls: boolean;
       allowConcurrentRunner?: boolean;
+      artifactIgnoreGlobs?: string[];
     }
   | {
       command: "senior-doctor";
@@ -1299,7 +1302,8 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       successStatus: parseSuccessStatus(flags.successStatus ?? "patch_ready"),
       maxOutputChars: flags.maxOutputChars ?? 8_000,
       approveToolContext: flags.approveToolContext,
-      rememberToolContext: flags.rememberToolContext
+      rememberToolContext: flags.rememberToolContext,
+      artifactIgnoreGlobs: flags.artifactIgnoreGlobs
     };
   }
 
@@ -1335,7 +1339,8 @@ export function parseProjectCliArgs(argv: string[]): ProjectCliCommand {
       continueOnFailure: flags.continueOnFailure,
       adaptiveRateLimit: flags.adaptiveRateLimit,
       minParallel: flags.minParallel ?? 1,
-      allowConcurrentRunner: flags.allowConcurrentRunner
+      allowConcurrentRunner: flags.allowConcurrentRunner,
+      artifactIgnoreGlobs: flags.artifactIgnoreGlobs
     };
   }
 
@@ -2126,9 +2131,9 @@ export function projectHelp(): string {
     "  agent-fabric-project review-patches --queue <id> [--accept-task <queueTaskId>] [--apply-patch] [--apply-cwd <path>] [--json]",
     "  agent-fabric-project write-task-packets --queue <id> --out-dir <dir> [--format json|markdown] [--ready-only] [--json]",
     "  agent-fabric-project resume-task --queue <id> --queue-task <queueTaskId> [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--output-file <file>] [--format json|markdown] [--json]",
-    "  agent-fabric-project run-task --queue <id> --queue-task <queueTaskId> --command <cmd> [--cwd <path>] [--cwd-prep auto|none|mkdir] [--task-packet <path>] [--task-packet-format json|markdown] [--approval-token <token>] [--approve-tool-context] [--remember-tool-context] [--success-status patch_ready|completed] [--json]",
-    "  agent-fabric-project run-ready --queue <id> [--project <path>] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--adaptive-rate-limit] [--command-template <cmd>] [--cwd-template <path>] [--cwd-prep auto|none|mkdir] [--task-packet-dir <dir>] [--task-packet-format json|markdown] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--approval-token <token>] [--approve-tool-context] [--allow-concurrent-runner] [--continue-on-failure] [--json]",
-    "  agent-fabric-project factory-run --queue <id> [--start-execution] [--dry-run] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--task-packet-dir <dir>] [--cwd-template <path>] [--deepseek-worker-command <cmd>] [--deepseek-role auto|implementer|reviewer|risk-reviewer|adjudicator|planner] [--sensitive-context-mode basic|strict|off] [--patch-mode report|write] [--approval-token <token>|--approve-model-calls] [--approve-tool-context] [--allow-sensitive-context] [--allow-concurrent-runner] [--continue-on-failure] [--no-adaptive-rate-limit] [--json]",
+    "  agent-fabric-project run-task --queue <id> --queue-task <queueTaskId> --command <cmd> [--cwd <path>] [--cwd-prep auto|none|mkdir] [--task-packet <path>] [--task-packet-format json|markdown] [--approval-token <token>] [--approve-tool-context] [--remember-tool-context] [--success-status patch_ready|completed] [--artifact-ignore <glob>] [--json]",
+    "  agent-fabric-project run-ready --queue <id> [--project <path>] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--adaptive-rate-limit] [--command-template <cmd>] [--cwd-template <path>] [--cwd-prep auto|none|mkdir] [--task-packet-dir <dir>] [--task-packet-format json|markdown] [--worker ramicode|local-cli|openhands|aider|smolagents|codex-app-server|deepseek-direct|jcode-deepseek|manual] [--approval-token <token>] [--approve-tool-context] [--allow-concurrent-runner] [--continue-on-failure] [--artifact-ignore <glob>] [--json]",
+    "  agent-fabric-project factory-run --queue <id> [--start-execution] [--dry-run] [--limit <n>] [--parallel <n>] [--min-parallel <n>] [--task-packet-dir <dir>] [--cwd-template <path>] [--deepseek-worker-command <cmd>] [--deepseek-role auto|implementer|reviewer|risk-reviewer|adjudicator|planner] [--sensitive-context-mode basic|strict|off] [--patch-mode report|write] [--approval-token <token>|--approve-model-calls] [--approve-tool-context] [--allow-sensitive-context] [--allow-concurrent-runner] [--continue-on-failure] [--no-adaptive-rate-limit] [--artifact-ignore <glob>] [--json]",
     "  agent-fabric-project launch-plan --queue <id> [--limit <n>] [--json]",
     "  agent-fabric-project status --queue <id> [--json]",
     "  agent-fabric-project collab-summary --queue <id> [--json]",
@@ -3146,6 +3151,8 @@ async function runTask(
   }
 
   const before = snapshotFiles(cwd);
+  const artifactIgnoreGlobs = resolveArtifactIgnoreGlobs(command.artifactIgnoreGlobs);
+  const beforeFiltered = artifactIgnoreGlobs.size > 0 ? snapshotFiles(cwd, artifactIgnoreGlobs) : before;
   await call("fabric_task_event", {
     taskId: task.fabricTaskId,
     workerRunId,
@@ -3179,6 +3186,7 @@ async function runTask(
       }
     }
   ).finally(stopHeartbeat);
+  const after = snapshotFiles(cwd, artifactIgnoreGlobs);
   const durationMs = Date.now() - startedAt;
   await call("fabric_task_event", {
     taskId: task.fabricTaskId,
@@ -3206,7 +3214,7 @@ async function runTask(
     });
   }
 
-  const changedFiles = diffSnapshots(before, snapshotFiles(cwd));
+  const changedFiles = diffSnapshots(beforeFiltered, after);
   const structuredResult = loadStructuredWorkerResult(cwd, result.stdout, changedFiles);
   const structuredStatus = structuredResult?.status;
   const structuredSummary = structuredResult?.summary;
@@ -3361,7 +3369,8 @@ async function runReady(
             successStatus: command.successStatus,
             maxOutputChars: command.maxOutputChars,
             approveToolContext: command.approveToolContext,
-            rememberToolContext: command.rememberToolContext
+            rememberToolContext: command.rememberToolContext,
+            artifactIgnoreGlobs: command.artifactIgnoreGlobs
           },
           call
         );
@@ -3578,7 +3587,8 @@ async function factoryRun(
       maxOutputChars: command.maxOutputChars,
       approveToolContext: command.approveToolContext,
       rememberToolContext: command.rememberToolContext,
-      continueOnFailure: command.continueOnFailure
+      continueOnFailure: command.continueOnFailure,
+      artifactIgnoreGlobs: command.artifactIgnoreGlobs
     },
     call
   );
@@ -3938,10 +3948,19 @@ async function importTasks(
     modelAlias: "task.writer",
     outputSummary: `Imported ${payload.tasks.length} task(s) from ${command.tasksFile}.`
   });
-  const added = await call<Record<string, unknown>>("project_queue_add_tasks", {
-    queueId: command.queueId,
-    tasks: payload.tasks
-  });
+  let added: Record<string, unknown>;
+  if (payload.defaults && Object.keys(payload.defaults).length > 0) {
+    added = await call<Record<string, unknown>>("project_queue_add_task_batch", {
+      queueId: command.queueId,
+      defaults: payload.defaults,
+      tasks: payload.tasks
+    });
+  } else {
+    added = await call<Record<string, unknown>>("project_queue_add_tasks", {
+      queueId: command.queueId,
+      tasks: payload.tasks
+    });
+  }
   await call("project_queue_record_stage", {
     queueId: command.queueId,
     stage: "queue_shaping",
@@ -4341,11 +4360,15 @@ async function mergeWorker(
   };
 }
 
-function parseTasksFile(path: string): { tasks: unknown[] } {
+function parseTasksFile(path: string): { tasks: unknown[]; defaults?: Record<string, unknown> } {
   const parsed = JSON.parse(readFile(path)) as unknown;
   if (Array.isArray(parsed)) return { tasks: parsed };
   if (parsed && typeof parsed === "object" && Array.isArray((parsed as { tasks?: unknown }).tasks)) {
-    return { tasks: (parsed as { tasks: unknown[] }).tasks };
+    const record = parsed as { tasks: unknown[]; defaults?: unknown };
+    return {
+      tasks: record.tasks,
+      defaults: record.defaults && typeof record.defaults === "object" && !Array.isArray(record.defaults) ? (record.defaults as Record<string, unknown>) : undefined
+    };
   }
   throw new FabricError("INVALID_INPUT", "tasks file must be a JSON array or an object with a tasks array", false);
 }
@@ -5925,7 +5948,7 @@ const SNAPSHOT_SKIP_NAMES = new Set([
   ".agent-fabric"
 ]);
 
-function snapshotFiles(root: string): FileSnapshot {
+function snapshotFiles(root: string, ignoreGlobs?: Set<string>): FileSnapshot {
   const entries = new Map<string, SnapshotEntry>();
   let truncated = false;
   const maxFiles = 10_000;
@@ -5942,6 +5965,7 @@ function snapshotFiles(root: string): FileSnapshot {
     }
     for (const name of names) {
       if (SNAPSHOT_SKIP_NAMES.has(name)) continue;
+      if (ignoreGlobs && shouldIgnoreArtifact(name, ignoreGlobs)) continue;
       const path = join(dir, name);
       let stat;
       try {
@@ -6439,6 +6463,7 @@ type ParsedFlags = {
   reason?: string;
   note?: string;
   rewriteContextRefs?: string[];
+  artifactIgnoreGlobs?: string[];
 };
 
 function parseFlags(args: string[]): ParsedFlags {
@@ -6578,6 +6603,7 @@ function parseFlags(args: string[]): ParsedFlags {
     else if (arg === "--remember") flags.remember = true;
     else if (arg === "--note") flags.note = requiredValue(args, ++i, arg);
     else if (arg === "--run-tests") flags.runTests = true;
+    else if (arg === "--artifact-ignore") flags.artifactIgnoreGlobs = [...(flags.artifactIgnoreGlobs ?? []), requiredValue(args, ++i, arg)];
     else if (arg.startsWith("-")) throw new FabricError("INVALID_INPUT", `Unknown flag: ${arg}`, false);
     else if (!flags.proposalId) flags.proposalId = arg;
     else throw new FabricError("INVALID_INPUT", `Unexpected argument: ${arg}`, false);

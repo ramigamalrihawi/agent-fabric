@@ -502,6 +502,100 @@ export interface PatchDiffStats {
   affectedFiles: string[];
 }
 
+/* ------------------------------------------------------------------ */
+/*  Artifact ignore globs for patch harvesting                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Default artifact ignore globs cover common generated artifacts.
+ * These patterns are matched against basenames during recursive walks.
+ * Exact names match as-is; patterns containing `*` or `?` are treated
+ * as simple globs.
+ */
+export const DEFAULT_ARTIFACT_IGNORE_GLOBS = [
+  "*.log",
+  "*.tsbuildinfo",
+  "*.pyc",
+  "*.pyo",
+  "*.class",
+  "*.o",
+  "*.a",
+  "*.so",
+  "*.dylib",
+  "*.exe",
+  "*.dll",
+  "*.wasm",
+  "*.map",
+  "*.min.js",
+  "*.min.css",
+  "__pycache__",
+  ".DS_Store",
+  "Thumbs.db",
+  "*.swp",
+  "*.swo",
+  "*~"
+];
+
+/**
+ * Resolve merged artifact ignore globs from environment and CLI additions.
+ *
+ * Merge order (last wins for conflicts):
+ * 1. DEFAULT_ARTIFACT_IGNORE_GLOBS (always applied)
+ * 2. AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS env var (colon, comma, space, or semicolon delimited)
+ * 3. CLI-supplied additions (--artifact-ignore, repeatable)
+ *
+ * Returns a set of lowercase glob strings for efficient lookup.
+ */
+export function resolveArtifactIgnoreGlobs(cliAdditions?: string[]): Set<string> {
+  const globs = new Set(DEFAULT_ARTIFACT_IGNORE_GLOBS.map((g) => g.toLowerCase()));
+
+  const envValue = process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS ?? "";
+  for (const part of envValue.split(/[,:;\s]+/)) {
+    const trimmed = part.trim();
+    if (trimmed) globs.add(trimmed.toLowerCase());
+  }
+
+  if (cliAdditions) {
+    for (const addition of cliAdditions) {
+      const trimmed = addition.trim();
+      if (trimmed) globs.add(trimmed.toLowerCase());
+    }
+  }
+
+  return globs;
+}
+
+/**
+ * Check whether a path segment (basename) should be ignored based on artifact globs.
+ */
+export function shouldIgnoreArtifact(name: string, ignoreGlobs: Set<string>): boolean {
+  const lower = name.toLowerCase();
+  if (ignoreGlobs.has(lower)) return true;
+
+  // Check glob patterns (those containing * or ?)
+  for (const pattern of ignoreGlobs) {
+    if (!pattern.includes("*") && !pattern.includes("?")) continue;
+    if (simpleGlobMatch(pattern, lower)) return true;
+  }
+
+  return false;
+}
+
+function simpleGlobMatch(pattern: string, value: string): boolean {
+  const regexStr =
+    "^" +
+    pattern
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*/g, ".*")
+      .replace(/\?/g, ".") +
+    "$";
+  try {
+    return new RegExp(regexStr).test(value);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Compute diff stats from a patch without full file-entry parsing.
  * Returns basic counts and affected sorted paths for quick dry-run output.

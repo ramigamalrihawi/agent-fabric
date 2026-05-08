@@ -875,6 +875,7 @@ function renderDashboard() {
       ${metric("Risk", summary.risk?.highestOpenRisk || "none", `${summary.risk?.highRiskOpenCount || 0} high`)}
       ${metric("Estimate", money(summary.cost?.estimatedCostUsd || 0), `${summary.cost?.preflightCount || 0} preflights`)}
       ${workerCostCoverageMetric()}
+      ${taskCostCoverageMetric()}
     </div>
     ${operatorBriefPanelHtml()}
     ${liveLanesPanelHtml()}
@@ -2885,6 +2886,7 @@ function operatorBriefData() {
   const queue = dashboard.queue || state.matrix?.queue || {};
   const cost = summary.cost || {};
   const risk = summary.risk || {};
+  const taskCostCoverage = dashboard.taskCostCoverage || {};
   const parallel = parallelWorkPreview();
   const review = patchReviewTasks();
   const actionItems = state.actionInbox?.items || [];
@@ -2916,6 +2918,9 @@ function operatorBriefData() {
     parallelSerial: parallel.serial.length,
     parallelOverlaps: parallel.overlapScopes.length,
     reviewCount: review.length,
+    costCoveragePct: Number(taskCostCoverage.costCoveragePercent ?? 0),
+    tasksWithWorkerRuns: Number(taskCostCoverage.tasksWithWorkerRuns || 0),
+    tasksWithCost: Number(taskCostCoverage.tasksWithCost || 0),
     actionItems,
     policy,
     parallel,
@@ -2939,6 +2944,7 @@ function operatorBriefText(options = {}) {
     `Ready: ${data.ready} task(s), ${data.parallelSafe} parallel-safe, ${data.parallelSerial} serial/risk review`,
     `Approvals: ${data.pendingApprovals} pending, policy missing ${data.policy.queueMissing}, policy rejected ${data.policy.queueRejected}`,
     `Cost/Risk: ${money(data.estimatedCost)} estimated, ${data.preflights} preflight(s), ${data.highRisk} high-risk task(s)`,
+    `Cost Coverage: ${data.costCoveragePct}% (${data.tasksWithCost} of ${data.tasksWithWorkerRuns} worker tasks have cost data)`,
     `Patch review: ${data.reviewCount} task(s)`,
     `File overlap: ${data.parallelOverlaps} scope(s)`,
     ""
@@ -3273,6 +3279,25 @@ function workerCostCoverageMetric() {
     <div class="metric">
       <div class="metric-value">$${workerCost.toFixed(4)}</div>
       <div class="metric-label" title="${esc(detail)}">${esc(label)} - ${esc(detail.slice(0, 60))}</div>
+    </div>
+  `;
+}
+
+function taskCostCoverageMetric() {
+  const dashboard = state.dashboard || {};
+  const coverage = dashboard.taskCostCoverage || {};
+  const totalTasks = Number(coverage.totalTasks || 0);
+  const tasksWithCost = Number(coverage.tasksWithCost || 0);
+  const tasksWithWorkerRuns = Number(coverage.tasksWithWorkerRuns || 0);
+  if (tasksWithWorkerRuns === 0) return "";
+  const pct = Number(coverage.costCoveragePercent ?? 0);
+  const warning = coverage.coverageWarning || null;
+  const severity = pct >= 100 ? "green" : pct >= 50 ? "amber" : "red";
+  const detail = warning ? warning : `${tasksWithCost} of ${tasksWithWorkerRuns} worker tasks have cost data`;
+  return `
+    <div class="metric">
+      <div class="metric-value ${severity}">${pct}%</div>
+      <div class="metric-label" title="${esc(detail)}">${esc("Cost Coverage")} - ${esc(detail.slice(0, 60))}</div>
     </div>
   `;
 }

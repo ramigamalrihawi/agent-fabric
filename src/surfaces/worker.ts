@@ -1,3 +1,5 @@
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { newId } from "../ids.js";
 import { FabricError } from "../runtime/errors.js";
 import {
@@ -98,6 +100,25 @@ const EVENT_KINDS = new Set([
 const FINAL_STATUSES = new Set(["completed", "failed", "canceled"]);
 const DEFAULT_TAIL_MAX_LINES = 200;
 const DEFAULT_TAIL_MAX_BYTES = 64 * 1024;
+const DEFAULT_TAIL_LOG_BYTES = 8192;
+const LOG_METADATA_KEYS = ["stdoutLogPath", "stderrLogPath"] as const;
+type LogMetadataKey = (typeof LOG_METADATA_KEYS)[number];
+
+type TailLogEntry = {
+  eventId: string;
+  kind: LogMetadataKey;
+  path: string;
+  content: string | null;
+  bytes: number;
+  truncated: boolean;
+};
+
+type TailLogError = {
+  eventId: string;
+  kind: LogMetadataKey;
+  path: string;
+  error: "unsafe_path" | "not_found" | "read_error";
+};
 
 export function fabricTaskCreate(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
   const title = getString(input, "title");
@@ -380,8 +401,10 @@ export function fabricTaskTail(host: SurfaceHost, input: unknown, context: CallC
   }
   requireTask(host, resolvedTaskId, session.workspace_root);
 
+  const includeLogs = getField(input, "includeLogs") === true;
   const maxLines = clampTailLimit(getOptionalNumber(input, "maxLines"), DEFAULT_TAIL_MAX_LINES);
   const maxBytes = clampTailLimit(getOptionalNumber(input, "maxBytes"), DEFAULT_TAIL_MAX_BYTES);
+  const maxLogBytes = clampTailLimit(getOptionalNumber(input, "maxLogBytes"), DEFAULT_TAIL_LOG_BYTES);
   const params = resolvedWorkerRunId ? [resolvedTaskId, resolvedWorkerRunId] : [resolvedTaskId];
   const filter = resolvedWorkerRunId ? " AND worker_run_id = ?" : "";
 
@@ -405,7 +428,7 @@ export function fabricTaskTail(host: SurfaceHost, input: unknown, context: CallC
     (row) => JSON.stringify(formatCheckpoint(row))
   );
 
-  return {
+  const result: Record<string, unknown> = {
     resolveMode: byWorkerRun ? "workerRunId" : byTask ? "taskId" : "queueId",
     taskId: resolvedTaskId,
     workerRunId: resolvedWorkerRunId,
@@ -418,6 +441,16 @@ export function fabricTaskTail(host: SurfaceHost, input: unknown, context: CallC
     totalEventCount: eventRows.length,
     totalCheckpointCount: checkpointRows.length
   };
+
+  if (includeLogs) {
+    const [logEntries, logErrors] = collectLogs(eventRows, session.workspace_root, maxLogBytes);
+    result.logs = logEntries;
+    if (logErrors.length > 0) {
+      result.logErrors = logErrors;
+    }
+  }
+
+  return result;
 }
 
 export function fabricTaskFinish(host: SurfaceHost, input: unknown, context: CallContext): Record<string, unknown> {
@@ -557,6 +590,64 @@ function applyTailLimits<T>(rows: T[], maxLines: number, maxBytes: number, seria
     bytes += nextBytes;
   }
   return [result, false];
+}
+
+function collectLogs(
+  eventRows: WorkerEventRow[],
+  workspaceRoot: string,
+  maxLogBytes: number
+): [TailLogEntry[], TailLogError[]] {
+  const entries: TailLogEntry[] = [];
+  const errors: TailLogError[] = [];
+  const root = resolve(workspaceRoot);
+
+  for (const row of eventRows) {
+    const metadata = safeJsonRecord(row.metadata_json);
+    for (const key of LOG_METADATA_KEYS) {
+      const logPath = typeof metadata[key] === "string" ? metadata[key] : undefined;
+      if (!logPath) continue;
+
+      const resolved = resolveLogPath(root, logPath);
+      if (!resolved) {
+        errors.push({ eventId: row.id, kind: key, path: logPath, error: "unsafe_path" });
+        continue;
+      }
+
+      if (!existsSync(resolved)) {
+        errors.push({ eventId: row.id, kind: key, path: logPath, error: "not_found" });
+        continue;
+      }
+
+      try {
+        const raw = readFileSync(resolved);
+        const truncated = raw.length > maxLogBytes;
+        const content = raw.subarray(0, maxLogBytes).toString("utf8");
+        entries.push({
+          eventId: row.id,
+          kind: key,
+          path: logPath,
+          content: content || null,
+          bytes: Buffer.byteLength(content, "utf8"),
+          truncated
+        });
+      } catch {
+        errors.push({ eventId: row.id, kind: key, path: logPath, error: "read_error" });
+      }
+    }
+  }
+
+  return [entries, errors];
+}
+
+function resolveLogPath(workspaceRoot: string, logPath: string): string | undefined {
+  const resolved = logPath.startsWith("/") ? resolve(logPath) : resolve(workspaceRoot, logPath);
+  return isResolvedPathInside(resolved, workspaceRoot) ? resolved : undefined;
+}
+
+function isResolvedPathInside(path: string, root: string): boolean {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedRoot = root.replace(/\\/g, "/").replace(/\/+$/, "");
+  return normalized === normalizedRoot || normalized.startsWith(`${normalizedRoot}/`);
 }
 
 function taskStatus(

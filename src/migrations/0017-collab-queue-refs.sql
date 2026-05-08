@@ -1,0 +1,3 @@
+ALTER TABLE decisions ADD COLUMN refs_json TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE claims ADD COLUMN refs_json TEXT NOT NULL DEFAULT '[]';

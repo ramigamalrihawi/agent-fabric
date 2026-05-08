@@ -290,6 +290,7 @@ export function claimPath(host: SurfaceHost, input: unknown, context: CallContex
   const paths = getRequiredStringArray(input, "paths");
   const note = getOptionalString(input, "note") ?? null;
   const mode = getOptionalString(input, "mode") ?? "normal";
+  const refs = getStringArray(input, "refs");
   const ttl = getOptionalNumber(input, "ttl") ?? 1800;
   return host.recordMutation("claim_path", input, context, (session) => {
     const conflicts = activeClaimConflicts(host.db, session.workspace_root, paths).filter((claim) => claim.agentId !== session.agent_id);
@@ -313,9 +314,9 @@ export function claimPath(host: SurfaceHost, input: unknown, context: CallContex
     const expiresAt = new Date(host.now().getTime() + ttl * 1000).toISOString();
     host.db.db
       .prepare(
-        "INSERT INTO claims (id, ts_expires, agent_id, session_id, workspace_root, paths_json, note, mode, overlapping) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO claims (id, ts_expires, agent_id, session_id, workspace_root, paths_json, note, mode, overlapping, refs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
       )
-      .run(claimId, expiresAt, session.agent_id, session.id, session.workspace_root, JSON.stringify(paths), note, mode, conflicts.length ? 1 : 0);
+      .run(claimId, expiresAt, session.agent_id, session.id, session.workspace_root, JSON.stringify(paths), note, mode, conflicts.length ? 1 : 0, JSON.stringify(refs));
     host.writeAuditAndEvent({
       sessionId: session.id,
       agentId: session.agent_id,
@@ -403,13 +404,14 @@ export function collabDecision(host: SurfaceHost, input: unknown, context: CallC
   const participants = getStringArray(input, "participants");
   const rationale = getOptionalString(input, "rationale") ?? null;
   const supersedes = getOptionalString(input, "supersedes") ?? null;
+  const refs = getStringArray(input, "refs");
   return host.recordMutation("collab_decision", input, context, (session) => {
     const decisionId = newId("dec");
     host.db.db
       .prepare(
-        "INSERT INTO decisions (id, title, decided, recorded_by_agent_id, participants_json, rationale, supersedes, workspace_root) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO decisions (id, title, decided, recorded_by_agent_id, participants_json, rationale, supersedes, workspace_root, refs_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
       )
-      .run(decisionId, title, decided, session.agent_id, JSON.stringify(participants), rationale, supersedes, session.workspace_root);
+      .run(decisionId, title, decided, session.agent_id, JSON.stringify(participants), rationale, supersedes, session.workspace_root, JSON.stringify(refs));
     host.writeAuditAndEvent({
       sessionId: session.id,
       agentId: session.agent_id,
