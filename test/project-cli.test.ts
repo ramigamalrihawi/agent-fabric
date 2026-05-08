@@ -3,8 +3,16 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FabricDaemon } from "../src/daemon.js";
-import { formatProjectResult, formatSeniorRun, parseProjectCliArgs, runProjectCommand, type ProjectToolCaller } from "../src/runtime/project-cli.js";
-import { resolveArtifactIgnoreGlobs, shouldIgnoreArtifact, DEFAULT_ARTIFACT_IGNORE_GLOBS } from "../src/runtime/patches.js";
+import {
+  formatProjectResult,
+  formatSeniorRun,
+  matchesGlob,
+  parseProjectCliArgs,
+  resolveArtifactIgnoreGlobs,
+  runProjectCommand,
+  snapshotFiles,
+  type ProjectToolCaller
+} from "../src/runtime/project-cli.js";
 import type { BridgeRegister, BridgeSession } from "../src/types.js";
 
 describe("project CLI runner", () => {
@@ -15,6 +23,7 @@ describe("project CLI runner", () => {
   const originalSeniorLaneCount = process.env.AGENT_FABRIC_SENIOR_LANE_COUNT;
   const originalSeniorMaxLaneCount = process.env.AGENT_FABRIC_SENIOR_MAX_LANE_COUNT;
   const originalQueueMaxAgents = process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS;
+  const originalArtifactIgnoreGlobs = process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS;
 
   beforeEach(() => {
     delete process.env.AGENT_FABRIC_SENIOR_MODE;
@@ -24,6 +33,7 @@ describe("project CLI runner", () => {
     delete process.env.AGENT_FABRIC_SENIOR_LANE_COUNT;
     delete process.env.AGENT_FABRIC_SENIOR_MAX_LANE_COUNT;
     delete process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS;
+    delete process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS;
   });
 
   it("redacts approval tokens from JSON output", () => {
@@ -67,6 +77,8 @@ describe("project CLI runner", () => {
     else process.env.AGENT_FABRIC_SENIOR_MAX_LANE_COUNT = originalSeniorMaxLaneCount;
     if (originalQueueMaxAgents === undefined) delete process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS;
     else process.env.AGENT_FABRIC_QUEUE_MAX_AGENTS = originalQueueMaxAgents;
+    if (originalArtifactIgnoreGlobs === undefined) delete process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS;
+    else process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS = originalArtifactIgnoreGlobs;
   });
 
   it("parses create and launch commands", () => {
@@ -3147,170 +3159,369 @@ describe("project CLI runner", () => {
     daemon.close();
   });
 
-  it("imports batch tasks with defaults via import-tasks routing through project_queue_add_task_batch", async () => {
+  it("rejects unsafe patch paths (traversal and .git) in dry-run", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-merge-unsafe-"));
+    const tasksFile = join(projectPath, "tasks.json");
+    writeFileSync(tasksFile, JSON.stringify({ tasks: [{ clientKey: "merge", title: "Merge unsafe test task", goal: "Produce a patch for dry-run.", risk: "low", priority: "normal", expectedFiles: ["hello.txt"], acceptanceCriteria: ["Patch applies cleanly."] }] }));
+    const created = await runProjectCommand({ command: "create", json: false, projectPath, promptSummary: "Merge unsafe test.", pipelineProfile: "balanced", maxParallelAgents: 4 }, call);
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    writeFileSync(join(projectPath, "hello.txt"), "old\n", "utf8");
+    const patch = "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    const safePatchFile = join(projectPath, "safe.patch");
+    writeFileSync(safePatchFile, patch, "utf8");
+
+    // Test 1: patch with traversal path via patchRefs
+    await call("project_queue_update_task", { queueId, queueTaskId: task.queueTaskId, status: "patch_ready", summary: "Ready.", patchRefs: ["../escape.patch"], testRefs: [] });
+    await expect(runProjectCommand({ command: "merge-worker", json: false, queueId, queueTaskId: task.queueTaskId, applyCwd: projectPath }, call)).rejects.toThrow(/inside apply cwd/);
+
+    // Test 2: patch with .git path
+    await call("project_queue_update_task", { queueId, queueTaskId: task.queueTaskId, status: "patch_ready", summary: "Ready.", patchRefs: [join(projectPath, ".git/config.patch")], testRefs: [] });
+    await expect(runProjectCommand({ command: "merge-worker", json: false, queueId, queueTaskId: task.queueTaskId, applyCwd: projectPath }, call)).rejects.toThrow(/inside apply cwd/);
+
+    // Test 3: a safe patch should pass dry-run cleanly
+    await call("project_queue_update_task", { queueId, queueTaskId: task.queueTaskId, status: "patch_ready", summary: "Ready.", patchRefs: [safePatchFile], testRefs: [] });
+    const ok = await runProjectCommand({ command: "merge-worker", json: false, queueId, queueTaskId: task.queueTaskId, applyCwd: projectPath }, call);
+    expect(ok.action).toBe("merge_worker_clean");
+    daemon.close();
+  });
+
+  it("dry-run rejects missing or non-existent cwd", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-merge-nocwd-"));
+    const tasksFile = join(projectPath, "tasks.json");
+    writeFileSync(tasksFile, JSON.stringify({ tasks: [{ clientKey: "merge", title: "Merge no-cwd task", goal: "Produce a patch for dry-run with missing cwd.", risk: "low", priority: "normal", expectedFiles: ["hello.txt"], acceptanceCriteria: ["Dry-run rejects missing cwd cleanly."] }] }));
+    const created = await runProjectCommand({ command: "create", json: false, projectPath, promptSummary: "Merge no-cwd test.", pipelineProfile: "balanced", maxParallelAgents: 4 }, call);
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    const patchFile = join(projectPath, "result.patch");
+    writeFileSync(patchFile, "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n", "utf8");
+    await call("project_queue_update_task", { queueId, queueTaskId: task.queueTaskId, status: "patch_ready", summary: "Ready.", patchRefs: [patchFile], testRefs: [] });
+    const badCwd = join(projectPath, "nonexistent");
+    await expect(runProjectCommand({ command: "merge-worker", json: false, queueId, queueTaskId: task.queueTaskId, applyCwd: badCwd }, call)).rejects.toThrow(/Workspace cwd does not exist/);
+    daemon.close();
+  });
+
+  it("merge-worker --apply rejects when conflicts are detected", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-merge-conflict-apply-"));
+    const tasksFile = join(projectPath, "tasks.json");
+    writeFileSync(tasksFile, JSON.stringify({ tasks: [{ clientKey: "merge", title: "Merge conflict apply task", goal: "Produce a conflicting patch.", risk: "low", priority: "normal", expectedFiles: ["hello.txt"], acceptanceCriteria: ["Apply blocked by conflicts."] }] }));
+    const created = await runProjectCommand({ command: "create", json: false, projectPath, promptSummary: "Merge conflict apply test.", pipelineProfile: "balanced", maxParallelAgents: 4 }, call);
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    writeFileSync(join(projectPath, "hello.txt"), "unexpected content\n", "utf8");
+    const patch = "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    const patchFile = join(projectPath, "result.patch");
+    writeFileSync(patchFile, patch, "utf8");
+    await call("project_queue_update_task", { queueId, queueTaskId: task.queueTaskId, status: "patch_ready", summary: "Patch is ready.", patchRefs: [patchFile], testRefs: ["node -e \"process.exit(0)\""] });
+    const agent = task.queueTaskId;
+    await expect(runProjectCommand({ command: "merge-worker", json: false, queueId, agent, apply: true, runTests: true, cwd: projectPath, reviewedBy: "Codex", reviewSummary: "Should be blocked by conflicts." }, call)).rejects.toThrow("MERGE_WORKER_CONFLICTS");
+    expect(readFileSync(join(projectPath, "hello.txt"), "utf8")).toBe("unexpected content\n");
+    daemon.close();
+  });
+
+  it("imports batch tasks with defaults via the CLI, routing through project_queue_add_task_batch", async () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload());
     const call = caller(daemon, session);
     const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-batch-import-"));
+    const tasksFile = writeBatchTasksFile(projectPath);
     const created = await runProjectCommand(
       { command: "create", json: false, projectPath, promptSummary: "Batch import test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
       call
     );
     const queueId = created.data.queueId as string;
+    const imported = await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    expect(imported.action).toBe("tasks_imported");
+    const createdTasks = imported.data.created as Array<{ clientKey?: string; title: string; queueTaskId: string }>;
+    expect(createdTasks).toHaveLength(3);
 
-    // Direct call to project_queue_add_task_batch with defaults
-    const direct = await call<{ created: Array<Record<string, unknown>> }>("project_queue_add_task_batch", {
-      queueId,
-      defaults: { phase: "batch-phase", risk: "medium", priority: "normal", expectedFiles: ["src/shared.ts"], acceptanceCriteria: ["Shared acceptance"] },
-      tasks: [
-        { clientKey: "batch-a", title: "Batch task A", goal: "First.", expectedFiles: ["src/task-a.ts"], acceptanceCriteria: ["Task A specific"], dependsOn: ["batch-b"] },
-        { clientKey: "batch-b", title: "Batch task B", goal: "Second.", risk: "low", expectedFiles: ["src/task-b.ts"] },
-        { clientKey: "batch-c", title: "Batch task C", goal: "Third.", priority: "high" }
-      ]
-    });
-    expect(direct.created).toHaveLength(3);
+    const status = await runProjectCommand({ command: "status", json: false, queueId }, call);
+    const tasks = (status.data as Record<string, unknown>).tasks as Array<Record<string, unknown>>;
+    expect(tasks).toHaveLength(3);
 
-    const status = await call<{ tasks: Array<Record<string, unknown>> }>("project_queue_status", { queueId });
-    expect(status.tasks).toHaveLength(3);
-
-    const taskA = status.tasks.find((t) => t.title === "Batch task A");
-    const taskB = status.tasks.find((t) => t.title === "Batch task B");
-    const taskC = status.tasks.find((t) => t.title === "Batch task C");
+    const taskA = tasks.find((t) => t.title === "Batch task A");
+    const taskB = tasks.find((t) => t.title === "Batch task B");
+    const taskC = tasks.find((t) => t.title === "Batch task C");
     expect(taskA).toBeDefined();
+    expect(taskB).toBeDefined();
+    expect(taskC).toBeDefined();
+
+    // Inherited defaults
     expect(taskA?.phase).toBe("batch-phase");
     expect(taskA?.risk).toBe("medium");
     expect(taskA?.priority).toBe("normal");
+    // Overridden risk
     expect(taskB?.risk).toBe("low");
+    // Overridden priority
     expect(taskC?.priority).toBe("high");
+    // Inherited defaults for C
     expect(taskC?.phase).toBe("batch-phase");
     expect(taskC?.risk).toBe("medium");
 
     daemon.close();
   });
-});
 
-describe("artifact ignore globs", () => {
-  const originalArtifactIgnoreGlobs = process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS;
-  const originalSeniorAllowNonDeepSeek = process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
-
-  afterEach(() => {
-    if (originalArtifactIgnoreGlobs === undefined) delete process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS;
-    else process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS = originalArtifactIgnoreGlobs;
-    if (originalSeniorAllowNonDeepSeek === undefined) delete process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS;
-    else process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS = originalSeniorAllowNonDeepSeek;
-  });
-
-  it("includes sensible defaults that cover common generated artifacts", () => {
-    const globs = resolveArtifactIgnoreGlobs();
-    expect(globs.has("*.log")).toBe(true);
-    expect(globs.has("*.tsbuildinfo")).toBe(true);
-    expect(globs.has("*.pyc")).toBe(true);
-    expect(globs.has("__pycache__")).toBe(true);
-    expect(globs.has(".ds_store")).toBe(true);
-    expect(globs.has("thumbs.db")).toBe(true);
-    expect(globs.has("*.swp")).toBe(true);
-    expect(globs.has("*~")).toBe(true);
-  });
-
-  it("merges AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS env var with defaults", () => {
-    process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS = "*.generated.md,tmp:priv/static";
-    const globs = resolveArtifactIgnoreGlobs();
-    expect(globs.has("*.generated.md")).toBe(true);
-    expect(globs.has("tmp")).toBe(true);
-    expect(globs.has("priv/static")).toBe(true);
-    expect(globs.has("*.log")).toBe(true);
-  });
-
-  it("merges CLI additions with env and defaults", () => {
-    process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS = "*.env-out";
-    const globs = resolveArtifactIgnoreGlobs(["cli-tmp", "*.cli-gen"]);
-    expect(globs.has("*.env-out")).toBe(true);
-    expect(globs.has("cli-tmp")).toBe(true);
-    expect(globs.has("*.cli-gen")).toBe(true);
-    expect(globs.has("*.log")).toBe(true);
-  });
-
-  it("shouldIgnoreArtifact matches exact names case-insensitively", () => {
-    const globs = resolveArtifactIgnoreGlobs();
-    expect(shouldIgnoreArtifact("Thumbs.db", globs)).toBe(true);
-    expect(shouldIgnoreArtifact("thumbs.db", globs)).toBe(true);
-    expect(shouldIgnoreArtifact("THUMBS.DB", globs)).toBe(true);
-    expect(shouldIgnoreArtifact("__pycache__", globs)).toBe(true);
-  });
-
-  it("shouldIgnoreArtifact matches simple glob patterns", () => {
-    const globs = resolveArtifactIgnoreGlobs();
-    expect(shouldIgnoreArtifact("app.log", globs)).toBe(true);
-    expect(shouldIgnoreArtifact("debug.log", globs)).toBe(true);
-    expect(shouldIgnoreArtifact("main.tsbuildinfo", globs)).toBe(true);
-    expect(shouldIgnoreArtifact("test.pyc", globs)).toBe(true);
-    expect(shouldIgnoreArtifact("myfile.swp", globs)).toBe(true);
-    expect(shouldIgnoreArtifact("backup~", globs)).toBe(true);
-    expect(shouldIgnoreArtifact("main.ts", globs)).toBe(false);
-    expect(shouldIgnoreArtifact("app.py", globs)).toBe(false);
-    expect(shouldIgnoreArtifact("README.md", globs)).toBe(false);
-    expect(shouldIgnoreArtifact("index.js", globs)).toBe(false);
-  });
-
-  it("parses --artifact-ignore flag from CLI args", () => {
-    const parsed = parseProjectCliArgs([
-      "run-task",
-      "--queue", "pqueue_1",
-      "--queue-task", "pqtask_1",
-      "--command", "echo hi",
-      "--artifact-ignore", "*.generated.md",
-      "--artifact-ignore", "tmp"
-    ]);
-    expect(parsed).toMatchObject({
-      command: "run-task",
-      queueId: "pqueue_1",
-      artifactIgnoreGlobs: ["*.generated.md", "tmp"]
-    });
-
-    const parsedReady = parseProjectCliArgs([
-      "run-ready",
-      "--queue", "pqueue_1",
-      "--artifact-ignore", "*.log"
-    ]);
-    expect(parsedReady).toMatchObject({
-      command: "run-ready",
-      artifactIgnoreGlobs: ["*.log"]
-    });
-  });
-
-  it("excludes artifact-ignored files from changed-files output", async () => {
-    process.env.AGENT_FABRIC_SENIOR_ALLOW_NON_DEEPSEEK_WORKERS = "1";
+  it("end-to-end dispatch tail health merge smoke: creates a queue, adds batch tasks, launches mock workers through run-ready, tails a worker, checks health, builds a patch review plan, and dry-runs merge-worker", async () => {
     const daemon = new FabricDaemon({ dbPath: ":memory:" });
     const session = daemon.registerBridge(registerPayload());
     const call = caller(daemon, session);
-    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-project-cli-artifact-ignore-"));
-    const tasksFile = join(projectPath, "tasks.json");
-    writeFileSync(
-      tasksFile,
-      JSON.stringify({
-        tasks: [
-          {
-            clientKey: "artifact",
-            title: "Artifact ignore test",
-            goal: "Generate log and source files; logs should not appear in changed files.",
-            risk: "low",
-            priority: "normal",
-            expectedFiles: ["src/main.ts"],
-            acceptanceCriteria: ["*.log files excluded from changed files."]
-          }
-        ]
-      })
-    );
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-e2e-smoke-"));
+    const sandboxDir = join(projectPath, "sandboxes");
 
+    // 1. Create queue
     const created = await runProjectCommand(
       {
         command: "create",
         json: false,
         projectPath,
-        promptSummary: "Artifact ignore integration test.",
+        promptSummary: "End-to-end smoke test.",
         pipelineProfile: "balanced",
         maxParallelAgents: 4
       },
+      call
+    );
+    expect(created.action).toBe("created");
+    const queueId = created.data.queueId as string;
+
+    // 2. Add templated parallel tasks via batch
+    const batch = await call<{ created: Array<{ queueTaskId: string; fabricTaskId: string; title: string }> }>(
+      "project_queue_add_task_batch",
+      {
+        queueId,
+        defaults: {
+          phase: "smoke",
+          risk: "low",
+          priority: "normal",
+          expectedFiles: ["result.txt"],
+          acceptanceCriteria: ["Result file exists."]
+        },
+        tasks: [
+          {
+            clientKey: "smoke-1",
+            title: "Smoke task 1",
+            goal: "Write file A.",
+            expectedFiles: ["file-a.txt"]
+          },
+          {
+            clientKey: "smoke-2",
+            title: "Smoke task 2",
+            goal: "Write file B.",
+            expectedFiles: ["file-b.txt"]
+          }
+        ]
+      }
+    );
+    expect(batch.created).toHaveLength(2);
+
+    // 3. Start execution
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+    // 4. Launch mock workers through run-ready (manual + sandbox)
+    const runResult = await runProjectCommand(
+      {
+        command: "run-ready",
+        json: false,
+        queueId,
+        limit: 2,
+        parallel: 2,
+        commandTemplate: "node -e \"require('node:fs').writeFileSync({{title}} + '-result.txt', 'smoke-output')\"",
+        cwdTemplate: `${sandboxDir}/{{queueTaskId}}`,
+        worker: "manual",
+        workspaceMode: "sandbox",
+        modelProfile: "execute.cheap",
+        successStatus: "patch_ready",
+        maxOutputChars: 4_000,
+        approveToolContext: true,
+        rememberToolContext: true,
+        continueOnFailure: false,
+        allowSharedCwd: false
+      },
+      call
+    );
+    expect(runResult.action).toBe("ready_tasks_run");
+    expect(runResult.data.runCount).toBe(2);
+
+    const runs = runResult.data.runs as Array<{
+      queueTaskId: string; fabricTaskId: string; workerRunId: string;
+    }>;
+    const firstRun = runs[0];
+
+    // Attach patch refs to the queue tasks so merge-worker can resolve them
+    for (const run of runs) {
+      const patchFile = join(sandboxDir, run.queueTaskId, "result.patch");
+      writeFileSync(patchFile, [
+        "diff --git a/result.txt b/result.txt",
+        "--- a/result.txt",
+        "+++ b/result.txt",
+        "@@ -0,0 +1 @@",
+        "+smoke-output"
+      ].join("\n"), "utf8");
+      await call("project_queue_update_task", {
+        queueId,
+        queueTaskId: run.queueTaskId,
+        status: "patch_ready",
+        summary: "Smoke task complete.",
+        patchRefs: [patchFile],
+        testRefs: ["node -e \"true\""]
+      });
+    }
+
+    // 5. Tail a worker via the daemon's fabric_task_tail tool
+    const tailResult = await call<{
+      resolveMode: string; taskId: string; eventCount: number; truncated: boolean;
+    }>("fabric_task_tail", {
+      queueId,
+      queueTaskId: firstRun.queueTaskId
+    });
+    expect(tailResult.resolveMode).toBe("queueId");
+    expect(tailResult.taskId).toBe(firstRun.fabricTaskId);
+    expect(tailResult.eventCount).toBeGreaterThanOrEqual(2);
+    expect(tailResult.truncated).toBe(false);
+
+    // 6. Check worker health
+    const health = await call<{
+      summary: Record<string, number>; workers: Array<{ classification: string; workerRunId?: string }>;
+    }>("project_queue_worker_health", { queueId });
+    expect(health.summary.patchReady).toBe(2);
+    expect(health.workers).toHaveLength(2);
+    for (const w of health.workers) {
+      expect(w.classification).toBe("patch_ready");
+    }
+
+    // 7. Build a patch review plan
+    const reviewPlan = await call<{
+      summary: Record<string, number>; entries: Array<Record<string, unknown>>;
+    }>("project_queue_patch_review_plan", { queueId });
+    expect(reviewPlan.summary.patchReadyCount).toBe(2);
+    expect(reviewPlan.entries).toHaveLength(2);
+    for (const entry of reviewPlan.entries) {
+      expect(entry.workerRun).toBeDefined();
+      expect(entry.worktreePath).toBeDefined();
+    }
+
+    // 8. Dry-run merge-worker for the first worker
+    const merge = await runProjectCommand(
+      { command: "merge-worker", json: false, queueId, workerRunId: firstRun.workerRunId, apply: false, runTests: false, cwd: sandboxDir },
+      call
+    );
+    expect(merge.action).toBe("merge_worker_clean");
+
+    // Verify sandbox files exist
+    for (const run of runs) {
+      const status = await call<{ tasks: Array<{ title: string; queueTaskId: string }> }>("project_queue_status", { queueId });
+      const task = status.tasks.find((t) => t.queueTaskId === run.queueTaskId);
+      const resultFile = join(sandboxDir, run.queueTaskId, `${task?.title ?? run.queueTaskId}-result.txt`);
+      expect(readFileSync(resultFile, "utf8")).toBe("smoke-output");
+    }
+
+    daemon.close();
+  });
+
+  it("writes task packets and excludes private material from context bundles", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-secret-exclusion-"));
+    const tasksFile = writeTasksFile(projectPath);
+    writeFileSync(join(projectPath, "README.md"), "# Project\n\nPublic readme.\n", "utf8");
+    mkdirSync(join(projectPath, "src"));
+    writeFileSync(join(projectPath, "src/main.ts"), "export const main = (): string => 'hello';\n", "utf8");
+    writeFileSync(join(projectPath, ".env"), "SECRET_KEY=test123\n", "utf8");
+    writeFileSync(join(projectPath, ".secrets-config"), "api=abc\n", "utf8");
+    writeFileSync(join(projectPath, "access-token.txt"), "tok=xyz\n", "utf8");
+    writeFileSync(join(projectPath, "ssh-key.pem"), "-----BEGIN RSA PRIVATE KEY-----\n", "utf8");
+    mkdirSync(join(projectPath, "decisions"));
+    writeFileSync(join(projectPath, "decisions/local-plan.md"), "private architecture note\n", "utf8");
+    mkdirSync(join(projectPath, ".agent-fabric-local"));
+    writeFileSync(join(projectPath, ".agent-fabric-local/state.json"), '{"data":"private"}\n', "utf8");
+    mkdirSync(join(projectPath, "artifacts"));
+    writeFileSync(join(projectPath, "artifacts/output.txt"), "build output\n", "utf8");
+
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Secret exclusion test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+    const outDir = join(projectPath, "packets");
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    await call("project_queue_update_task_metadata", {
+      queueId,
+      queueTaskId: task.queueTaskId,
+      expectedFiles: ["README.md", ".env", "src/main.ts"],
+      requiredContextRefs: ["decisions/local-plan.md", ".secrets-config", "access-token.txt", "ssh-key.pem", ".agent-fabric-local/state.json", "artifacts/output.txt"]
+    });
+
+    const result = await runProjectCommand(
+      { command: "write-task-packets", json: false, queueId, outDir, format: "markdown", readyOnly: false },
+      call
+    );
+
+    expect(result.action).toBe("task_packets_written");
+    const contextPath = join(outDir, `${task.queueTaskId}.context.md`);
+    const contextText = readFileSync(contextPath, "utf8");
+
+    // Public files included
+    expect(contextText).toContain("README.md");
+    expect(contextText).toContain("Public readme");
+    expect(contextText).toContain("src/main.ts");
+    expect(contextText).toContain("const main");
+
+    // Secret-like and private paths skipped
+    expect(contextText).toContain("secret-like path skipped");
+    expect(contextText).not.toContain("SECRET_KEY");
+    expect(contextText).toContain("decisions/local-plan.md: secret-like path skipped");
+    expect(contextText).toContain(".agent-fabric-local/state.json: secret-like path skipped");
+    expect(contextText).toContain("artifacts/output.txt: secret-like path skipped");
+
+    // Verify markdown packet has frontmatter
+    const packetPath = join(outDir, `${task.queueTaskId}.md`);
+    const packetText = readFileSync(packetPath, "utf8");
+    expect(packetText).toContain("schema: agent-fabric.task-packet.v1");
+    expect(packetText).toContain(`queueId: "${queueId}"`);
+    expect(packetText).toContain(`contextFilePath: "${contextPath}"`);
+    expect(packetText).toContain("## Goal");
+    expect(packetText).toContain("## Terminal Tool Guidance");
+    expect(packetText).toContain("### automationSafe");
+    expect(packetText).toContain("### humanFacingOrOptional");
+
+    daemon.close();
+  });
+
+  it("writes context bundle omitting large and binary files", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-bundle-cap-"));
+    const tasksFile = writeTasksFile(projectPath);
+    writeFileSync(join(projectPath, "README.md"), "# Hi\n", "utf8");
+    const bigFile = join(projectPath, "huge.log");
+    writeFileSync(bigFile, "x".repeat(50_000), "utf8");
+    writeFileSync(join(projectPath, "data.bin"), Buffer.from([0x00, 0x01, 0x02, 0x00, 0xff]), "binary");
+
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Bundle cap test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
       call
     );
     const queueId = created.data.queueId as string;
@@ -3318,40 +3529,277 @@ describe("artifact ignore globs", () => {
     await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
     const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
     const task = status.tasks[0];
-    mkdirSync(join(projectPath, "src"), { recursive: true });
+    await call("project_queue_update_task_metadata", {
+      queueId,
+      queueTaskId: task.queueTaskId,
+      expectedFiles: ["README.md", "huge.log", "data.bin"]
+    });
 
-    const ran = await runProjectCommand(
+    const outDir = join(projectPath, "packets");
+    await runProjectCommand({ command: "write-task-packets", json: false, queueId, outDir, format: "json", readyOnly: false }, call);
+    const contextText = readFileSync(join(outDir, `${task.queueTaskId}.context.md`), "utf8");
+
+    expect(contextText).toContain("README.md");
+    expect(contextText).toContain("huge.log: too large");
+    expect(contextText).toContain("data.bin: binary-looking content");
+
+    daemon.close();
+  });
+
+  it("writes JSON task packets with terminal tool guidance", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-json-packet-"));
+    const tasksFile = writeTasksFile(projectPath);
+    writeFileSync(join(projectPath, "README.md"), "# Public\n", "utf8");
+
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "JSON packet test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    await call("project_queue_update_task_metadata", { queueId, queueTaskId: task.queueTaskId, expectedFiles: ["README.md"] });
+
+    const outDir = join(projectPath, "packets");
+    await runProjectCommand({ command: "write-task-packets", json: false, queueId, outDir, format: "json", readyOnly: false }, call);
+
+    const packetJson = JSON.parse(readFileSync(join(outDir, `${task.queueTaskId}.json`), "utf8"));
+    expect(packetJson.schema).toBe("agent-fabric.task-packet.v1");
+    expect(packetJson.queue.queueId).toBe(queueId);
+
+    const guidance = packetJson.terminalToolGuidance;
+    expect(guidance.automationSafe.rg).toBe("Use for source/text search.");
+    expect(guidance.automationSafe.jq).toBe("Use for JSON payloads, logs, and config.");
+    expect(guidance.humanFacingOrOptional.bat).toContain("Readable file viewing");
+    expect(guidance.humanFacingOrOptional.tmux).toContain("Persistent human-facing sessions");
+    expect(packetJson.operatorInstructions).toEqual(expect.arrayContaining([expect.stringContaining("Work only on this task")]));
+
+    daemon.close();
+  });
+
+  it("blocks missing requiredContextRefs before launch", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-missing-refs-"));
+    const tasksFile = writeTasksFile(projectPath);
+    writeFileSync(join(projectPath, "README.md"), "# Public\n", "utf8");
+
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Missing refs test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    await call("project_queue_update_task_metadata", {
+      queueId,
+      queueTaskId: task.queueTaskId,
+      expectedFiles: ["README.md"],
+      requiredContextRefs: ["does-not-exist.md", "also-missing.ts"]
+    });
+
+    const outDir = join(projectPath, "packets");
+    const sandboxDir = join(projectPath, "sandbox");
+
+    await expect(
+      runProjectCommand(
+        {
+          command: "run-ready", json: false, queueId, limit: 1, parallel: 1,
+          commandTemplate: "echo ok", cwdTemplate: `${sandboxDir}/{{queueTaskId}}`,
+          taskPacketDir: outDir, taskPacketFormat: "json",
+          worker: "manual", workspaceMode: "sandbox", modelProfile: "execute.cheap",
+          successStatus: "completed", maxOutputChars: 100,
+          approveToolContext: true, rememberToolContext: false,
+          continueOnFailure: false, allowSharedCwd: false
+        },
+        call
+      )
+    ).rejects.toThrow("missing context refs");
+
+    daemon.close();
+  });
+
+  it("writes context bundle with missing-file warnings for unsupported refs", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-unsupported-refs-"));
+    const tasksFile = writeTasksFile(projectPath);
+    writeFileSync(join(projectPath, "README.md"), "# Public\n", "utf8");
+
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Unsupported refs test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+    const status = await call<{ tasks: Array<{ queueTaskId: string }> }>("project_queue_status", { queueId });
+    const task = status.tasks[0];
+    await call("project_queue_update_task_metadata", {
+      queueId,
+      queueTaskId: task.queueTaskId,
+      expectedFiles: ["README.md"],
+      requiredContextRefs: ["../outside-file.txt", "https://example.com/doc.md", "/etc/passwd"]
+    });
+
+    const outDir = join(projectPath, "packets");
+    await runProjectCommand({ command: "write-task-packets", json: false, queueId, outDir, format: "markdown", readyOnly: false }, call);
+
+    const contextText = readFileSync(join(outDir, `${task.queueTaskId}.context.md`), "utf8");
+    expect(contextText).toContain("unsupported or outside project");
+    expect(contextText).toContain("## README.md");
+    expect(contextText).toContain("Public");
+
+    daemon.close();
+  });
+
+  it("parses artifact ignore filters for run-task and run-ready", () => {
+    expect(
+      parseProjectCliArgs([
+        "run-task",
+        "--queue", "pqueue_1",
+        "--queue-task", "pqtask_1",
+        "--command", "npm test",
+        "--artifact-ignore", "*.generated.md",
+        "--artifact-ignore", "tmp/output"
+      ])
+    ).toMatchObject({
+      command: "run-task",
+      artifactIgnore: ["*.generated.md", "tmp/output"]
+    });
+
+    expect(
+      parseProjectCliArgs([
+        "run-ready",
+        "--queue", "pqueue_1",
+        "--artifact-ignore", "*.generated.md",
+        "--artifact-ignore", "priv/static"
+      ])
+    ).toMatchObject({
+      command: "run-ready",
+      artifactIgnore: ["*.generated.md", "priv/static"]
+    });
+  });
+
+  it("matches default, env, and CLI artifact ignore globs", () => {
+    process.env.AGENT_FABRIC_ARTIFACT_IGNORE_GLOBS = "*.generated.md;priv/static";
+    const globs = resolveArtifactIgnoreGlobs(["tmp/output", "*.generated.md"]);
+    expect(globs).toContain("*.log");
+    expect(globs).toContain("*.generated.md");
+    expect(globs).toContain("priv/static");
+    expect(globs).toContain("tmp/output");
+
+    expect(matchesGlob("debug.log", "*.log")).toBe(true);
+    expect(matchesGlob("nested/debug.log", "*.log")).toBe(true);
+    expect(matchesGlob("priv/static/app.js", "priv/static")).toBe(true);
+    expect(matchesGlob("app.generated.md", "*.generated.md")).toBe(true);
+    expect(matchesGlob("app.generated.md.bak", "*.generated.md")).toBe(false);
+  });
+
+  it("filters artifact noise from run-task changed-file harvesting", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const call = caller(daemon, session);
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-artifact-ignore-"));
+    const tasksFile = writeTasksFile(projectPath);
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Artifact ignore test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    const imported = await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    const task = (imported.data.created as Array<{ queueTaskId: string }>)[0];
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
+
+    const commandLine = [
+      "node -e",
+      JSON.stringify(
+        "const fs=require('node:fs');fs.mkdirSync('generated',{recursive:true});fs.writeFileSync('keep.txt','ok');fs.writeFileSync('debug.log','noise');fs.writeFileSync('generated/asset.map','noise');"
+      )
+    ].join(" ");
+    const result = await runProjectCommand(
       {
         command: "run-task",
         json: false,
         queueId,
         queueTaskId: task.queueTaskId,
-        commandLine: "node -e \"const fs=require('node:fs');fs.mkdirSync('src',{recursive:true});fs.writeFileSync('src/main.ts','export const x=1;');fs.writeFileSync('build.log','done');fs.writeFileSync('dist.js','generated');fs.writeFileSync('src/__pycache__','cache');\"",
+        commandLine,
         cwd: projectPath,
         worker: "manual",
         workspaceMode: "in_place",
         modelProfile: "execute.cheap",
-        successStatus: "patch_ready",
+        successStatus: "completed",
         maxOutputChars: 4_000,
         approveToolContext: true,
         rememberToolContext: false,
-        artifactIgnoreGlobs: ["dist.js"]
+        artifactIgnore: ["generated"]
       },
       call
     );
 
-    expect(ran.action).toBe("task_run_completed");
-    const changedFiles = ran.data.changedFiles as string[];
-    expect(changedFiles).toContain("src/main.ts");
-    expect(changedFiles).not.toContain("build.log");
-    expect(changedFiles).not.toContain("dist.js");
-    expect(changedFiles).not.toContain("src/__pycache__");
+    expect(result.data.changedFiles).toEqual(["keep.txt"]);
+    daemon.close();
+  });
 
-    const jsonOutput = formatProjectResult(ran, true);
-    const parsed = JSON.parse(jsonOutput);
-    expect(parsed.changedFiles).toContain("src/main.ts");
-    expect(parsed.changedFiles).not.toContain("build.log");
+  it("persists run-task stdout and stderr logs and records their paths", async () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const projectPath = mkdtempSync(join(tmpdir(), "agent-fabric-task-logs-"));
+    const payload = registerPayload();
+    const session = daemon.registerBridge({ ...payload, workspace: { ...payload.workspace, root: projectPath } });
+    const call = caller(daemon, session);
+    const tasksFile = writeTasksFile(projectPath);
+    const created = await runProjectCommand(
+      { command: "create", json: false, projectPath, promptSummary: "Task log test.", pipelineProfile: "balanced", maxParallelAgents: 4 },
+      call
+    );
+    const queueId = created.data.queueId as string;
+    const imported = await runProjectCommand({ command: "import-tasks", json: false, queueId, tasksFile, approveQueue: true }, call);
+    const task = (imported.data.created as Array<{ queueTaskId: string }>)[0];
+    await runProjectCommand({ command: "decide-queue", json: false, queueId, decision: "start_execution" }, call);
 
+    const result = await runProjectCommand(
+      {
+        command: "run-task",
+        json: false,
+        queueId,
+        queueTaskId: task.queueTaskId,
+        commandLine: "node -e \"process.stdout.write('visible out');process.stderr.write('visible err')\"",
+        cwd: projectPath,
+        worker: "manual",
+        workspaceMode: "in_place",
+        modelProfile: "execute.cheap",
+        successStatus: "completed",
+        maxOutputChars: 4_000,
+        approveToolContext: true,
+        rememberToolContext: false
+      },
+      call
+    );
+    const stdoutLogPath = result.data.stdoutLogPath as string;
+    const stderrLogPath = result.data.stderrLogPath as string;
+    expect(stdoutLogPath).toContain(join(projectPath, ".agent-fabric", "logs"));
+    expect(stderrLogPath).toContain(join(projectPath, ".agent-fabric", "logs"));
+    expect(readFileSync(stdoutLogPath, "utf8")).toBe("visible out");
+    expect(readFileSync(stderrLogPath, "utf8")).toBe("visible err");
+
+    const tail = await call<{ events: Array<{ kind: string; metadata: Record<string, unknown> }> }>("fabric_task_tail", {
+      workerRunId: result.data.workerRunId as string
+    });
+    const finished = tail.events.find((event) => event.kind === "command_finished");
+    expect(finished?.metadata.stdoutLogPath).toBe(stdoutLogPath);
+    expect(finished?.metadata.stderrLogPath).toBe(stderrLogPath);
+
+    const snap = snapshotFiles(projectPath);
+    expect([...snap.entries.keys()].some((entry) => entry.includes(".agent-fabric/logs"))).toBe(false);
     daemon.close();
   });
 });

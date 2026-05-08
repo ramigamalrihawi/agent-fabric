@@ -993,3 +993,123 @@ describe("Dashboard-level cost coverage visibility", () => {
     daemon.close();
   });
 });
+
+describe("Log path visibility in bridge cards and worker health", () => {
+  it("exposes stdoutLogPath and stderrLogPath from command_finished event metadata in bridge cards and worker health evidence", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const queueId = createQueue(daemon, session, "logpath-create", 4);
+    addReadyTasks(daemon, session, queueId, 1);
+    startExecution(daemon, session, queueId, "logpath-start");
+
+    const claim = daemon.callTool(
+      "project_queue_claim_next",
+      {
+        queueId,
+        worker: "deepseek-direct",
+        workspaceMode: "git_worktree",
+        modelProfile: "deepseek-v4-pro:max",
+        metadata: { source: "test-runner" }
+      },
+      contextFor(session, "logpath-claim")
+    );
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) throw new Error("claim failed");
+    const claimed = claim.data.claimed as { fabricTaskId: string };
+    const workerRun = claim.data.workerRun as { workerRunId: string };
+
+    daemon.callTool(
+      "fabric_task_event",
+      {
+        taskId: claimed.fabricTaskId,
+        workerRunId: workerRun.workerRunId,
+        kind: "command_spawned",
+        body: "spawned",
+        metadata: { pid: 12345 }
+      },
+      contextFor(session, "logpath-spawned")
+    );
+
+    daemon.callTool(
+      "fabric_task_event",
+      {
+        taskId: claimed.fabricTaskId,
+        workerRunId: workerRun.workerRunId,
+        kind: "command_started",
+        body: "echo test",
+        metadata: { cwd: "/tmp/workspace" }
+      },
+      contextFor(session, "logpath-started")
+    );
+
+    const stdoutLogPath = "/tmp/workspace/.agent-fabric/logs/task-1-run-1-stdout.log";
+    const stderrLogPath = "/tmp/workspace/.agent-fabric/logs/task-1-run-1-stderr.log";
+    daemon.callTool(
+      "fabric_task_event",
+      {
+        taskId: claimed.fabricTaskId,
+        workerRunId: workerRun.workerRunId,
+        kind: "command_finished",
+        body: "test output",
+        metadata: {
+          cwd: "/tmp/workspace",
+          command: "echo test",
+          exitCode: 0,
+          durationMs: 100,
+          stdoutTail: "test output",
+          stderrTail: "",
+          stdoutLogPath,
+          stderrLogPath
+        }
+      },
+      contextFor(session, "logpath-finished")
+    );
+
+    const cards = daemon.callTool(
+      "fabric_list_agents",
+      { queueId, includeCompleted: true, maxEventsPerLane: 5 },
+      contextFor(session, "logpath-cards")
+    );
+    expect(cards.ok).toBe(true);
+    if (!cards.ok) throw new Error("cards failed");
+    expect(cards.data.cards).toHaveLength(1);
+    expect(cards.data.cards[0].stdoutLogPath).toBe(stdoutLogPath);
+    expect(cards.data.cards[0].stderrLogPath).toBe(stderrLogPath);
+
+    const health = daemon.callTool(
+      "project_queue_worker_health",
+      { queueId },
+      contextFor(session, "logpath-health")
+    );
+    expect(health.ok).toBe(true);
+    if (!health.ok) throw new Error("health failed");
+    expect(health.data.workers).toHaveLength(1);
+    expect(health.data.workers[0].evidence).toMatchObject({
+      stdoutLogPath,
+      stderrLogPath
+    });
+
+    daemon.close();
+  });
+
+  it("returns undefined log paths for planned cards and workers with no command_finished event", () => {
+    const daemon = new FabricDaemon({ dbPath: ":memory:" });
+    const session = daemon.registerBridge(registerPayload());
+    const queueId = createQueue(daemon, session, "logpath-nofin-create", 4);
+    addReadyTasks(daemon, session, queueId, 1);
+    startExecution(daemon, session, queueId, "logpath-nofin-start");
+
+    const planned = daemon.callTool(
+      "fabric_spawn_agents",
+      { queueId, count: 1, worker: "deepseek-direct", workspaceMode: "git_worktree", planOnly: true },
+      contextFor(session, "logpath-nofin-spawn")
+    );
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) throw new Error("spawn failed");
+
+    expect(planned.data.cards[0].stdoutLogPath).toBeUndefined();
+    expect(planned.data.cards[0].stderrLogPath).toBeUndefined();
+
+    daemon.close();
+  });
+});

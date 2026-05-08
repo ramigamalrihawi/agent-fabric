@@ -444,6 +444,8 @@ function laneCard(queueId: string, lane: Record<string, unknown>, index: number)
   const latestEvent = objectFrom(lane.latestEvent);
   const spawnedEvent = recentEvents.find((event) => stringFrom(objectFrom(event).kind) === "command_spawned");
   const spawnedMetadata = objectFrom(objectFrom(spawnedEvent).metadata);
+  const finishedEvent = recentEvents.find((event) => stringFrom(objectFrom(event).kind) === "command_finished");
+  const finishedMetadata = objectFrom(objectFrom(finishedEvent).metadata);
   const hasRunnerEvidence =
     eventKinds.has("command_spawned") ||
     eventKinds.has("command_started") ||
@@ -481,6 +483,8 @@ function laneCard(queueId: string, lane: Record<string, unknown>, index: number)
     runnerStartedAt: stringFrom(run.startedAt),
     lastHeartbeatAt: stringFrom(run.updatedAt) ?? stringFrom(progress.lastActivityAt),
     runnerLogPath: stringFrom(metadata.runnerLogPath) ?? stringFrom(spawnedMetadata.runnerLogPath),
+    stdoutLogPath: stringFrom(finishedMetadata.stdoutLogPath) ?? stringFrom(metadata.stdoutLogPath),
+    stderrLogPath: stringFrom(finishedMetadata.stderrLogPath) ?? stringFrom(metadata.stderrLogPath),
     taskPacketPath: stringFrom(metadata.taskPacketPath) ?? stringFrom(spawnedMetadata.taskPacketPath),
     contextFilePath: stringFrom(metadata.contextFilePath) ?? stringFrom(spawnedMetadata.contextFilePath),
     launchSource: stringFrom(metadata.source) ?? stringFrom(objectFrom(metadata.codexBridge).source),

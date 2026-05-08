@@ -58,13 +58,16 @@ function run(options: Options): string {
 
   writeFileSync(ndjsonLog, child.stdout ?? "", "utf8");
   writeFileSync(stderrLog, child.stderr ?? "", "utf8");
-  const changedFiles = gitLines(["diff", "--name-only"], options.cwd);
-  const patch = gitText(["diff", "--binary"], options.cwd);
+  const gitResult = gitDiff(options.cwd);
+  const changedFiles = gitResult.changedFiles;
+  const patch = gitResult.patch;
+  const gitBlockers = gitResult.blockers;
   if (patch.trim()) writeFileSync(patchFile, patch, "utf8");
   const exitCode = child.status ?? 1;
   const status = exitCode === 0 ? "completed" : "failed";
   const timedOut = child.error && "code" in child.error && child.error.code === "ETIMEDOUT";
-  const blockers = exitCode === 0 ? [] : [timedOut ? `Jcode timed out after ${options.maxRuntimeMinutes} minute(s).` : `Jcode exited ${exitCode}`];
+  const jcodeBlockers = exitCode === 0 ? [] : [timedOut ? `Jcode timed out after ${options.maxRuntimeMinutes} minute(s).` : `Jcode exited ${exitCode}`];
+  const blockers = [...jcodeBlockers, ...gitBlockers];
   const artifact = {
     schema: "agent-fabric.deepseek-worker-result.v1",
     result: {
@@ -88,7 +91,7 @@ function run(options: Options): string {
     }
   };
   writeFileSync(resultFile, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
-  if (exitCode !== 0) process.exitCode = exitCode;
+  if (exitCode !== 0 || gitBlockers.length > 0) process.exitCode = exitCode || 1;
   return resultFile;
 }
 
@@ -149,14 +152,19 @@ function formatPrompt(taskPacketPath: string): string {
   ].join("\n");
 }
 
-function gitLines(args: string[], cwd: string): string[] {
-  const text = gitText(args, cwd);
-  return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-}
-
-function gitText(args: string[], cwd: string): string {
-  const result = spawnSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-  return result.status === 0 ? result.stdout : "";
+function gitDiff(cwd: string): { changedFiles: string[]; patch: string; blockers: string[] } {
+  const nameResult = spawnSync("git", ["-C", cwd, "diff", "--name-only"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  if (nameResult.status !== 0) {
+    const error = (nameResult.stderr || "git is not available or cwd is not a repository").trim();
+    return { changedFiles: [], patch: "", blockers: [`git diff --name-only failed in ${cwd}: ${error}`] };
+  }
+  const changedFiles = nameResult.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const patchResult = spawnSync("git", ["-C", cwd, "diff", "--binary"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  if (patchResult.status !== 0) {
+    const error = (patchResult.stderr || "git diff --binary failed").trim();
+    return { changedFiles, patch: "", blockers: [`git diff --binary failed in ${cwd}: ${error}`] };
+  }
+  return { changedFiles, patch: patchResult.stdout, blockers: [] };
 }
 
 function tail(value: string, maxChars: number): string {

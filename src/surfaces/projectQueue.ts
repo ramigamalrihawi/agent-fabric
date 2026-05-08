@@ -6061,6 +6061,8 @@ export function projectQueueWorkerHealth(host: SurfaceHost, input: unknown, cont
     const checkpoint = task.fabric_task_id && latestRun ? latestWorkerCheckpoint(host, task.fabric_task_id, latestRun.id) : undefined;
     const spawnedEvent = events.find((e) => e.kind === "command_spawned");
     const spawnedMetadata = spawnedEvent ? safeJsonRecord(spawnedEvent.metadata_json) : undefined;
+    const finishedEvent = events.find((e) => e.kind === "command_finished");
+    const finishedMetadata = finishedEvent ? safeJsonRecord(finishedEvent.metadata_json) : undefined;
     const pid = typeof spawnedMetadata?.pid === "number" ? spawnedMetadata.pid : 0;
     const hasRunnerEvidence = events.some((e) =>
       ["command_spawned", "command_started", "command_finished", "test_result", "file_changed", "checkpoint"].includes(e.kind)
@@ -6075,6 +6077,8 @@ export function projectQueueWorkerHealth(host: SurfaceHost, input: unknown, cont
       hasRunnerEvidence,
       failedEvent: failedEvent ? { kind: failedEvent.kind, body: failedEvent.body } : undefined,
       runnerLogPath: stringFromUnknown(spawnedMetadata?.runnerLogPath) ?? stringFromUnknown(safeJsonRecord(latestRun.metadata_json).runnerLogPath),
+      stdoutLogPath: stringFromUnknown(finishedMetadata?.stdoutLogPath) ?? stringFromUnknown(safeJsonRecord(latestRun.metadata_json).stdoutLogPath),
+      stderrLogPath: stringFromUnknown(finishedMetadata?.stderrLogPath) ?? stringFromUnknown(safeJsonRecord(latestRun.metadata_json).stderrLogPath),
       taskPacketPath: stringFromUnknown(spawnedMetadata?.taskPacketPath) ?? stringFromUnknown(safeJsonRecord(latestRun.metadata_json).taskPacketPath),
       contextFilePath: stringFromUnknown(spawnedMetadata?.contextFilePath) ?? stringFromUnknown(safeJsonRecord(latestRun.metadata_json).contextFilePath),
       cost: costSummary ? {
@@ -6150,6 +6154,8 @@ type HealthEvidence = {
   hasRunnerEvidence: boolean;
   failedEvent?: { kind: string; body: string | null };
   runnerLogPath?: string;
+  stdoutLogPath?: string;
+  stderrLogPath?: string;
   taskPacketPath?: string;
   contextFilePath?: string;
   cost?: {
@@ -6190,6 +6196,8 @@ function healthClassify(
         lastCheckpointAt: undefined,
         hasRunnerEvidence: false,
         runnerLogPath: undefined,
+        stdoutLogPath: undefined,
+        stderrLogPath: undefined,
         taskPacketPath: undefined,
         contextFilePath: undefined,
         patchRefs,
@@ -6274,6 +6282,8 @@ function healthClassify(
       lastCheckpointAt,
       hasRunnerEvidence,
       runnerLogPath: evidence?.runnerLogPath,
+      stdoutLogPath: evidence?.stdoutLogPath,
+      stderrLogPath: evidence?.stderrLogPath,
       taskPacketPath: evidence?.taskPacketPath,
       contextFilePath: evidence?.contextFilePath,
       patchRefs,
